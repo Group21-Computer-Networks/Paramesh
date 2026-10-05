@@ -1,0 +1,38 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    { "name": "dev", "inherits": "base", "displayName": "Debug, no sanitizer" },
+    { "name": "asan", "inherits": "base", "displayName": "AddressSanitizer",
+      "cacheVariables": { "PARAMESH_SANITIZER": "address" } },
+    { "name": "ubsan", "inherits": "base", "displayName": "UndefinedBehaviorSanitizer",
+      "cacheVariables": { "PARAMESH_SANITIZER": "undefined" } },
+    { "name": "tsan", "inherits": "base", "displayName": "ThreadSanitizer",
+      "cacheVariables": { "PARAMESH_SANITIZER": "thread" } },
+    { "name": "tidy", "inherits": "base", "displayName": "clang build with clang-tidy on every file",
+      "cacheVariables": { "CMAKE_C_COMPILER": "clang", "CMAKE_CXX_COMPILER": "clang++",
+                          "PARAMESH_CLANG_TIDY": "ON" } }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "ubsan", "configurePreset": "ubsan" },
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "tidy", "configurePreset": "tidy" }
+  ],
+  "testPresets": [
+    { "name": "base", "hidden": true, "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" } },
+    { "name": "dev", "inherits": "base", "configurePreset": "dev" },
+    { "name": "asan", "inherits": "base", "configurePreset": "asan" },
+    { "name": "ubsan", "inherits": "base", "configurePreset": "ubsan" },
+    { "name": "tsan", "inherits": "base", "configurePreset": "tsan" }
+  ]
+}
