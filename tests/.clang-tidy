@@ -1,0 +1,10 @@
+---
+# Tests inherit the root checks, minus those that fire on doctest's macro expansions.
+InheritParentConfig: true
+Checks: >
+  -cert-err58-cpp,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -cppcoreguidelines-avoid-do-while,
+  -misc-use-anonymous-namespace,
+  -readability-function-cognitive-complexity
+...
