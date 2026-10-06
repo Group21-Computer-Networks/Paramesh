@@ -1,0 +1,27 @@
+# Add this job to the GitHub Actions workflow created in M0-1 (.github/workflows/ci.yml).
+# The workflow's `on:` must include pull_request with the `edited` type so a fixed PR title re-runs it:
+#
+# on:
+#   push:
+#   pull_request:
+#     types: [opened, synchronize, reopened, edited]
+#
+# The PR title goes through an environment variable, never straight into the shell line,
+# so a title containing quotes or $(...) cannot run as a command.
+
+  implementation-logs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check docs/logs
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            python3 .claude/skills/paramesh-plan/scripts/plan.py check --base "origin/$BASE_REF" --pr-title "$PR_TITLE"
+          else
+            python3 .claude/skills/paramesh-plan/scripts/plan.py check
+          fi

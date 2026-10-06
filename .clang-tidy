@@ -1,0 +1,71 @@
+---
+# Run through the "tidy" preset (cmake --preset tidy && cmake --build --preset tidy).
+# Every enabled check is an error. Disable a check here only with a reason in the comment;
+# silence one site with NOLINTNEXTLINE(<check>) and a reason.
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -bugprone-easily-swappable-parameters,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -readability-magic-numbers,
+  -cppcoreguidelines-pro-type-vararg,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-type-union-access,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -misc-include-cleaner,
+  -misc-non-private-member-variables-in-classes,
+  -modernize-use-trailing-return-type,
+  -readability-identifier-length
+# Why the exclusions:
+#   magic-numbers         protocol sizes and opcodes are named in PROTOCOL.md tables, not constants
+#   pro-type-vararg       ioctl() and fcntl() for userfaultfd and sockets are variadic
+#   reinterpret-cast, union-access, pointer-arithmetic
+#                         mmap, uffd_msg and frame decoding need them; kept to src/mem and src/wire
+#   include-cleaner       reports false positives on the vendored single headers
+#   non-private-members   plain structs for wire payloads and events are intended
+#   trailing-return-type  style choice, not a defect
+#   identifier-length     i, n, fd, id are clear in context
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*/(src|include|apps|tests)/.*'
+FormatStyle: file
+CheckOptions:
+  - key: readability-function-cognitive-complexity.Threshold
+    value: '40'
+  - key: readability-identifier-naming.NamespaceCase
+    value: lower_case
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.EnumCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.ParameterCase
+    value: lower_case
+  - key: readability-identifier-naming.PrivateMemberSuffix
+    value: '_'
+  - key: readability-identifier-naming.ConstexprVariableCase
+    value: CamelCase
+  - key: readability-identifier-naming.ConstexprVariablePrefix
+    value: k
+  - key: readability-identifier-naming.EnumConstantCase
+    value: CamelCase
+  - key: readability-identifier-naming.EnumConstantPrefix
+    value: k
+  - key: readability-identifier-naming.MacroDefinitionCase
+    value: UPPER_CASE
+  - key: misc-const-correctness.AnalyzeValues
+    value: 'true'
+...
