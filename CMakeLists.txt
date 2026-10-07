@@ -29,11 +29,15 @@ add_library(paramesh_api INTERFACE)
 target_include_directories(paramesh_api INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 add_library(paramesh::api ALIAS paramesh_api)
 
+# Before any directory is added, so that a test registered anywhere, apps/ included, is found.
+if(PARAMESH_BUILD_TESTS)
+    enable_testing()
+endif()
+
 add_subdirectory(third_party)
 add_subdirectory(src)
 add_subdirectory(apps)
 
 if(PARAMESH_BUILD_TESTS)
-    enable_testing()
     add_subdirectory(tests)
 endif()
