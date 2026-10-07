@@ -23,6 +23,7 @@ Checks: >
   -cppcoreguidelines-pro-bounds-pointer-arithmetic,
   -misc-include-cleaner,
   -misc-non-private-member-variables-in-classes,
+  -misc-no-recursion,
   -modernize-use-trailing-return-type,
   -readability-identifier-length
 # Why the exclusions:
@@ -32,6 +33,7 @@ Checks: >
 #                         mmap, uffd_msg and frame decoding need them; kept to src/mem and src/wire
 #   include-cleaner       reports false positives on the vendored single headers
 #   non-private-members   plain structs for wire payloads and events are intended
+#   no-recursion          a JSON value holds JSON values; copying and comparing one recurses
 #   trailing-return-type  style choice, not a defect
 #   identifier-length     i, n, fd, id are clear in context
 WarningsAsErrors: '*'
