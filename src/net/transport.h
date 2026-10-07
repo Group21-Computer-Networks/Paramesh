@@ -120,8 +120,9 @@ struct TransportConfig {
     JoinInfo self;
 };
 
-// `handler` must outlive the transport.
-Result<std::unique_ptr<Transport>> net_open(const TransportConfig& config, NetHandler& handler);
+// `checksum` and `handler` must outlive the transport.
+Result<std::unique_ptr<Transport>> net_open(const TransportConfig& config, const Checksum& checksum,
+                                            NetHandler& handler);
 
 }  // namespace paramesh
 
