@@ -26,3 +26,4 @@ These are deferred by `docs/PLAN.md` itself. The "Plan reference" column names t
 | Item | Added by | Notes |
 | --- | --- | --- |
 | Run `tools/check_env.sh` on the other five laptops, and have the person see `m0_demo` run. | M0 gate | Waived at the gate on 2026-10-07; only `ouroboros` has run it. Record the results in `docs/logs/M0-gate.md`. |
+| Run `readshare` on two cabled laptops (the M1 gate's hardware check for FR-4.1 and FR-4.2). | M1 gate | Waived at the gate on 2026-10-08. The commands are in `docs/logs/M1-gate.md`, "Hardware runs"; record the result there. |
