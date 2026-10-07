@@ -5,6 +5,7 @@
 #ifndef PARAMESH_WIRE_FRAME_H
 #define PARAMESH_WIRE_FRAME_H
 
+#include "platform/checksum.h"
 #include "platform/ids.h"
 #include "platform/result.h"
 
@@ -131,7 +132,11 @@ void wire_encode_header(const FrameHeader& header, std::span<std::byte, kFrameHe
 Result<FrameHeader> wire_decode_header(std::span<const std::byte, kFrameHeaderSize> in);
 
 // CRC-32C of a payload; 0 for an empty one.
-std::uint32_t wire_payload_crc(std::span<const std::byte> payload);
+std::uint32_t wire_payload_crc(const Checksum& checksum, std::span<const std::byte> payload);
+
+// Errc::kProtocol unless the payload has the length and the CRC its header states.
+Result<void> wire_check_payload(const Checksum& checksum, const FrameHeader& header,
+                                std::span<const std::byte> payload);
 
 }  // namespace paramesh
 
