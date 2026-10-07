@@ -1,0 +1,14 @@
+---
+# Applications are ordinary C or C++ programs against paramesh.h. They inherit the root checks,
+# minus those that reject normal C: macros for constants, a file-scope variable, printf, and
+# an unchecked printf result. The int-to-pointer check goes too, until M3 lets a task receive
+# its pointers as an argument instead of computing them from the region's base.
+InheritParentConfig: true
+Checks: >
+  -cppcoreguidelines-macro-to-enum,
+  -modernize-macro-to-enum,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -cert-err33-c,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -performance-no-int-to-ptr
+...
