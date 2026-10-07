@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
@@ -200,11 +201,85 @@ TEST_CASE("a lost node makes every other process exit with a message" * doctest:
     CHECK(read_all(job.launcher_stderr) == "job 42 aborted: node 3 lost\n");
 }
 
+// A job of one node, in a child process: a system call on shared memory before and after
+// pm_touch. Returns 0 if everything was as paramesh.h says, else the number of the step that
+// was not.
+int touch_program() {
+    ::setenv("PARAMESH_ROLE", "launcher", 1);
+    ::setenv("PARAMESH_JOB_ID", "43", 1);
+    ::setenv("PARAMESH_NODE_ID", "1", 1);
+    const std::string here = "127.0.0.1:" + std::to_string(free_port());
+    ::setenv("PARAMESH_LISTEN", here.c_str(), 1);
+    ::setenv("PARAMESH_PEERS", ("1@" + here).c_str(), 1);
+    pm_config config{};
+    config.region_bytes = kRegionBytes;
+    if (pm_init(nullptr, nullptr, &config) != PM_OK) {
+        return 1;
+    }
+    auto* buffer = static_cast<char*>(pm_malloc(4 * paramesh::kPageSize));
+    std::array<char, 16> name = {"/tmp/pm-XXXXXX"};
+    const int file = ::mkstemp(name.data());
+    ::unlink(name.data());
+    const std::string_view text = "read through the kernel";
+    if (buffer == nullptr || file < 0 ||
+        ::pwrite(file, text.data(), text.size(), 0) != static_cast<ssize_t>(text.size())) {
+        return 2;
+    }
+
+    // The kernel is asked to write into a shared page this node does not hold.
+    errno = 0;
+    if (::pread(file, buffer, text.size(), 0) != -1 || errno != EFAULT) {
+        return 3;
+    }
+    if (pm_touch(buffer, text.size(), PM_ACCESS_WRITE) != PM_OK) {
+        return 4;
+    }
+    if (::pread(file, buffer, text.size(), 0) != static_cast<ssize_t>(text.size()) ||
+        std::string_view{buffer, text.size()} != text) {
+        return 5;
+    }
+
+    // The kernel is asked to read from one: the same, with read access. An untouched page reads as
+    // zeros.
+    char* second = buffer + paramesh::kPageSize;
+    errno = 0;
+    if (::pwrite(file, second, 8, 100) != -1 || errno != EFAULT) {
+        return 6;
+    }
+    if (pm_touch(second, 8, PM_ACCESS_READ) != PM_OK || ::pwrite(file, second, 8, 100) != 8) {
+        return 7;
+    }
+
+    // A range over a page boundary is brought in whole; bad arguments are refused.
+    char* across = buffer + 3 * paramesh::kPageSize -
+                   4;  // the last 4 bytes of one page, the first 4 of the next
+    if (pm_touch(across, 8, PM_ACCESS_WRITE) != PM_OK || ::pread(file, across, 8, 0) != 8) {
+        return 8;
+    }
+    if (pm_touch(buffer, 0, PM_ACCESS_READ) != PM_OK ||
+        pm_touch(&config, 8, PM_ACCESS_READ) != PM_ERR_INVALID ||
+        pm_touch(buffer, kRegionBytes + 1, PM_ACCESS_READ) != PM_ERR_INVALID) {
+        return 9;
+    }
+    return pm_finalize() == PM_OK ? 0 : 10;
+}
+
+TEST_CASE("a system call on a missing shared page fails with EFAULT, and succeeds after pm_touch" *
+          doctest::skip(!can_run())) {
+    const pid_t child = ::fork();
+    REQUIRE(child >= 0);
+    if (child == 0) {
+        ::_exit(touch_program());
+    }
+    CHECK(wait_for(child, 30) == 0);
+}
+
 TEST_CASE("pm_init without the launch environment reports a configuration error") {
     ::unsetenv("PARAMESH_ROLE");
     CHECK(pm_init(nullptr, nullptr, nullptr) == PM_ERR_CONFIG);
     CHECK(pm_finalize() == PM_ERR_STATE);
     CHECK(pm_malloc(64) == nullptr);
+    CHECK(pm_touch(numbers(), 8, PM_ACCESS_READ) == PM_ERR_STATE);
     CHECK(std::string_view{pm_strerror(PM_ERR_CONFIG)} ==
           "the launch environment is missing or malformed");
     CHECK(std::string_view{pm_strerror(-99)} == "unknown error");
