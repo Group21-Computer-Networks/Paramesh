@@ -205,6 +205,46 @@ public:
         return offset ? reinterpret_cast<void*>(kRegionBase + *offset) : nullptr;
     }
 
+    // pm_touch: makes each page of the range fault, if it has to, exactly as the program's own
+    // access would, and returns when the pages are here.
+    int touch(const void* p, std::size_t n, pm_access access) const noexcept {
+        const auto first = reinterpret_cast<std::uintptr_t>(p);
+        const std::uint64_t region = region_bytes_;
+        if (region == 0) {
+            return PM_ERR_STATE;
+        }
+        if ((access != PM_ACCESS_READ && access != PM_ACCESS_WRITE) || first < kRegionBase ||
+            first - kRegionBase > region || n > region - (first - kRegionBase)) {
+            return PM_ERR_INVALID;
+        }
+        if (n == 0) {
+            return PM_OK;
+        }
+        for (std::uintptr_t page = first / kPageSize * kPageSize; page < first + n;
+             page += kPageSize) {
+            // NOLINTNEXTLINE(performance-no-int-to-ptr): the region lives at a fixed address
+            auto* byte = reinterpret_cast<unsigned char*>(page);
+            if (access == PM_ACCESS_READ) {
+                static_cast<void>(std::atomic_ref<unsigned char>{*byte}.load());
+                continue;
+            }
+            // One write instruction that changes nothing and cannot lose another thread's update:
+            // an atomic "or with 0". It must be a single write, not a read then a compare-and-swap,
+            // or the page would be fetched for reading first and upgraded after.
+#if defined(__x86_64__)
+            __asm__ volatile("lock orb $0, (%0)"
+                             :
+                             : "r"(byte)
+                             : "memory", "cc");  // NOLINT(hicpp-no-assembler)
+#else
+            // ponytail: other architectures take the read-then-upgrade route until one is
+            // supported.
+            std::atomic_ref<unsigned char>{*byte}.fetch_or(0);
+#endif
+        }
+        return PM_OK;
+    }
+
     int run_on_workers(std::uint32_t id) {
         std::array<std::byte, 40>
             assign{};  // a TASK_ASSIGN whose chunk ID is the function's number
@@ -480,6 +520,7 @@ private:
         }
         states_.assign(homes_.size() * kPagesPerSegment, PageState::kInvalid);
         allocator_ = RegionAllocator{homes_.size() * kSegmentSize};
+        region_bytes_ = homes_.size() * kSegmentSize;
         have_map_ = true;
     }
 
@@ -769,6 +810,7 @@ private:
     std::atomic<std::uint64_t> next_req_{1};
     std::atomic<bool> aborting_{false};
     std::atomic<bool> ending_{false};
+    std::atomic<std::uint64_t> region_bytes_{0};  // 0 until the segment map is applied
     TimerId linger_;
     std::mutex mutex_;
     std::condition_variable changed_;
@@ -852,6 +894,10 @@ void* pm_malloc(size_t bytes) {
     return paramesh::job() != nullptr && paramesh::job()->is_launcher()
                ? paramesh::job()->allocate(bytes)
                : nullptr;
+}
+
+int pm_touch(const void* p, size_t n, pm_access access) {
+    return paramesh::job() != nullptr ? paramesh::job()->touch(p, n, access) : PM_ERR_STATE;
 }
 
 void pm_test_register(uint32_t id, pm_test_fn fn) {
