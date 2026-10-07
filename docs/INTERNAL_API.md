@@ -1,6 +1,6 @@
 # ParaMesh internal interfaces
 
-**Status: DRAFT from task M0-7, awaiting approval at the M0 gate. Not frozen yet.**
+**Status: approved at the M0 gate on 2026-10-07 and frozen: it changes only with the person's approval. Every paragraph tagged [GATE ...] was a proposal and was approved as drafted (`docs/logs/M0-gate.md`).**
 
 This document defines how the source directories of `libparamesh` call each other. Each
 section names the headers that make up one directory's interface and gives their declarations

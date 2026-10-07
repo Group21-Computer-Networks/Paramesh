@@ -1,6 +1,6 @@
 # ParaMesh state machines
 
-**Status: DRAFT from task M0-6, awaiting approval at the M0 gate. Not frozen yet.**
+**Status: approved at the M0 gate on 2026-10-07 and frozen: it changes only with the person's approval. Every paragraph tagged [GATE ...] was a proposal and was approved as drafted (`docs/logs/M0-gate.md`).**
 
 This document defines the two state machines that keep shared pages coherent: the one every
 node runs for each page it may map (the *node* machine), and the one a page's home runs for

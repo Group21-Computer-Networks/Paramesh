@@ -1,10 +1,9 @@
 /*
  * paramesh.h - the ParaMesh public API.
  *
- * STATUS: DRAFT from task M0-4, awaiting approval at the M0 gate. It is not frozen yet.
- * A comment tagged [GATE Gn] marks a proposal that the person approves or changes at the gate;
- * the same numbers, with the alternatives, are listed in docs/logs/M0-4.md. Untagged text
- * restates what docs/PLAN.md or the HLD already fixes.
+ * STATUS: approved at the M0 gate on 2026-10-07 and frozen: it changes only with the person's
+ * approval. A comment tagged [GATE Gn] was a proposal; every one was approved as drafted
+ * (docs/logs/M0-gate.md). Untagged text restates what docs/PLAN.md or the HLD already fixes.
  *
  * A ParaMesh program is one ordinary C or C++ program. The same binary runs on every node of
  * a job. On the launcher, main() runs to the end; on a worker, pm_init() serves tasks and never
@@ -292,7 +291,8 @@ pm_lock_t pm_lock_create(void);
  * be called by the thread that holds it. Callable from a task or from the launcher's main().
  * Errors: PM_ERR_INVALID (not a lock; pm_lock() by the thread that already holds it;
  * pm_unlock() by a thread that does not), PM_ERR_STATE.
- * A task must release every lock it took before it returns.
+ * A task must release every lock it took before it returns. If a chunk has to be run again
+ * while its thread holds a lock (its node is leaving), the job is aborted.
  * [GATE G6] Both return int where the Build Plan's sketch returned void.
  */
 int pm_lock(pm_lock_t lock);

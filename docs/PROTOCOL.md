@@ -1,6 +1,6 @@
 # ParaMesh wire protocol
 
-**Status: DRAFT from task M0-5, awaiting approval at the M0 gate. Not frozen yet.**
+**Status: approved at the M0 gate on 2026-10-07 and frozen: it changes only with the person's approval. Every paragraph tagged [GATE ...] was a proposal and was approved as drafted (`docs/logs/M0-gate.md`).**
 
 This document defines every byte ParaMesh processes send each other: the frame header, every
 opcode and its payload, the discovery beacon, the local socket between a job process and its
