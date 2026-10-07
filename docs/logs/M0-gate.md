@@ -1,9 +1,9 @@
 # M0 gate
 
 - Milestone: M0
-- Status: open
-- Closed by:
-- Closed on:
+- Status: closed
+- Closed by: Amirishetty Sai Vignesh
+- Closed on: 2026-10-07
 
 <!--
 Only the person closes a gate. An agent may prepare this file and fill in checks it ran,
@@ -20,13 +20,13 @@ The plan's gate text:
 
 | Check | Setup | Result | Evidence |
 | --- | --- | --- | --- |
-| `include/paramesh.h` approved | the person | pending | draft merged in PR #2 |
-| `docs/PROTOCOL.md` approved | the person | pending | draft merged in PR #3 |
-| `docs/STATE_MACHINES.md` approved | the person | pending | draft merged in PR #4 |
-| `docs/INTERNAL_API.md` approved | the person | pending | draft merged in PR #5 |
-| Every flagged point answered | the person | pending | the list below |
-| `tools/check_env.sh` passes on all six laptops | six laptops | pending | 1 of 6 so far, see Hardware runs |
-| The demo is seen running | the person | pending | `./build/dev/apps/m0_demo/m0_demo`; passes locally and in Actions (PR #7) |
+| `include/paramesh.h` approved | the person | pass | approved as drafted by Amirishetty Sai Vignesh in chat, 2026-10-07; draft merged in PR #2 |
+| `docs/PROTOCOL.md` approved | the person | pass | approved as drafted by Amirishetty Sai Vignesh in chat, 2026-10-07; draft merged in PR #3 |
+| `docs/STATE_MACHINES.md` approved | the person | pass | approved as drafted by Amirishetty Sai Vignesh in chat, 2026-10-07; draft merged in PR #4 |
+| `docs/INTERNAL_API.md` approved | the person | pass | approved as drafted by Amirishetty Sai Vignesh in chat, 2026-10-07; draft merged in PR #5 |
+| Every flagged point answered | the person | pass | "none" to exceptions, 2026-10-07: every point takes its drafted answer; G13 answered separately |
+| `tools/check_env.sh` passes on all six laptops | six laptops | n/a | waived by Amirishetty Sai Vignesh, 2026-10-07: 1 of 6 run and passing; the other five are in `docs/TODO.md` |
+| The demo is seen running | the person | n/a | waived with the hardware runs, 2026-10-07; the demo passes locally and in Actions (PR #7) |
 
 ## Hardware runs
 
@@ -58,9 +58,10 @@ The plan's gate text:
 Two of these change text only the person edits: M4-4 in `docs/PLAN.md` ("refused before any
 process starts" becomes "before any worker starts"), and HLD home rule 5.
 
-### To answer at the gate: these need a decision
+### Decided at the gate
 
-Each has the draft's answer; "as drafted" accepts it. Alternatives are in the log named.
+Amirishetty Sai Vignesh, 2026-10-07: no exceptions. Every point below takes the answer in its "As drafted"
+column, except G13, which had none and was answered separately.
 
 | Point | Question | As drafted | Answer |
 | --- | --- | --- | --- |
@@ -72,7 +73,7 @@ Each has the draft's answer; "as drafted" accepts it. Alternatives are in the lo
 | G5, Still open #13 (M0-4) | Unit of work in a chunk for credit | Number of indexes; no API for it | |
 | G7 (M0-4) | A barrier API: `pm_barrier_create`, `pm_barrier_wait`? | Added | |
 | G8 (M0-4) | `pm_touch` takes read or write access and returns `int`? | Yes | |
-| G13 (M0-4) | A task holding a lock when its node leaves is run again: what of the lock? | Not settled: nothing drafted | |
+| G13 (M0-4) | A task holding a lock when its node leaves is run again: what of the lock? | Not settled: nothing drafted | Abort the job. Recorded in `include/paramesh.h`, at `pm_lock`. |
 | P3, Still open #4 (M0-5) | `TASK_DONE` carries CPU time, though M5-2's "median over workers" then feeds a credit from a reported value | Kept | |
 | P6, Still open #8 (M0-5) | Job ID | Launcher's `pmd`: node ID in the high 16 bits, a saved counter in the low 16 | |
 | P7, Still open #9 (M0-5) | Discovery interface | Every multicast-capable IPv4 interface; `--iface` restricts | |
@@ -86,7 +87,7 @@ Each has the draft's answer; "as drafted" accepts it. Alternatives are in the lo
 | I2 (M0-7) | `mem`, `store`, `net`, `rt` as abstract classes, not the HLD's free functions | Abstract classes | |
 | I5 (M0-7) | `rt` includes `paramesh.h`, beyond the layout's `wire` and `net` | Yes | |
 
-### To answer at the gate: form, proposed for approval as drafted
+### Form: approved as drafted
 
 M0-4 (`docs/logs/M0-4.md`): G1 `pm_init` signature; G3 task function and `PM_TASK`; G6
 `pm_lock_t` as a 64-bit ID in a struct; G9 error codes and `pm_strerror`; G10 `pm_atomic_add`
@@ -113,4 +114,6 @@ Still open #16 (starting balance of a new peer) is already in `docs/TODO.md`.
 
 - The person edits `docs/PLAN.md` (M4-4 wording) and decides whether the HLD is brought in
   line (home rule 5, leave order, FETCH_INV wording in M2-2).
-- After approval, the `[GATE ...]` and `DRAFT` marks come out of the four files in one change.
+- The four files now carry an "approved and frozen" status line; the `[GATE ...]` tags stay as
+  the record of what was approved (`docs/logs/X-m0-freeze.md`).
+- M1-4 or M2-4 implements G13: a chunk requeued while its thread holds a lock aborts the job.
