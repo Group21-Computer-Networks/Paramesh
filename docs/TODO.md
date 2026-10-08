@@ -27,3 +27,5 @@ These are deferred by `docs/PLAN.md` itself. The "Plan reference" column names t
 | --- | --- | --- |
 | Run `tools/check_env.sh` on the other five laptops, and have the person see `m0_demo` run. | M0 gate | Waived at the gate on 2026-10-07; only `ouroboros` has run it. Record the results in `docs/logs/M0-gate.md`. |
 | Run `readshare` on two cabled laptops (the M1 gate's hardware check for FR-4.1 and FR-4.2). | M1 gate | Waived at the gate on 2026-10-08. The commands are in `docs/logs/M1-gate.md`, "Hardware runs"; record the result there. |
+| Connect `Sync` (`src/rt/sync.h`) to the C API: `pm_lock`, `pm_unlock`, `pm_barrier_*` and `pm_wait_all` in `src/lib/`, and the routing of the five lock and barrier opcodes. | M2-4 | No M2 card lists `src/lib/`; the person decides which task does it. Needed by M2-7. |
+| G13: the code that runs a chunk again must call `Sync::holds_lock` and end the job if the chunk's thread holds a lock. | M2-4 | With M3-2 (`member_leaving`) or M4-5; decided at the M0 gate. |
