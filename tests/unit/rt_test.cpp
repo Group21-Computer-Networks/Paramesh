@@ -187,8 +187,9 @@ public:
     explicit FakeHost(NodeId self) : self_(self) {}
     [[nodiscard]] NodeId self() const noexcept override { return self_; }
     [[nodiscard]] NodeId launcher() const noexcept override { return kLauncher; }
-    [[nodiscard]] NodeId home_of(paramesh::PageId /*page*/) const noexcept override {
-        return kLauncher;
+    // Segment 0 is homed on node 1, segment 1 on node 2, segment 2 on node 3, and round again.
+    [[nodiscard]] NodeId home_of(paramesh::PageId page) const noexcept override {
+        return NodeId{static_cast<std::uint16_t>(paramesh::segment_of(page).value % 3 + 1)};
     }
     [[noreturn]] void abort_job(Status status, std::string_view message) noexcept override {
         static_cast<void>(std::fprintf(stderr, "abort %u: %.*s\n", static_cast<unsigned>(status),
@@ -890,4 +891,48 @@ TEST_CASE("a task frame that fits nothing ends the job") {
     CHECK(with_tasks(1, [](Process& p, paramesh::Tasks& tasks) {
               task_frame(p, tasks, Opcode::kTaskReq, 2, 5, paramesh::TaskReqPayload{0});
           }) == 0);
+}
+
+TEST_CASE("a node that asks is given a chunk whose data it is home for, else the first chunk") {
+    // Six chunks of 1 MiB each over three segments: chunks 1 and 2 are homed on node 1, chunks
+    // 3 and 4 on node 2, chunks 5 and 6 on node 3 (see FakeHost::home_of).
+    const auto queue_six = [](paramesh::Tasks& tasks, bool with_array) {
+        paramesh::ParallelFor call;
+        call.task = "rt_test_sum";
+        call.lo = 0;
+        call.hi = 6;
+        call.grain = 1;
+        if (with_array) {
+            // NOLINTNEXTLINE(performance-no-int-to-ptr): the region lives at a fixed address
+            call.data = reinterpret_cast<const void*>(paramesh::kRegionBase);
+            call.stride = paramesh::kSegmentSize / 2;
+        }
+        REQUIRE(tasks.parallel_for(call).ok());
+    };
+    // Who gets which chunk when nodes 3, 2, 3, 3, 2, 2 ask in that order.
+    const auto handed_out = [&](bool affinity, bool with_array) {
+        Process launcher;
+        paramesh::TasksConfig config;
+        config.threads = 0;
+        config.region_bytes = 3 * paramesh::kSegmentSize;
+        config.affinity = affinity;
+        paramesh::Tasks tasks{launcher.net, launcher.host, launcher.sync, config};
+        queue_six(tasks, with_array);
+        std::string chunks;
+        for (const int node : {3, 2, 3, 3, 2, 2}) {
+            task_frame(launcher, tasks, Opcode::kTaskReq, static_cast<std::uint16_t>(node), 1,
+                       paramesh::TaskReqPayload{0});
+            const std::string sent = launcher.net.take();
+            const auto at = sent.find("chunk ");
+            REQUIRE(at != std::string::npos);
+            chunks += sent.substr(at + 6, 1);
+        }
+        task_frame(launcher, tasks, Opcode::kTaskReq, 2, 1, paramesh::TaskReqPayload{0});
+        CHECK(launcher.net.take() == "NO_TASK>2 req 1 reason 1");
+        return chunks;
+    };
+    // Node 3 takes its own two, then has none and takes the first left; node 2 the same.
+    CHECK(handed_out(true, true) == "536142");
+    CHECK(handed_out(false, true) == "123456");  // affinity off: first in, first out
+    CHECK(handed_out(true, false) == "123456");  // a call with no array has no home to prefer
 }

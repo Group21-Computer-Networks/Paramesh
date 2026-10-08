@@ -41,6 +41,9 @@ struct TasksConfig {
     Nanos backoff_max = std::chrono::milliseconds{200};     // ... doubling to
     std::uint32_t prefetch = 1;                             // task.prefetch
     std::uint32_t chunks_per_slot = 4;  // task.default_grain: range / (this x total_slots)
+    // Data affinity (M3-3): a node that asks is given a chunk whose first page it is home for,
+    // if the queue has one. Off, the queue is first in, first out.
+    bool affinity = true;
 };
 
 // Cuts lo <= i < hi into chunks of about `grain` indexes (at least 1). With an array, where
@@ -89,6 +92,7 @@ private:
         std::uint32_t call = 0;
         std::uint64_t lo = 0;
         std::uint64_t hi = 0;
+        NodeId home;  // the home of the chunk's first page; kNoNode for a call with no array
     };
     struct Worker {
         std::thread thread;
@@ -100,7 +104,7 @@ private:
 
     void work(std::uint16_t thread);
     void ask(std::uint16_t thread);
-    bool take(TaskAssignPayload& out);
+    bool take(NodeId asker, TaskAssignPayload& out);
     void done(std::uint64_t chunk_id, NodeId ran_by, std::uint64_t cpu_ns);
     template <typename Payload>
     void send(NodeId to, Opcode opcode, ReqId req, const Payload& payload, ReplyTimer timer);
