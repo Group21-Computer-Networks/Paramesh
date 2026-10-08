@@ -73,6 +73,18 @@ struct SyncPayload {
     std::uint16_t word = 0;
 };
 
+// ATOMIC_OP: add `operand` to the 64-bit number `offset` bytes from the region base.
+struct AtomicOpPayload {
+    std::uint64_t offset = 0;  // a multiple of 8
+    std::uint64_t operand = 0;
+};
+
+// ATOMIC_RESULT: the number's value before the operation.
+struct AtomicResultPayload {
+    std::uint64_t offset = 0;
+    std::uint64_t old = 0;
+};
+
 Result<std::size_t> wire_encode(const PageIdPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const PagePayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const JoinJobPayload& payload, std::span<std::byte> out);
@@ -80,6 +92,8 @@ Result<std::size_t> wire_encode(const SegMapPayload& payload, std::span<std::byt
 Result<std::size_t> wire_encode(const SegMapAckPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const JobEndPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const SyncPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const AtomicOpPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const AtomicResultPayload& payload, std::span<std::byte> out);
 
 Result<PageIdPayload> wire_decode_page_id(std::span<const std::byte> in);
 // `flags` are the frame's: with ZERO_PAGE the payload must carry no data, without it 4,096 bytes.
@@ -89,6 +103,8 @@ Result<SegMapPayload> wire_decode_seg_map(std::span<const std::byte> in);
 Result<SegMapAckPayload> wire_decode_seg_map_ack(std::span<const std::byte> in);
 Result<JobEndPayload> wire_decode_job_end(std::span<const std::byte> in);
 Result<SyncPayload> wire_decode_sync(std::span<const std::byte> in);
+Result<AtomicOpPayload> wire_decode_atomic_op(std::span<const std::byte> in);
+Result<AtomicResultPayload> wire_decode_atomic_result(std::span<const std::byte> in);
 
 }  // namespace paramesh
 

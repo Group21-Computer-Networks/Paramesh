@@ -277,3 +277,34 @@ TEST_CASE("the lock and barrier payload: id, one word, six reserved bytes") {
     CHECK(paramesh::wire_encode(paramesh::SyncPayload{1, 2}, small).error().code ==
           Errc::kInvalidArgument);
 }
+
+TEST_CASE("the atomic payloads: ATOMIC_OP is 24 bytes with op 1, ATOMIC_RESULT 16") {
+    // Add 3 to the number 0x2008 bytes into the region.
+    const Bytes op = hex("00 00 00 00 00 00 20 08 00 00 00 00 00 00 00 03 01 00 00 00 00 00 00 00");
+    const auto decoded = paramesh::wire_decode_atomic_op(op);
+    REQUIRE(decoded.ok());
+    CHECK(decoded.value().offset == 0x2008);
+    CHECK(decoded.value().operand == 3);
+    CHECK(encoded(paramesh::AtomicOpPayload{0x2008, 3}) == op);
+
+    Bytes other = op;
+    other[16] = std::byte{2};  // an operation that does not exist
+    CHECK(paramesh::wire_decode_atomic_op(other).error().code == Errc::kProtocol);
+    other = op;
+    other[7] = std::byte{0x09};  // not a multiple of 8
+    CHECK(paramesh::wire_decode_atomic_op(other).error().code == Errc::kProtocol);
+    other = op;
+    other.pop_back();
+    CHECK(paramesh::wire_decode_atomic_op(other).error().code == Errc::kProtocol);
+    std::array<std::byte, 24> room{};
+    CHECK(paramesh::wire_encode(paramesh::AtomicOpPayload{0x2009, 3}, room).error().code ==
+          Errc::kInvalidArgument);
+
+    const Bytes result = hex("00 00 00 00 00 00 20 08 FF FF FF FF FF FF FF FE");
+    const auto old = paramesh::wire_decode_atomic_result(result);
+    REQUIRE(old.ok());
+    CHECK(old.value().offset == 0x2008);
+    CHECK(old.value().old == 0xFFFFFFFFFFFFFFFEULL);
+    CHECK(encoded(paramesh::AtomicResultPayload{0x2008, 0xFFFFFFFFFFFFFFFEULL}) == result);
+    CHECK(paramesh::wire_decode_atomic_result(op).error().code == Errc::kProtocol);  // 24 bytes
+}
