@@ -335,6 +335,20 @@ PM_TASK(lib_test_mark) {
     pm_atomic_add(&args->totals->processed, hi - lo);
 }
 
+// Writes the first number of every page of its chunk: one page fault each.
+PM_TASK(lib_test_fill) {
+    const auto* args = static_cast<const MarkArgs*>(arg);
+    volatile std::uint64_t* started = args->totals->started.data();
+    started[ctx->node] = 1;  // as in lib_test_mark: every node runs some chunks
+    for (int waited = 0; waited < 10000 && (started[1] & started[2] & started[3]) == 0; waited++) {
+        ::usleep(1000);
+    }
+    for (std::uint64_t i = lo; i < hi; i += 512) {
+        args->hits[i] = i + 1;
+    }
+    ::usleep(2000);  // long enough that no node has to take another's chunks for want of work
+}
+
 // Throws on any node but the launcher.
 PM_TASK(lib_test_throws) {
     if (ctx->node != 1) {
@@ -415,6 +429,36 @@ int task_program() {
     return pm_finalize() == PM_OK ? 0 : 13;
 }
 
+// The affinity program: one array over six segments, whose homes differ, filled by tasks.
+constexpr std::uint64_t kFillPages = 6ULL * 512;   // six segments of pages
+constexpr std::uint64_t kFillGrain = 32ULL * 512;  // 32 pages to a chunk
+
+int fill_program() {
+    pm_config config{};
+    config.region_bytes = kRegionBytes;
+    config.threads_per_node = 2;
+    if (pm_init(nullptr, nullptr, &config) != PM_OK) {
+        return 2;
+    }
+    auto* totals = static_cast<Totals*>(pm_malloc(sizeof(Totals)));
+    auto* numbers = static_cast<std::uint64_t*>(pm_malloc(kFillPages * paramesh::kPageSize));
+    if (totals == nullptr || numbers == nullptr) {
+        return 3;
+    }
+    const MarkArgs args{numbers, totals};
+    if (pm_parallel_for_data("lib_test_fill", 0, kFillPages * 512, kFillGrain, &args, sizeof args,
+                             numbers, sizeof(std::uint64_t)) != PM_OK ||
+        pm_wait_all() != PM_OK) {
+        return 4;
+    }
+    for (std::uint64_t i = 0; i < kFillPages * 512; i += kFillGrain) {  // one page of each chunk
+        if (numbers[i] != i + 1) {
+            return 5;
+        }
+    }
+    return pm_finalize() == PM_OK ? 0 : 6;
+}
+
 std::uint16_t free_port() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr{};
@@ -433,7 +477,9 @@ struct Started {
 };
 
 // Starts node 1 as the launcher and nodes 2 and 3 as workers, each a process running `run`.
-Started start_job(const char* function, int (*run)() = program) {
+// `setting`, if given, is one more environment variable as NAME=VALUE, and then the pipe takes
+// what all three processes write to stderr, not the launcher alone.
+Started start_job(const char* function, int (*run)() = program, const char* setting = nullptr) {
     const std::array<std::uint16_t, 3> ports = {free_port(), free_port(), free_port()};
     std::string peers;
     for (std::size_t i = 0; i < ports.size(); i++) {
@@ -454,7 +500,14 @@ Started start_job(const char* function, int (*run)() = program) {
             ::setenv("PARAMESH_LISTEN", ("127.0.0.1:" + std::to_string(ports.at(i))).c_str(), 1);
             ::setenv("PARAMESH_PEERS", peers.c_str(), 1);
             ::setenv("TEST_FUNCTION", function, 1);
-            if (i == 0) {
+            if (setting != nullptr) {
+                const std::string_view pair{setting};
+                const auto equals = pair.find('=');
+                ::setenv(std::string{pair.substr(0, equals)}.c_str(),
+                         std::string{pair.substr(equals + 1)}.c_str(), 1);
+                ::setenv("PARAMESH_CFG_LOG_LEVEL", "info", 1);
+            }
+            if (i == 0 || setting != nullptr) {
                 ::dup2(err[1], STDERR_FILENO);
             }
             ::_exit(run());
@@ -537,6 +590,35 @@ TEST_CASE("a task that throws on a worker ends the job everywhere, with its name
     CHECK(wait_for(job.pids[2], 10) == 1);
     CHECK(read_all(job.launcher_stderr) ==
           "job 42 aborted: task 'lib_test_throws' threw: the matrix is singular\n");
+}
+
+// Runs the affinity program and returns the page transfers its three processes logged,
+// summed, or -1 if the run failed or a process logged none.
+long page_transfers(const char* setting) {
+    const Started job = start_job("0", fill_program, setting);
+    const bool ok = wait_for(job.pids[0], 120) == 0 && wait_for(job.pids[1], 10) == 0 &&
+                    wait_for(job.pids[2], 10) == 0;
+    const std::string log = read_all(job.launcher_stderr);
+    const std::string_view key = "\"received\":";
+    long total = 0;
+    int lines = 0;
+    for (auto at = log.find(key); at != std::string::npos; at = log.find(key, at + 1)) {
+        total += std::strtol(log.c_str() + at + key.size(), nullptr, 10);
+        lines++;
+    }
+    INFO(log);
+    CHECK(ok);
+    CHECK(lines == 3);
+    return ok && lines == 3 ? total : -1;
+}
+
+TEST_CASE("with data affinity on, fewer page transfers are logged for the same run" *
+          doctest::skip(!can_run())) {
+    const long with_affinity = page_transfers("PARAMESH_CFG_TASK_AFFINITY=1");
+    const long without = page_transfers("PARAMESH_CFG_TASK_AFFINITY=0");
+    MESSAGE("page transfers: " << with_affinity << " with affinity, " << without << " without");
+    CHECK(with_affinity >= 0);
+    CHECK(with_affinity < without);
 }
 
 TEST_CASE("concurrent atomic adds from three processes sum exactly" * doctest::skip(!can_run())) {

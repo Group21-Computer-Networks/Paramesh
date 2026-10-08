@@ -105,7 +105,9 @@ Result<void> Tasks::parallel_for(const ParallelFor& call) {
     const std::uint32_t id = next_call_++;
     calls_[id] = Call{task_id, {call.arg.begin(), call.arg.end()}, cuts.size()};
     for (const auto& [lo, hi] : cuts) {
-        queue_.push_back(Chunk{next_chunk_++, id, lo, hi});
+        // Where the chunk's data lives, as far as the launcher's own segment map says.
+        const NodeId home = array ? host_.home_of(page_of(data + lo * call.stride)) : kNoNode;
+        queue_.push_back(Chunk{next_chunk_++, id, lo, hi, home});
     }
     sync_.work_added(cuts.size());
     changed_.notify_all();  // the launcher's own threads may be waiting out an empty queue
@@ -188,7 +190,7 @@ void Tasks::ask(std::uint16_t thread) {
     Worker& me = workers_[thread];
     if (launcher_) {
         TaskAssignPayload chunk;
-        if (take(chunk)) {
+        if (take(host_.self(), chunk)) {
             me.have.push_back(std::move(chunk));
         } else {
             me.refused = true;
@@ -201,13 +203,22 @@ void Tasks::ask(std::uint16_t thread) {
     send(host_.launcher(), Opcode::kTaskReq, req, TaskReqPayload{thread}, ReplyTimer::kTimed);
 }
 
-// Launcher: the next chunk of the queue, if there is one, with its call's argument.
-bool Tasks::take(TaskAssignPayload& out) {
+// Launcher: a chunk for `asker`, if the queue has any, with its call's argument: the first one
+// whose data is homed on that node, or else the first one.
+bool Tasks::take(NodeId asker, TaskAssignPayload& out) {
     if (queue_.empty()) {
         return false;
     }
-    const Chunk chunk = queue_.front();
-    queue_.pop_front();
+    // ponytail: a scan of the queue for every request; one queue for each home if a job ever
+    // has enough chunks waiting for this to show.
+    auto pick = queue_.begin();
+    if (config_.affinity) {
+        const auto homed = std::find_if(queue_.begin(), queue_.end(),
+                                        [asker](const Chunk& c) { return c.home == asker; });
+        pick = homed != queue_.end() ? homed : pick;
+    }
+    const Chunk chunk = *pick;
+    queue_.erase(pick);
     taken_[chunk.id] = chunk;
     const Call& call = calls_[chunk.call];
     out = TaskAssignPayload{chunk.id, call.task_id, chunk.lo, chunk.hi, chunk.call, call.arg};
@@ -240,7 +251,7 @@ void Tasks::on_frame(const FrameHeader& header, std::span<const std::byte> paylo
                 bad();
             }
             TaskAssignPayload chunk;
-            if (take(chunk)) {
+            if (take(header.src, chunk)) {
                 send(header.src, Opcode::kTaskAssign, header.req, chunk, ReplyTimer::kNone);
             } else {
                 send(header.src, Opcode::kNoTask, header.req, NoTaskPayload{1}, ReplyTimer::kNone);
