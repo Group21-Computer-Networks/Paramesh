@@ -382,4 +382,47 @@ Result<SyncPayload> wire_decode_sync(std::span<const std::byte> in) {
     return payload;
 }
 
+Result<std::size_t> wire_encode(const AtomicOpPayload& payload, std::span<std::byte> out) {
+    if (payload.offset % 8 != 0) {
+        return kUnsendable;
+    }
+    Writer w{out};
+    w.put(payload.offset, 8);
+    w.put(payload.operand, 8);
+    w.put(1, 1);  // op: add
+    w.put(0, 7);  // reserved
+    return w.done();
+}
+
+Result<AtomicOpPayload> wire_decode_atomic_op(std::span<const std::byte> in) {
+    Reader r{in};
+    AtomicOpPayload payload;
+    payload.offset = r.get(8);
+    payload.operand = r.get(8);
+    const std::uint64_t op = r.get(1);
+    r.take(7);  // reserved: not checked
+    if (!r.exact() || op != 1 || payload.offset % 8 != 0) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const AtomicResultPayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    w.put(payload.offset, 8);
+    w.put(payload.old, 8);
+    return w.done();
+}
+
+Result<AtomicResultPayload> wire_decode_atomic_result(std::span<const std::byte> in) {
+    Reader r{in};
+    AtomicResultPayload payload;
+    payload.offset = r.get(8);
+    payload.old = r.get(8);
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
 }  // namespace paramesh
