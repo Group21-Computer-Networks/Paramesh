@@ -1,5 +1,6 @@
-// src/lib/: three job processes on localhost run the M1 program, started the way
-// docs/PROTOCOL.md section 10 describes for a job without pmd: by environment variables.
+// src/lib/: three job processes on localhost run the M1 program (read sharing) and the M2
+// program (write sharing, locks, a barrier), started the way docs/PROTOCOL.md section 10
+// describes for a job without pmd: by environment variables.
 //
 // The processes map the real region, so these tests are skipped under ThreadSanitizer and
 // where user-mode userfaultfd is missing, as in mem_test.cpp.
@@ -105,6 +106,120 @@ int program() {
     return pm_finalize() == PM_OK ? 0 : 6;
 }
 
+// ---- the M2 program: every node writes one shared page -----------------------------------------
+
+constexpr std::uint64_t kAdds = 1000;
+
+// The first thing in the region. All of it is in one page, on purpose.
+struct Shared {
+    pm_lock_t lock;
+    pm_barrier_t barrier;
+    std::uint64_t counter;                 // changed only under `lock`
+    std::array<std::uint64_t, 4> own;      // own[n] is written by node n alone, without a lock
+    std::array<std::uint64_t, 4> arrived;  // arrived[n]: node n reached the barrier
+};
+
+Shared* shared() {
+    // NOLINTNEXTLINE(performance-no-int-to-ptr): the first allocation is at the region's base
+    return reinterpret_cast<Shared*>(paramesh::kRegionBase);
+}
+
+std::size_t node_number() {
+    const char* id = std::getenv("PARAMESH_NODE_ID");
+    return id != nullptr ? static_cast<std::size_t>(std::strtoul(id, nullptr, 10)) : 0;
+}
+
+void add_with_lock() {
+    for (std::uint64_t i = 0; i < kAdds; i++) {
+        if (pm_lock(shared()->lock) != PM_OK) {
+            pm_test_fail("pm_lock failed");
+        }
+        shared()->counter = shared()->counter + 1;
+        if (pm_unlock(shared()->lock) != PM_OK) {
+            pm_test_fail("pm_unlock failed");
+        }
+    }
+}
+
+// No lock: each node has its own number, but they share a page, so the page changes owner
+// under the writers again and again and no write may be lost on the way.
+void add_to_own_number() {
+    volatile std::uint64_t* mine = &shared()->own.at(node_number());
+    for (std::uint64_t i = 0; i < kAdds; i++) {
+        *mine = *mine + 1;
+    }
+}
+
+void meet_at_the_barrier() {
+    shared()->arrived.at(node_number()) = 1;
+    if (pm_barrier_wait(shared()->barrier) != PM_OK) {
+        pm_test_fail("pm_barrier_wait failed");
+    }
+    if (shared()->arrived.at(2) != 1 || shared()->arrived.at(3) != 1) {
+        pm_test_fail("a worker passed the barrier before the other reached it");
+    }
+}
+
+// What paramesh.h says each wrong call returns, checked on a worker.
+void misuse_a_lock() {
+    const pm_lock_t lock = shared()->lock;
+    const bool as_documented =
+        pm_lock_create().id == 0 &&  // launcher only
+        pm_barrier_create(2).id == 0 &&
+        pm_lock(pm_lock_t{0}) == PM_ERR_INVALID &&  // all zero bytes is never a lock
+        pm_unlock(lock) == PM_ERR_INVALID &&        // not held
+        pm_lock(lock) == PM_OK && pm_lock(lock) == PM_ERR_INVALID &&  // not recursive
+        pm_unlock(lock) == PM_OK &&
+        pm_lock(pm_lock_t{987654}) == PM_ERR_INVALID &&  // the launcher knows no such lock
+        pm_lock(pm_lock_t{shared()->barrier.id}) == PM_ERR_INVALID &&  // a barrier is not a lock
+        pm_barrier_wait(pm_barrier_t{lock.id}) == PM_ERR_INVALID;
+    if (!as_documented) {
+        pm_test_fail("a wrong lock or barrier call did not return what paramesh.h says");
+    }
+}
+
+// The launcher's side. Returns 0, or the number of the step that went wrong.
+int write_program() {
+    pm_test_register(2, add_with_lock);
+    pm_test_register(3, add_to_own_number);
+    pm_test_register(4, meet_at_the_barrier);
+    pm_test_register(5, misuse_a_lock);
+    pm_config config{};
+    config.region_bytes = kRegionBytes;
+    if (pm_lock_create().id != 0 || pm_lock(pm_lock_t{1}) != PM_ERR_STATE) {
+        return 1;  // before pm_init() there is no job
+    }
+    if (pm_init(nullptr, nullptr, &config) != PM_OK) {
+        return 2;
+    }
+    if (pm_malloc(sizeof(Shared)) != shared()) {
+        return 3;
+    }
+    shared()->lock = pm_lock_create();
+    shared()->barrier = pm_barrier_create(2);
+    if (shared()->lock.id == 0 || shared()->barrier.id == 0) {
+        return 4;
+    }
+    if (pm_test_run_on_workers(5) != PM_OK) {
+        return 5;
+    }
+    if (pm_test_run_on_workers(2) != PM_OK || shared()->counter != 2 * kAdds) {
+        return 6;  // two workers, kAdds each, under the lock
+    }
+    add_with_lock();  // the launcher takes the lock from itself and the page from a worker
+    if (shared()->counter != 3 * kAdds) {
+        return 7;
+    }
+    if (pm_test_run_on_workers(3) != PM_OK || shared()->own.at(2) != kAdds ||
+        shared()->own.at(3) != kAdds || shared()->counter != 3 * kAdds) {
+        return 8;
+    }
+    if (pm_test_run_on_workers(4) != PM_OK) {
+        return 9;
+    }
+    return pm_finalize() == PM_OK ? 0 : 10;
+}
+
 std::uint16_t free_port() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr{};
@@ -122,8 +237,8 @@ struct Started {
     int launcher_stderr = -1;
 };
 
-// Starts node 1 as the launcher and nodes 2 and 3 as workers, each a process running program().
-Started start_job(const char* function) {
+// Starts node 1 as the launcher and nodes 2 and 3 as workers, each a process running `run`.
+Started start_job(const char* function, int (*run)() = program) {
     const std::array<std::uint16_t, 3> ports = {free_port(), free_port(), free_port()};
     std::string peers;
     for (std::size_t i = 0; i < ports.size(); i++) {
@@ -147,7 +262,7 @@ Started start_job(const char* function) {
             if (i == 0) {
                 ::dup2(err[1], STDERR_FILENO);
             }
-            ::_exit(program());
+            ::_exit(run());
         }
         started.pids.at(i) = pid;
     }
@@ -199,6 +314,15 @@ TEST_CASE("a lost node makes every other process exit with a message" * doctest:
     CHECK(wait_for(job.pids[0], 10) == 1);
     CHECK(wait_for(job.pids[1], 10) == 1);
     CHECK(read_all(job.launcher_stderr) == "job 42 aborted: node 3 lost\n");
+}
+
+TEST_CASE("three processes write one shared page and lose no update, with and without a lock" *
+          doctest::skip(!can_run())) {
+    const Started job = start_job("0", write_program);
+    CHECK(wait_for(job.pids[0], 120) == 0);  // every total was exact
+    CHECK(wait_for(job.pids[1], 10) == 0);
+    CHECK(wait_for(job.pids[2], 10) == 0);
+    CHECK(read_all(job.launcher_stderr).empty());
 }
 
 // A job of one node, in a child process: a system call on shared memory before and after
