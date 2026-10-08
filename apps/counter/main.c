@@ -21,7 +21,7 @@
  * of a job always is: at the start of the shared region. */
 #define REGION_BASE ((uintptr_t)0x600000000000)
 
-struct shared {
+struct Shared {
     pm_lock_t lock;
     uint64_t nodes;       /* how many nodes took part: each adds 1 when it starts */
     uint64_t with_lock;   /* changed only under `lock` */
@@ -30,8 +30,8 @@ struct shared {
 
 static uint64_t g_adds;
 
-static struct shared* shared(void) {
-    return (struct shared*)REGION_BASE;
+static struct Shared* shared(void) {
+    return (struct Shared*)REGION_BASE;
 }
 
 /* What every node runs in the first phase. */
@@ -62,8 +62,8 @@ static void* run(void* function) {
 
 /* Runs `function` on every worker and, at the same time, on a thread of the launcher. */
 static int on_every_node(uint32_t id, pm_test_fn function) {
-    pthread_t mine;
-    if (pthread_create(&mine, NULL, run, &function) != 0) {
+    pthread_t mine = 0;
+    if (pthread_create(&mine, NULL, run, (void*)&function) != 0) {
         return 0;
     }
     const int ran = pm_test_run_on_workers(id);
@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "counter: pm_init: %s\n", pm_strerror(status));
         return 1;
     }
-    if (pm_malloc(sizeof(struct shared)) != shared()) {
+    if (pm_malloc(sizeof(struct Shared)) != shared()) {
         fprintf(stderr, "counter: the shared data is not where the workers will look\n");
         return 1;
     }
