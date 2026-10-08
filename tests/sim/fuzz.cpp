@@ -368,12 +368,13 @@ private:
     // docs/STATE_MACHINES.md, section 4.
     void check() {
         for (int p = 0; p < kPages; p++) {
-            const std::string name = "page " + std::to_string(p);
+            // Names are built only when something has failed.
+            const auto name = [p] { return "page " + std::to_string(p); };
             const std::uint32_t latest = latest_.at(static_cast<std::size_t>(p));
             const HomeEntryView entry = home_entry(*dir_, PageId{static_cast<std::uint64_t>(p)});
             const std::optional<std::uint32_t>& copy = store_.at(static_cast<std::size_t>(p));
             if (copy.has_value() != (entry.where == HomeWhere::kRam)) {
-                fail("the home's entry and its store disagree about " + name);
+                fail("the home's entry and its store disagree about " + name());
             }
             int writers = 0;
             int readable = 0;
@@ -381,14 +382,14 @@ private:
             bool held = latest == 0 || copy == latest;
             for (int n = 1; n <= kNodes; n++) {
                 const NodePage& mine = page(n, p);
-                const std::string who = "node " + std::to_string(n);
+                const auto who = [n] { return "node " + std::to_string(n); };
                 const bool mapped = mine.state != PageState::kInvalid &&
                                     mine.state != PageState::kReadPending &&
                                     mine.state != PageState::kWritePending;
                 if (mapped != mine.mapped.has_value() ||
                     mine.writable != (mine.state == PageState::kModified) ||
                     is_stable(mine.state) != (mine.current == kNoReq)) {
-                    fail(who + "'s state and its mapping or request disagree on " + name);
+                    fail(who() + "'s state and its mapping or request disagree on " + name());
                 }
                 if (!mapped) {
                     continue;
@@ -397,21 +398,21 @@ private:
                 writers += mine.state == PageState::kModified ? 1 : 0;
                 // No stale read: every copy that can be read is the latest.
                 if (mine.mapped != latest) {
-                    fail("stale read: " + who + " holds an old copy of " + name);
+                    fail("stale read: " + who() + " holds an old copy of " + name());
                 }
                 // The home knows the holders.
                 if ((entry.copyset >> slot_of(n).value & 1U) == 0) {
-                    fail("the home does not know " + who + " holds " + name);
+                    fail("the home does not know " + who() + " holds " + name());
                 }
                 if (entry.state == HomeState::kExclusive && entry.owner != id_of(n)) {
-                    fail(name + " is exclusive but a node other than its owner holds it");
+                    fail(name() + " is exclusive but a node other than its owner holds it");
                 }
                 held = held || mine.state == PageState::kModified ||
                        mine.state == PageState::kWritebackPending ||
                        (mine.state == PageState::kUpgradePending && entry.owner == id_of(n));
             }
             if (writers > 0 && readable > 1) {
-                fail("one writer or many readers: " + name + " has both");
+                fail("one writer or many readers: " + name() + " has both");
             }
             for (const std::deque<Msg>& q : bus_) {
                 for (const Msg& m : q) {
@@ -421,7 +422,7 @@ private:
                 }
             }
             if (!held) {
-                fail("lost update: nobody holds the latest bytes of " + name);
+                fail("lost update: nobody holds the latest bytes of " + name());
             }
         }
     }
