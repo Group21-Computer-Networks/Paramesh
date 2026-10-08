@@ -1,6 +1,7 @@
-// src/lib/: three job processes on localhost run the M1 program (read sharing) and the M2
-// programs (write sharing, locks, a barrier; atomic adds), started the way docs/PROTOCOL.md
-// section 10 describes for a job without pmd: by environment variables.
+// src/lib/: three job processes on localhost run the M1 program (read sharing), the M2
+// programs (write sharing, locks, a barrier; atomic adds) and the M3 program (tasks), started
+// the way docs/PROTOCOL.md section 10 describes for a job without pmd: by environment
+// variables.
 //
 // The processes map the real region, so these tests are skipped under ThreadSanitizer and
 // where user-mode userfaultfd is missing, as in mem_test.cpp.
@@ -26,6 +27,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -289,6 +291,130 @@ int atomic_program() {
     return pm_finalize() == PM_OK ? 0 : 7;
 }
 
+// ---- the task program: three nodes run the chunks of one range -------------------------------
+
+constexpr std::uint64_t kIndexes = 150ULL * 512;  // 150 pages of 64-bit numbers
+
+struct Totals {
+    std::uint64_t processed;               // indexes run, summed over every chunk
+    std::array<std::uint64_t, 4> by_node;  // the same, for each node
+    std::uint64_t misused;                 // calls a task may not make that did not fail
+    std::array<std::uint64_t, 4> started;  // started[n]: node n has begun a chunk
+};
+
+// The tasks' argument: pointers into shared memory, as paramesh.h says to pass them.
+struct MarkArgs {
+    std::uint64_t* hits;
+    Totals* totals;
+};
+
+}  // namespace
+
+// Adds 1 to every index of its chunk, then to the totals, with pm_atomic_add as the last thing.
+PM_TASK(lib_test_mark) {
+    const auto* args = static_cast<const MarkArgs*>(arg);
+    for (std::uint64_t i = lo; i < hi; i++) {
+        args->hits[i] = args->hits[i] + 1;
+    }
+    // The first chunks wait until every node has begun one, so that each node runs some
+    // however long its idle threads slept; they give up waiting after 10 s.
+    volatile std::uint64_t* started = args->totals->started.data();
+    started[ctx->node] = 1;
+    for (int waited = 0; waited < 10000 && (started[1] & started[2] & started[3]) == 0; waited++) {
+        ::usleep(1000);
+    }
+    std::uint64_t misused = ctx->arg_len != sizeof(MarkArgs) ? 1U : 0U;
+    if (lo == 0) {  // what only the launcher's main() may call fails inside a task
+        const bool refused =
+            pm_parallel_for("lib_test_mark", 0, 1, 0, arg, sizeof(MarkArgs)) == PM_ERR_STATE &&
+            pm_wait_all() == PM_ERR_STATE && pm_malloc(8) == nullptr;
+        misused += refused ? 0U : 1U;
+    }
+    pm_atomic_add(&args->totals->misused, misused);
+    pm_atomic_add(&args->totals->by_node.at(ctx->node), hi - lo);
+    pm_atomic_add(&args->totals->processed, hi - lo);
+}
+
+// Throws on any node but the launcher.
+PM_TASK(lib_test_throws) {
+    if (ctx->node != 1) {
+        throw std::runtime_error{"the matrix is singular"};
+    }
+    ::usleep(6000);
+}
+
+namespace {
+
+// The launcher's side. Returns 0, or the number of the step that went wrong.
+int task_program() {
+    pm_config config{};
+    config.region_bytes = kRegionBytes;
+    config.threads_per_node = 2;
+    if (pm_parallel_for("lib_test_mark", 0, 1, 0, nullptr, 0) != PM_ERR_STATE ||
+        pm_wait_all() != PM_ERR_STATE) {
+        return 1;  // before pm_init() there is no job
+    }
+    if (pm_init(nullptr, nullptr, &config) != PM_OK) {
+        return 2;
+    }
+    auto* totals = static_cast<Totals*>(pm_malloc(sizeof(Totals)));
+    auto* hits = static_cast<std::uint64_t*>(pm_malloc(kIndexes * sizeof(std::uint64_t)));
+    if (totals == nullptr || hits == nullptr) {
+        return 3;
+    }
+    const MarkArgs args{hits, totals};
+    const char* task = "lib_test_mark";
+
+    // What paramesh.h says each wrong call returns.
+    std::uint64_t local = 0;
+    if (pm_parallel_for("no_such_task", 0, 8, 0, nullptr, 0) != PM_ERR_UNKNOWN_TASK ||
+        pm_parallel_for(nullptr, 0, 8, 0, nullptr, 0) != PM_ERR_INVALID ||
+        pm_parallel_for(task, 9, 8, 0, &args, sizeof args) != PM_ERR_INVALID ||
+        pm_parallel_for(task, 0, 8, 0, nullptr, sizeof args) != PM_ERR_INVALID ||
+        pm_parallel_for(task, 0, 8, 0, hits, PM_TASK_ARG_MAX + 1) != PM_ERR_INVALID ||
+        pm_parallel_for_data(task, 0, 8, 0, &args, sizeof args, &local, 8) != PM_ERR_INVALID ||
+        pm_parallel_for_data(task, 0, 8, 0, &args, sizeof args, hits, 0) != PM_ERR_INVALID ||
+        pm_parallel_for_data(task, 0, 8, 0, &args, sizeof args, nullptr, 8) != PM_ERR_INVALID) {
+        return 4;
+    }
+    if (pm_parallel_for(task, 5, 5, 0, &args, sizeof args) != PM_OK || pm_wait_all() != PM_OK) {
+        return 5;  // an empty range queues nothing, and nothing outstanding returns at once
+    }
+
+    // Two calls outstanding before one pm_wait_all(): the first half cut on the array's pages,
+    // the second with the default grain.
+    if (pm_parallel_for_data(task, 0, kIndexes / 2, 512, &args, sizeof args, hits,
+                             sizeof(std::uint64_t)) != PM_OK ||
+        pm_parallel_for(task, kIndexes / 2, kIndexes, 0, &args, sizeof args) != PM_OK) {
+        return 6;
+    }
+    if (pm_finalize() != PM_ERR_STATE) {
+        return 7;  // work is still outstanding
+    }
+    if (pm_wait_all() != PM_OK) {
+        return 8;
+    }
+    for (std::uint64_t i = 0; i < kIndexes; i++) {
+        if (hits[i] != 1) {
+            return 9;  // an index was run twice, or not at all
+        }
+    }
+    if (totals->processed != kIndexes || totals->misused != 0 ||
+        totals->by_node[1] + totals->by_node[2] + totals->by_node[3] != kIndexes) {
+        return 10;
+    }
+    if (totals->by_node[1] == 0 || totals->by_node[2] == 0 || totals->by_node[3] == 0) {
+        return 11;  // every node ran some of the chunks
+    }
+    const char* which = std::getenv("TEST_FUNCTION");
+    if (which != nullptr && *which == 't') {  // a task that throws on a worker
+        static_cast<void>(pm_parallel_for("lib_test_throws", 0, 400, 1, nullptr, 0));
+        static_cast<void>(pm_wait_all());
+        return 12;  // not reached: the job is aborted
+    }
+    return pm_finalize() == PM_OK ? 0 : 13;
+}
+
 std::uint16_t free_port() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr{};
@@ -392,6 +518,25 @@ TEST_CASE("three processes write one shared page and lose no update, with and wi
     CHECK(wait_for(job.pids[1], 10) == 0);
     CHECK(wait_for(job.pids[2], 10) == 0);
     CHECK(read_all(job.launcher_stderr).empty());
+}
+
+TEST_CASE("every index of a range is run exactly once across three processes" *
+          doctest::skip(!can_run())) {
+    const Started job = start_job("0", task_program);
+    CHECK(wait_for(job.pids[0], 120) == 0);
+    CHECK(wait_for(job.pids[1], 10) == 0);
+    CHECK(wait_for(job.pids[2], 10) == 0);
+    CHECK(read_all(job.launcher_stderr).empty());
+}
+
+TEST_CASE("a task that throws on a worker ends the job everywhere, with its name" *
+          doctest::skip(!can_run())) {
+    const Started job = start_job("t", task_program);
+    CHECK(wait_for(job.pids[0], 120) == 1);
+    CHECK(wait_for(job.pids[1], 10) == 1);
+    CHECK(wait_for(job.pids[2], 10) == 1);
+    CHECK(read_all(job.launcher_stderr) ==
+          "job 42 aborted: task 'lib_test_throws' threw: the matrix is singular\n");
 }
 
 TEST_CASE("concurrent atomic adds from three processes sum exactly" * doctest::skip(!can_run())) {
