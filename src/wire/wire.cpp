@@ -425,4 +425,97 @@ Result<AtomicResultPayload> wire_decode_atomic_result(std::span<const std::byte>
     return payload;
 }
 
+Result<std::size_t> wire_encode(const TaskReqPayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    w.put(payload.thread, 2);
+    w.put(0, 2);  // reserved
+    return w.done();
+}
+
+Result<TaskReqPayload> wire_decode_task_req(std::span<const std::byte> in) {
+    Reader r{in};
+    const TaskReqPayload payload{static_cast<std::uint16_t>(r.get(2))};
+    r.take(2);
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const TaskAssignPayload& payload, std::span<std::byte> out) {
+    if (payload.arg.size() > kMaxTaskArg) {
+        return kUnsendable;
+    }
+    Writer w{out};
+    w.put(payload.chunk_id, 8);
+    w.put(payload.task_id, 8);
+    w.put(payload.lo, 8);
+    w.put(payload.hi, 8);
+    w.put(payload.call_id, 4);
+    w.put(payload.arg.size(), 2);
+    w.put(0, 2);  // reserved
+    w.bytes(payload.arg);
+    return w.done();
+}
+
+Result<TaskAssignPayload> wire_decode_task_assign(std::span<const std::byte> in) {
+    Reader r{in};
+    TaskAssignPayload payload;
+    payload.chunk_id = r.get(8);
+    payload.task_id = r.get(8);
+    payload.lo = r.get(8);
+    payload.hi = r.get(8);
+    payload.call_id = static_cast<std::uint32_t>(r.get(4));
+    const std::size_t length = r.get(2);
+    r.take(2);
+    const std::span<const std::byte> arg = r.take(length);
+    if (!r.exact() || length > kMaxTaskArg) {
+        return kMalformed;
+    }
+    payload.arg.assign(arg.begin(), arg.end());
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const NoTaskPayload& payload, std::span<std::byte> out) {
+    if (payload.reason != 1 && payload.reason != 2) {
+        return kUnsendable;
+    }
+    Writer w{out};
+    w.put(payload.reason, 1);
+    w.put(0, 3);  // reserved
+    return w.done();
+}
+
+Result<NoTaskPayload> wire_decode_no_task(std::span<const std::byte> in) {
+    Reader r{in};
+    const NoTaskPayload payload{static_cast<std::uint8_t>(r.get(1))};
+    r.take(3);
+    if (!r.exact() || (payload.reason != 1 && payload.reason != 2)) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const TaskDonePayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    w.put(payload.chunk_id, 8);
+    w.put(payload.cpu_ns, 8);
+    w.put(payload.thread, 2);
+    w.put(0, 6);  // reserved
+    return w.done();
+}
+
+Result<TaskDonePayload> wire_decode_task_done(std::span<const std::byte> in) {
+    Reader r{in};
+    TaskDonePayload payload;
+    payload.chunk_id = r.get(8);
+    payload.cpu_ns = r.get(8);
+    payload.thread = static_cast<std::uint16_t>(r.get(2));
+    r.take(6);
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
 }  // namespace paramesh

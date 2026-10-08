@@ -85,6 +85,34 @@ struct AtomicResultPayload {
     std::uint64_t old = 0;
 };
 
+// TASK_REQ: a worker thread asks the launcher for a chunk.
+struct TaskReqPayload {
+    std::uint16_t thread = 0;
+};
+
+// TASK_ASSIGN: one chunk, with the argument of its pm_parallel_for call.
+struct TaskAssignPayload {
+    std::uint64_t chunk_id = 0;
+    std::uint64_t task_id = 0;
+    std::uint64_t lo = 0;
+    std::uint64_t hi = 0;
+    std::uint32_t call_id = 0;
+    std::vector<std::byte> arg;  // at most kMaxTaskArg bytes
+};
+inline constexpr std::size_t kMaxTaskArg = 1024;
+
+// NO_TASK. 1: the queue is empty for now. 2: this node gets no more tasks.
+struct NoTaskPayload {
+    std::uint8_t reason = 1;
+};
+
+// TASK_DONE: a chunk finished, and the CPU time its thread spent on it.
+struct TaskDonePayload {
+    std::uint64_t chunk_id = 0;
+    std::uint64_t cpu_ns = 0;
+    std::uint16_t thread = 0;
+};
+
 Result<std::size_t> wire_encode(const PageIdPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const PagePayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const JoinJobPayload& payload, std::span<std::byte> out);
@@ -94,6 +122,10 @@ Result<std::size_t> wire_encode(const JobEndPayload& payload, std::span<std::byt
 Result<std::size_t> wire_encode(const SyncPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const AtomicOpPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const AtomicResultPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const TaskReqPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const TaskAssignPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const NoTaskPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const TaskDonePayload& payload, std::span<std::byte> out);
 
 Result<PageIdPayload> wire_decode_page_id(std::span<const std::byte> in);
 // `flags` are the frame's: with ZERO_PAGE the payload must carry no data, without it 4,096 bytes.
@@ -105,6 +137,10 @@ Result<JobEndPayload> wire_decode_job_end(std::span<const std::byte> in);
 Result<SyncPayload> wire_decode_sync(std::span<const std::byte> in);
 Result<AtomicOpPayload> wire_decode_atomic_op(std::span<const std::byte> in);
 Result<AtomicResultPayload> wire_decode_atomic_result(std::span<const std::byte> in);
+Result<TaskReqPayload> wire_decode_task_req(std::span<const std::byte> in);
+Result<TaskAssignPayload> wire_decode_task_assign(std::span<const std::byte> in);
+Result<NoTaskPayload> wire_decode_no_task(std::span<const std::byte> in);
+Result<TaskDonePayload> wire_decode_task_done(std::span<const std::byte> in);
 
 }  // namespace paramesh
 
