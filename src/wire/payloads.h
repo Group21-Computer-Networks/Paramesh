@@ -1,4 +1,4 @@
-// Payloads of the opcodes M1 uses (docs/PROTOCOL.md, sections 7.1 and 7.2). Each has a struct,
+// Payloads of the opcodes built so far (docs/PROTOCOL.md, section 7). Each has a struct,
 // wire_encode() and a decoder. A decoder returns Errc::kProtocol for a payload that breaks the
 // protocol; wire_encode() returns the bytes written, or Errc::kInvalidArgument for a value that
 // cannot be sent or a buffer that is too small.
@@ -65,12 +65,21 @@ struct JobEndPayload {
     std::string message;  // at most 512 bytes
 };
 
+// LOCK_ACQ, LOCK_REL and BARRIER_ENTER, where `word` is the thread index, and LOCK_GRANT and
+// BARRIER_RELEASE, where it is a Status: all five are the handle's id, one 16-bit word and
+// six reserved bytes.
+struct SyncPayload {
+    std::uint64_t id = 0;
+    std::uint16_t word = 0;
+};
+
 Result<std::size_t> wire_encode(const PageIdPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const PagePayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const JoinJobPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const SegMapPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const SegMapAckPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const JobEndPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const SyncPayload& payload, std::span<std::byte> out);
 
 Result<PageIdPayload> wire_decode_page_id(std::span<const std::byte> in);
 // `flags` are the frame's: with ZERO_PAGE the payload must carry no data, without it 4,096 bytes.
@@ -79,6 +88,7 @@ Result<JoinJobPayload> wire_decode_join_job(std::span<const std::byte> in);
 Result<SegMapPayload> wire_decode_seg_map(std::span<const std::byte> in);
 Result<SegMapAckPayload> wire_decode_seg_map_ack(std::span<const std::byte> in);
 Result<JobEndPayload> wire_decode_job_end(std::span<const std::byte> in);
+Result<SyncPayload> wire_decode_sync(std::span<const std::byte> in);
 
 }  // namespace paramesh
 

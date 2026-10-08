@@ -362,4 +362,24 @@ Result<JobEndPayload> wire_decode_job_end(std::span<const std::byte> in) {
     return payload;
 }
 
+Result<std::size_t> wire_encode(const SyncPayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    w.put(payload.id, 8);
+    w.put(payload.word, 2);
+    w.put(0, 6);  // reserved
+    return w.done();
+}
+
+Result<SyncPayload> wire_decode_sync(std::span<const std::byte> in) {
+    Reader r{in};
+    SyncPayload payload;
+    payload.id = r.get(8);
+    payload.word = static_cast<std::uint16_t>(r.get(2));
+    r.take(6);  // reserved: not checked
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
 }  // namespace paramesh
