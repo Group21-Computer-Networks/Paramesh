@@ -1,9 +1,9 @@
 # M2 gate
 
 - Milestone: M2
-- Status: open
-- Closed by:
-- Closed on:
+- Status: closed
+- Closed by: Amirishetty Sai Vignesh
+- Closed on: 2026-10-09
 
 <!--
 Only the person closes a gate. An agent may prepare this file and fill in checks it ran,
@@ -31,12 +31,12 @@ Evidence: the command, the log or result file, the trace, or "seen by <who>".
 | FR-5.3: atomics | three simulated nodes | pass | the same two runs: `3000 with pm_atomic_add` and `300`; and `unit.lib_test`, "concurrent atomic adds from three processes sum exactly" |
 | FR-5.3: barriers | three processes on localhost | pass | `unit.lib_test`, the same case as the lock: two workers meet at a barrier and each sees the other's mark. The counter program has no barrier |
 | UC-2: the shared counter stays exact | three simulated nodes | pass | `PASS: counter, both runs`; output under "Runs" |
-| FR-5.3 and UC-2 on hardware | two cabled laptops | pending | not run; commands under "Hardware runs" |
+| FR-5.3 and UC-2 on hardware | two cabled laptops | n/a | waived by Amirishetty Sai Vignesh in chat, 2026-10-09 ("Waive for now"); the run is in `docs/TODO.md`, commands under "Hardware runs" |
 
 ## Hardware runs
 
 <!-- Which laptops, kernel versions, the cable or switch, and anything unusual. -->
-Not run yet. There is no `pmd` before M3, so each laptop starts its process by hand. With the
+Waived at this gate; not run. There is no `pmd` before M3, so each laptop starts its process by hand. With the
 same build of `counter` at the same path on both, A at 10.0.0.1 and B at 10.0.0.2:
 
 ```bash
@@ -91,7 +91,11 @@ Each "Still open" point or flagged question the person answered at this gate:
 the point's number, the answer, and where it is now recorded (the frozen file, AGENTS.md, docs/TODO.md).
 "None" if none.
 -->
-None so far.
+None. No "Still open" point came up at this gate; the three questions answered during M2 are
+listed under "What M2 added beyond its seven cards".
+
+**How the gate was closed.** Asked in chat on 2026-10-09, Amirishetty Sai Vignesh waived the two-laptop
+run and answered "Yes, close it".
 
 ## Follow-ups
 
