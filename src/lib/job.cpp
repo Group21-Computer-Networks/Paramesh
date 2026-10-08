@@ -1,7 +1,7 @@
 // One job process: the transport, the memory engine, the node and home machines, the home
 // store and the lock manager wired together behind paramesh.h. So far: start-up without pmd,
-// read and write sharing, locks and barriers, clean end, and abort on a lost node or a reply
-// timeout. Not yet: atomics (M2-5), tasks (M3), eviction and spill (M4).
+// read and write sharing, locks, barriers and atomic adds, clean end, and abort on a lost node or a
+// reply timeout. Not yet: tasks (M3), eviction and spill (M4).
 //
 // Threads (docs/INTERNAL_API.md, section 1): every piece of protocol state below is touched
 // only on the network thread. The fault-handler thread and the application's threads hand
@@ -257,6 +257,27 @@ public:
         return PM_OK;
     }
 
+    // pm_atomic_add: asks the page's home to add, and sleeps until it answers with the old value.
+    std::uint64_t atomic_add(const std::uint64_t* addr, std::uint64_t delta) noexcept {
+        const auto address = reinterpret_cast<std::uintptr_t>(addr);
+        if (address < kRegionBase || address - kRegionBase >= region_bytes_ || address % 8 != 0) {
+            // The return value cannot carry an error (paramesh.h).
+            abort_job(Status::kInternal,
+                      std::string_view{"pm_atomic_add: the address is not an 8-byte-aligned "
+                                       "number in the shared region"});
+        }
+        const ReqId req = fresh();
+        std::unique_lock<std::mutex> lock{mutex_};
+        adds_.push_back({req, AtomicOpPayload{address - kRegionBase, delta}});
+        // A reference into an unordered_map stays valid while other threads insert and erase.
+        std::optional<std::uint64_t>& old = add_results_[req.value];
+        run_on_network_thread();
+        changed_.wait(lock, [&old] { return old.has_value(); });
+        const std::uint64_t value = old.value_or(0);
+        add_results_.erase(req.value);
+        return value;
+    }
+
     // Locks and barriers. Null before pm_init() has built the job.
     [[nodiscard]] Sync* sync() noexcept { return sync_.has_value() ? &*sync_ : nullptr; }
 
@@ -402,9 +423,17 @@ public:
             advance_start();
         }
         std::deque<FaultEvent> faults;
+        std::deque<Add> adds;
         {
             const std::lock_guard<std::mutex> lock{mutex_};
             faults.swap(faults_);
+            adds.swap(adds_);
+        }
+        for (const Add& add : adds) {
+            std::array<std::byte, 24> payload{};
+            static_cast<void>(wire_encode(add.op, payload));
+            post(home_of(page_of(kRegionBase + add.op.offset)), Opcode::kAtomicOp, payload, add.req,
+                 0, ReplyTimer::kTimed);
         }
         for (const FaultEvent& fault : faults) {
             node_event(fault.kind == FaultKind::kRead ? NodeEventKind::kNeedRead
@@ -418,6 +447,11 @@ private:
     struct Local {
         FrameHeader header;
         std::vector<std::byte> payload;
+    };
+    // One pm_atomic_add on its way from an application thread to the network thread.
+    struct Add {
+        ReqId req;
+        AtomicOpPayload op;
     };
 
     bool hash_binary(const Hasher& hasher) {
@@ -636,6 +670,29 @@ private:
                 }
                 return;
             }
+            case Opcode::kAtomicOp: {
+                const Result<AtomicOpPayload> op = wire_decode_atomic_op(payload);
+                if (!op.ok() || op.value().offset >= region_bytes_) {
+                    bad();
+                    return;
+                }
+                home_event(
+                    HomeEventKind::kAtomicOp, header, page_of(kRegionBase + op.value().offset), {},
+                    static_cast<std::uint16_t>(op.value().offset % kPageSize), op.value().operand);
+                return;
+            }
+            case Opcode::kAtomicResult: {
+                const Result<AtomicResultPayload> result = wire_decode_atomic_result(payload);
+                const std::lock_guard<std::mutex> lock{mutex_};
+                const auto waiting = add_results_.find(header.req.value);
+                if (!result.ok() || waiting == add_results_.end()) {
+                    bad();
+                    return;
+                }
+                waiting->second = result.value().old;
+                changed_.notify_all();
+                return;
+            }
             case Opcode::kLockAcq:
             case Opcode::kLockGrant:
             case Opcode::kLockRel:
@@ -794,10 +851,13 @@ private:
     // ------------------------------------------------------------------------
 
     void home_event(HomeEventKind kind, const FrameHeader& header, PageId page,
-                    std::span<const std::byte> data) noexcept {
+                    std::span<const std::byte> data, std::uint16_t offset_in_page = 0,
+                    std::uint64_t operand = 0) noexcept {
         HomeEvent event;
         event.kind = kind;
         event.page = page;
+        event.offset_in_page = offset_in_page;
+        event.operand = operand;
         event.from = header.src;
         event.slot = slot_of(header.src);
         event.req = header.req;
@@ -844,11 +904,40 @@ private:
                 case HomeActionKind::kDropCopy:
                     store_->drop(a.page);
                     break;
+                case HomeActionKind::kApplyAtomic: {
+                    // The number is in the program's own byte order, as its threads read it.
+                    std::array<std::byte, kPageSize> copy{};  // zeros for a page never written
+                    std::uint64_t number = 0;
+                    std::byte* const at = copy.data() + a.offset_in_page;
+                    bool have = a.offset_in_page <= kPageSize - sizeof number;
+                    if (have && a.source != PageSource::kZero) {
+                        const Result<StoreLookup> got = store_->get(a.page, copy);
+                        have = got.ok() && got.value() == StoreLookup::kCopied;
+                    }
+                    if (!have) {
+                        abort_job(Status::kInternal, s_.self,
+                                  "the home has no copy of page " + std::to_string(a.page.value));
+                        return;
+                    }
+                    std::memcpy(&number, at, sizeof number);
+                    const std::uint64_t sum = number + a.operand;  // modulo 2^64
+                    std::memcpy(at, &sum, sizeof sum);
+                    if (!store_->put(a.page, copy).ok()) {
+                        abort_job(Status::kInternal, s_.self, "the home store is full");
+                        return;
+                    }
+                    std::array<std::byte, 16> result{};
+                    static_cast<void>(wire_encode(
+                        AtomicResultPayload{a.page.value * kPageSize + a.offset_in_page, number},
+                        result));
+                    post(a.to, Opcode::kAtomicResult, result, a.req);
+                    break;
+                }
                 case HomeActionKind::kAbort:
                     abort_job(Status::kInternal, s_.self,
                               "the home machine met an impossible event");
                     return;
-                default:  // apply atomic: M2-5; load and the hold window: later milestones
+                default:  // load and the hold window: later milestones
                     abort_job(Status::kUnsupported, s_.self,
                               "a home action this build does not carry out yet");
                     return;
@@ -893,6 +982,8 @@ private:
     std::mutex mutex_;
     std::condition_variable changed_;
     std::deque<FaultEvent> faults_;
+    std::deque<Add> adds_;
+    std::unordered_map<std::uint64_t, std::optional<std::uint64_t>> add_results_;
     std::string abort_message_;
     bool up_ = false;
     std::size_t hook_done_ = 0;
@@ -993,6 +1084,14 @@ paramesh::Sync* locks() {
 }
 
 }  // namespace
+
+uint64_t pm_atomic_add(uint64_t* addr, uint64_t delta) {
+    if (paramesh::job() == nullptr) {
+        static_cast<void>(std::fprintf(stderr, "pm_atomic_add: there is no job\n"));
+        ::_exit(1);
+    }
+    return paramesh::job()->atomic_add(addr, delta);
+}
 
 pm_lock_t pm_lock_create(void) {
     return locks() != nullptr ? locks()->lock_create() : pm_lock_t{0};
