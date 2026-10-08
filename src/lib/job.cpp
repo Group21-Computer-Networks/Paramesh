@@ -14,6 +14,7 @@
 #include "net/transport.h"
 #include "platform/factory.h"
 #include "rt/region_allocator.h"
+#include "rt/registry.h"
 #include "rt/runtime.h"
 #include "rt/sync.h"
 #include "store/home_store.h"
@@ -1027,9 +1028,19 @@ const char* pm_strerror(int status) {
     }
 }
 
+int pm_register_task(const char* name, pm_task_fn fn) {
+    return paramesh::rt_register_task(name, fn).ok() ? PM_OK : PM_ERR_INVALID;
+}
+
 int pm_init(int* /*argc*/, char*** /*argv*/, const pm_config* cfg) {
     if (paramesh::job() != nullptr) {
         return PM_ERR_STATE;
+    }
+    // Two tasks that would be one on the wire: the program cannot run (paramesh.h).
+    if (const paramesh::Result<void> tasks = paramesh::rt_check_registry(); !tasks.ok()) {
+        static_cast<void>(std::fprintf(stderr, "pm_init: %s\n", tasks.error().what));
+        static_cast<void>(std::fflush(nullptr));
+        ::_exit(1);
     }
     const std::uint64_t bytes =
         cfg != nullptr && cfg->region_bytes != 0 ? cfg->region_bytes : PM_REGION_MAX_BYTES;
