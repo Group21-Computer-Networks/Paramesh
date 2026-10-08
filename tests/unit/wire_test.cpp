@@ -251,3 +251,29 @@ TEST_CASE("payloads that break the protocol are rejected, and unsendable ones ar
     twice.members[1].slot = paramesh::Slot{0};  // two members, one slot
     CHECK(paramesh::wire_encode(twice, small).error().code == Errc::kInvalidArgument);
 }
+
+TEST_CASE("the lock and barrier payload: id, one word, six reserved bytes") {
+    // LOCK_ACQ for lock 0x1122334455667788 by the launcher's main thread.
+    const Bytes acquire = hex("11 22 33 44 55 66 77 88 FF FF 00 00 00 00 00 00");
+    const auto decoded = paramesh::wire_decode_sync(acquire);
+    REQUIRE(decoded.ok());
+    CHECK(decoded.value().id == 0x1122334455667788ULL);
+    CHECK(decoded.value().word == 0xFFFF);
+    CHECK(encoded(paramesh::SyncPayload{0x1122334455667788ULL, 0xFFFF}) == acquire);
+
+    // LOCK_GRANT with BAD_HANDLE (14); the reserved bytes are not checked.
+    const auto grant =
+        paramesh::wire_decode_sync(hex("00 00 00 00 00 00 00 05 00 0E 01 02 03 04 05 06"));
+    REQUIRE(grant.ok());
+    CHECK(grant.value().id == 5);
+    CHECK(grant.value().word == static_cast<std::uint16_t>(paramesh::Status::kBadHandle));
+
+    CHECK(paramesh::wire_decode_sync(hex("00 00 00 00 00 00 00 05 00 0E")).error().code ==
+          Errc::kProtocol);  // short
+    Bytes longer = acquire;
+    longer.push_back(std::byte{0});
+    CHECK(paramesh::wire_decode_sync(longer).error().code == Errc::kProtocol);
+    std::array<std::byte, 15> small{};
+    CHECK(paramesh::wire_encode(paramesh::SyncPayload{1, 2}, small).error().code ==
+          Errc::kInvalidArgument);
+}
