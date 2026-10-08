@@ -224,6 +224,96 @@ TEST_CASE("a write to a read-only page reports a write fault; allowing writes re
     CHECK(*byte_of(page) == 0x44);
 }
 
+// The M2-3 card's check, as the node machine drives it: S, a write fault, UPGRADE_REQ, and on
+// UPGRADE_GRANT "allow writes".
+TEST_CASE("a write to a shared page raises one event and resumes after the grant" *
+          doctest::skip(!region_tests_can_run())) {
+    RecordingSink sink;
+    const EnginePtr engine = open_engine(sink);
+    const PageId page{11};
+    PageArray shared = filled(0x55);
+    shared[1] = std::byte{0x66};
+    REQUIRE(engine->install(page, shared, PageProtection::kReadOnly).ok());
+
+    std::atomic<bool> wrote{false};
+    std::thread writer{[&] {
+        *byte_of(page) = 0x77;
+        wrote = true;
+    }};
+    CHECK(next_fault(sink).kind == FaultKind::kWrite);
+    CHECK(*byte_of(page) == 0x55);  // readers go on reading while the writer waits
+    CHECK_FALSE(wrote);
+
+    REQUIRE(engine->write_protect(page, false).ok());  // the grant
+    writer.join();
+    CHECK(wrote);
+    *byte_of(page) = 0x78;  // and the page stays writable: no further fault
+    CHECK(sink.count() == 1);
+
+    PageArray now{};
+    REQUIRE(engine->read(page, now).ok());
+    CHECK(now[0] == std::byte{0x78});
+    CHECK(now[1] == std::byte{0x66});  // the grant carried no bytes; the rest is as it was
+}
+
+// S→M then INV: another writer won. The page is discarded while the writer is parked, and the
+// WRITE_GRANT that follows brings the winner's bytes.
+TEST_CASE("a parked writer whose page is discarded resumes on the page installed for it" *
+          doctest::skip(!region_tests_can_run())) {
+    RecordingSink sink;
+    const EnginePtr engine = open_engine(sink);
+    const PageId page{12};
+    REQUIRE(engine->install(page, filled(0x10), PageProtection::kReadOnly).ok());
+
+    std::thread writer{[&] { *byte_of(page) = 0x99; }};
+    CHECK(next_fault(sink).kind == FaultKind::kWrite);
+    REQUIRE(engine->zap(page).ok());  // not woken: it still waits for its grant
+
+    PageArray theirs = filled(0x20);
+    REQUIRE(engine->install(page, theirs, PageProtection::kWritable).ok());
+    writer.join();
+    CHECK(sink.count() == 1);  // the one write raised the one event
+    PageArray now{};
+    REQUIRE(engine->read(page, now).ok());
+    CHECK(now[0] == std::byte{0x99});  // its write landed on the new page
+    CHECK(now[1] == std::byte{0x20});
+}
+
+// M then FETCH_INV: write-protect, copy the page out, discard, wake. A thread that wrote
+// between the write-protect and the discard must not lose its write silently: it parks, and
+// after the wake it faults again as on a missing page.
+TEST_CASE("a writer caught by a page being given up faults again after the discard" *
+          doctest::skip(!region_tests_can_run())) {
+    RecordingSink sink;
+    const EnginePtr engine = open_engine(sink);
+    const PageId page{13};
+    REQUIRE(engine->install(page, filled(0x01), PageProtection::kWritable).ok());
+    *byte_of(page) = 0x02;
+
+    REQUIRE(engine->write_protect(page, true).ok());
+    std::atomic<bool> wrote{false};
+    std::thread writer{[&] {
+        *byte_of(page) = 0x03;
+        wrote = true;
+    }};
+    CHECK(next_fault(sink).kind == FaultKind::kWrite);
+    PageArray sent{};
+    REQUIRE(engine->read(page, sent).ok());
+    CHECK(sent[0] == std::byte{0x02});  // what goes to the home is what was there before
+    REQUIRE(engine->zap(page).ok());
+    REQUIRE(engine->wake(page).ok());
+
+    const FaultEvent again = next_fault(sink);  // the same write, now to a missing page
+    CHECK(again.page == page);
+    CHECK(again.kind == FaultKind::kWrite);
+    CHECK_FALSE(wrote);
+
+    REQUIRE(engine->install(page, filled(0x02), PageProtection::kWritable).ok());  // WRITE_GRANT
+    writer.join();
+    CHECK(*byte_of(page) == 0x03);
+    CHECK(sink.count() == 2);
+}
+
 TEST_CASE("write_protect on makes the next write to a writable page fault" *
           doctest::skip(!region_tests_can_run())) {
     RecordingSink sink;
