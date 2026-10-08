@@ -69,6 +69,8 @@ struct Settings {
     Endpoint listen;
     std::vector<Member> members;  // launcher first; slots in this order
     Nanos start_timeout = std::chrono::seconds{10};
+    LogLevel log_level = LogLevel::kWarn;  // log.level
+    bool affinity = true;                  // PARAMESH_CFG_TASK_AFFINITY=0 turns M3-3 off
 };
 
 // "127.0.0.1:47100" -> endpoint. False if it is not that.
@@ -113,6 +115,19 @@ bool read_settings(Settings& s) {
     if (const char* timeout =
             env("PARAMESH_CFG_JOB_START_TIMEOUT")) {  // job.start_timeout, in seconds
         s.start_timeout = std::chrono::seconds{std::strtol(timeout, nullptr, 10)};
+    }
+    if (const char* level = env("PARAMESH_CFG_LOG_LEVEL")) {
+        const std::string_view name{level};
+        if (name == "debug") {
+            s.log_level = LogLevel::kDebug;
+        } else if (name == "info") {
+            s.log_level = LogLevel::kInfo;
+        } else if (name == "error") {
+            s.log_level = LogLevel::kError;
+        }
+    }
+    if (const char* affinity = env("PARAMESH_CFG_TASK_AFFINITY")) {
+        s.affinity = std::string_view{affinity} != "0";
     }
     bool found_self = false;
     std::string_view rest{peers};
@@ -168,7 +183,7 @@ public:
     // Brings the process into the job. Returns a pm_status; on a worker it returns PM_OK once
     // the job is up, and the caller then waits for the job to end.
     int start(std::uint64_t region_bytes, std::uint32_t threads) {
-        auto platform = platform_open({}, PlatformOptions{s_.self, s_.job, 2, LogLevel::kWarn});
+        auto platform = platform_open({}, PlatformOptions{s_.self, s_.job, 2, s_.log_level});
         if (!platform.ok() || !hash_binary(*platform.value().hasher)) {
             return PM_ERR_PLATFORM;
         }
@@ -219,6 +234,7 @@ public:
             threads != 0 ? threads : std::thread::hardware_concurrency(), 1, kHookThreads - 1));
         tasks.total_slots = static_cast<std::uint32_t>(tasks.threads * s_.members.size());
         tasks.region_bytes = region_bytes_;
+        tasks.affinity = s_.affinity;
         tasks_.emplace(*net_, *this, *sync_, tasks);
         return tasks_->start().ok() ? PM_OK : PM_ERR_PLATFORM;
     }
@@ -334,6 +350,7 @@ public:
         }
         net_->stop();
         thread_.join();
+        log_pages();
     }
 
     // Ends the job on an error, from any thread: tells the others, then exits this process.
@@ -621,7 +638,20 @@ private:
 
     // ---- one frame -----------------------------------------------------------------------------
 
+    // What this process has to say when the job ends in order: how many pages, or rights to
+    // pages, reached it from other nodes.
+    void log_pages() const noexcept {
+        platform_.logger->log(
+            LogLevel::kInfo, "job_pages",
+            JsonObject{{"received", JsonValue{static_cast<std::int64_t>(pages_in_)}}});
+    }
+
     void handle(const FrameHeader& header, std::span<const std::byte> payload) noexcept {
+        if (header.src != s_.self &&
+            (header.opcode == Opcode::kReadData || header.opcode == Opcode::kWriteGrant ||
+             header.opcode == Opcode::kUpgradeGrant || header.opcode == Opcode::kFetchData)) {
+            pages_in_++;
+        }
         const auto bad = [&] {
             abort_job(Status::kProtocol, header.src,
                       "malformed frame from node " + std::to_string(header.src.value));
@@ -756,6 +786,9 @@ private:
                 if (is_launcher()) {  // a worker reported a fatal condition: pass it on and stop
                     abort_job(end.value().status, end.value().node, end.value().message);
                     return;
+                }
+                if (end.value().status == Status::kOk) {
+                    log_pages();
                 }
                 exit_with(end.value().status, end.value().message);
             }
@@ -1006,6 +1039,7 @@ private:
     std::vector<PageState> states_;
     std::unordered_map<std::uint64_t, ReqId> current_;
     std::deque<Local> local_;
+    std::uint64_t pages_in_ = 0;
     std::vector<HomeAction> actions_;
 
     // Shared.
