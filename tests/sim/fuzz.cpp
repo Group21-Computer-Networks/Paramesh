@@ -1,4 +1,5 @@
-// Fuzz harness for the coherence state machines (M1 subset).
+// Fuzz harness for the coherence state machines: the whole protocol of
+// docs/STATE_MACHINES.md sections 1 and 2, without the hold window, spill and migration.
 //
 //   sim_fuzz --schedules N   run seeds 1 to N; exit 1 at the first that fails
 //   sim_fuzz --seed S        run one seed and print every step
@@ -7,8 +8,9 @@
 // Three simulated nodes run the real coh_step; node 1 also runs the real home_step for every
 // page. They talk over a fake bus: one queue per ordered pair of nodes, kept in order as a TCP
 // connection would, with the choice of which queue delivers next (and so every delay and
-// every reordering between connections) taken from the seed. After every step the invariants
-// of docs/STATE_MACHINES.md, section 4, are checked. A run depends on its seed alone.
+// every reordering between connections) taken from the seed. Any node may read, write, add
+// atomically or evict any page at any step. After every step the invariants of
+// docs/STATE_MACHINES.md, section 4, are checked. A run depends on its seed alone.
 
 #include "coh/home_machine.h"
 #include "coh/node_machine.h"
@@ -22,6 +24,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -31,9 +34,6 @@ using namespace paramesh;  // NOLINT(google-build-using-namespace): a test progr
 constexpr int kNodes = 3;  // node IDs 1 to 3; node n has copyset slot n - 1
 constexpr int kHome = 1;
 constexpr int kPages = 3;
-// Who writes each page first, or 0 for a page nobody writes. In M1 the home refuses a write to
-// a page others hold, so a page's readers start only after its writer has finished.
-constexpr std::array<int, kPages> kWriter = {2, 1, 0};
 constexpr int kSteps = 300;
 
 struct Failure {
@@ -59,7 +59,19 @@ struct NodePage {
     ReqId current;
     std::optional<std::uint32_t> mapped;  // what the node's copy holds, if it has one
     bool writable = false;
+    bool adding = false;  // a thread waits in pm_atomic_add for this page
 };
+
+// How often each message was delivered, over every schedule of the run.
+std::array<std::uint64_t, 256>& delivered() {
+    static std::array<std::uint64_t, 256> counts{};
+    return counts;
+}
+
+bool is_stable(PageState state) {
+    return state == PageState::kInvalid || state == PageState::kShared ||
+           state == PageState::kModified;
+}
 
 class Sim {
 public:
@@ -81,12 +93,16 @@ public:
             step_++;
             check();
         }
-        for (int n = 1; n <= kNodes; n++) {
-            for (int p = 0; p < kPages; p++) {
-                if (page(n, p).current != kNoReq) {
+        for (int p = 0; p < kPages; p++) {
+            for (int n = 1; n <= kNodes; n++) {
+                if (page(n, p).current != kNoReq || page(n, p).adding) {
                     fail("node " + std::to_string(n) + " still waits for page " +
                          std::to_string(p));
                 }
+            }
+            const HomeEntryView entry = home_entry(*dir_, PageId{static_cast<std::uint64_t>(p)});
+            if (entry.wait != HomeWait::kIdle || entry.queued != 0) {
+                fail("the home is still busy with page " + std::to_string(p));
             }
         }
     }
@@ -115,28 +131,39 @@ private:
     void random_move() {
         const int node = static_cast<int>(pick(kNodes)) + 1;
         const int p = static_cast<int>(pick(kPages));
-        const int writer = kWriter.at(static_cast<std::size_t>(p));
-        switch (pick(4)) {
-            case 0:  // a read fault, once the page's writer is done (or it has none)
-                if (writer == 0 || published_.at(static_cast<std::size_t>(p))) {
+        NodePage& mine = page(node, p);
+        switch (pick(10)) {
+            case 0:
+            case 1:  // a thread reads: it faults unless the page is mapped
+                if (!mine.mapped) {
                     say("read fault", node, p);
                     node_event(node, p, NodeEventKind::kNeedRead, nullptr);
                 }
                 break;
-            case 1:  // the writer's write fault, then its write, then it lets the readers in
-                if (node == writer && !published_.at(static_cast<std::size_t>(p))) {
-                    NodePage& mine = page(node, p);
-                    if (mine.state == PageState::kModified) {
-                        say("write", node, p);
-                        mine.mapped = ++latest_.at(static_cast<std::size_t>(p));
-                        published_.at(static_cast<std::size_t>(p)) = pick(2) == 0;
-                    } else {
-                        say("write fault", node, p);
-                        node_event(node, p, NodeEventKind::kNeedWrite, nullptr);
-                    }
+            case 2:
+            case 3:  // a thread writes: at once if the page is writable, else it faults
+                if (mine.writable) {
+                    say("write", node, p);
+                    mine.mapped = ++latest_.at(static_cast<std::size_t>(p));
+                } else {
+                    say("write fault", node, p);
+                    node_event(node, p, NodeEventKind::kNeedWrite, nullptr);
                 }
                 break;
-            default:  // deliver something, twice as often as each kind of fault
+            case 4:  // a thread calls pm_atomic_add and waits for the result
+                if (!mine.adding) {
+                    say("atomic add", node, p);
+                    mine.adding = true;
+                    queue(node, kHome)
+                        .push_back(
+                            {Opcode::kAtomicOp, node, kHome, p, ReqId{++next_req_}, 0, false});
+                }
+                break;
+            case 5:  // the local cache frees the page
+                say("evict", node, p);
+                node_event(node, p, NodeEventKind::kEvict, nullptr);
+                break;
+            default:  // deliver something
                 deliver_one();
         }
     }
@@ -156,12 +183,25 @@ private:
         const Msg msg = q.front();
         q.pop_front();
         say("deliver", msg.to, msg.page);
+        delivered().at(static_cast<std::size_t>(msg.op))++;
         switch (msg.op) {
             case Opcode::kReadReq:
                 home_event(HomeEventKind::kReadReq, msg);
                 break;
             case Opcode::kWriteReq:
                 home_event(HomeEventKind::kWriteReq, msg);
+                break;
+            case Opcode::kUpgradeReq:
+                home_event(HomeEventKind::kUpgradeReq, msg);
+                break;
+            case Opcode::kWriteback:
+                home_event(HomeEventKind::kWriteback, msg);
+                break;
+            case Opcode::kAtomicOp:
+                home_event(HomeEventKind::kAtomicOp, msg);
+                break;
+            case Opcode::kInvAck:
+                home_event(HomeEventKind::kInvAck, msg);
                 break;
             case Opcode::kFetchData:
                 home_event(HomeEventKind::kFetchData, msg);
@@ -172,11 +212,26 @@ private:
             case Opcode::kWriteGrant:
                 node_event(msg.to, msg.page, NodeEventKind::kWriteGrant, &msg);
                 break;
+            case Opcode::kUpgradeGrant:
+                node_event(msg.to, msg.page, NodeEventKind::kUpgradeGrant, &msg);
+                break;
+            case Opcode::kWritebackAck:
+                node_event(msg.to, msg.page, NodeEventKind::kWritebackAck, &msg);
+                break;
+            case Opcode::kInv:
+                node_event(msg.to, msg.page, NodeEventKind::kInv, &msg);
+                break;
             case Opcode::kFetch:
                 node_event(msg.to, msg.page, NodeEventKind::kFetch, &msg);
                 break;
+            case Opcode::kFetchInv:
+                node_event(msg.to, msg.page, NodeEventKind::kFetchInv, &msg);
+                break;
+            case Opcode::kAtomicResult:
+                page(msg.to, msg.page).adding = false;
+                break;
             default:
-                fail("the bus carried an opcode M1 does not use");
+                fail("the bus carried an opcode the harness does not know");
         }
         return true;
     }
@@ -184,6 +239,8 @@ private:
     // One event for one node's page, and the actions it returns carried out.
     void node_event(int node, int p, NodeEventKind kind, const Msg* msg) {
         NodePage& mine = page(node, p);
+        const bool was_writer =
+            mine.state == PageState::kModified || mine.state == PageState::kWritebackPending;
         NodeEvent event;
         event.kind = kind;
         event.page = PageId{static_cast<std::uint64_t>(p)};
@@ -196,21 +253,39 @@ private:
             const NodeAction& a = result.actions.at(i);
             switch (a.kind) {
                 case NodeActionKind::kSend:
-                    queue(node, kHome).push_back({a.opcode, node, kHome, p, a.req, 0, false});
-                    break;
                 case NodeActionKind::kReply:
-                    if (!mine.mapped) {
+                    if (a.with_page && !mine.mapped) {
                         fail("a node was asked to send a page it does not hold");
                     }
                     queue(node, kHome)
-                        .push_back({a.opcode, node, kHome, p, a.req, *mine.mapped, false});
+                        .push_back({a.opcode, node, kHome, p, a.req,
+                                    a.with_page ? mine.mapped.value_or(0) : 0, false});
                     break;
                 case NodeActionKind::kInstallReadOnly:
                 case NodeActionKind::kInstallWritable:
+                    // Zeros only for unwritten pages.
+                    if (msg->zero && latest_.at(static_cast<std::size_t>(p)) != 0) {
+                        fail("node " + std::to_string(node) + " installed zeros for page " +
+                             std::to_string(p) + ", which has been written");
+                    }
                     mine.mapped = msg->zero ? 0 : msg->value;
                     mine.writable = a.kind == NodeActionKind::kInstallWritable;
                     break;
                 case NodeActionKind::kWriteProtect:
+                    mine.writable = false;
+                    break;
+                case NodeActionKind::kAllowWrites:
+                    mine.writable = true;
+                    break;
+                case NodeActionKind::kDiscard:
+                    // No early discard: a page held for writing goes only once the home has
+                    // its bytes or they are on their way.
+                    if (was_writer && kind != NodeEventKind::kWritebackAck &&
+                        kind != NodeEventKind::kFetchInv && kind != NodeEventKind::kInv) {
+                        fail("early discard: node " + std::to_string(node) + " dropped page " +
+                             std::to_string(p) + " before the home had it");
+                    }
+                    mine.mapped.reset();
                     mine.writable = false;
                     break;
                 case NodeActionKind::kWake:
@@ -231,7 +306,10 @@ private:
         event.req = msg.req;
         std::vector<HomeAction> actions;
         home_step(*dir_, event, actions);
+        const bool carries_page = msg.op == Opcode::kFetchData || msg.op == Opcode::kWriteback;
         std::optional<std::uint32_t>& copy = store_.at(static_cast<std::size_t>(msg.page));
+        std::uint32_t& latest = latest_.at(static_cast<std::size_t>(msg.page));
+        int stores = 0;
         for (const HomeAction& a : actions) {
             const int to = a.to.value;
             switch (a.kind) {
@@ -248,18 +326,38 @@ private:
                         }
                         reply.value = *copy;
                     } else if (a.source == PageSource::kReceived) {
+                        if (!carries_page) {
+                            fail("the home was to pass on bytes it did not receive");
+                        }
                         reply.value = msg.value;
                     }
                     queue(kHome, to).push_back(reply);
                     break;
                 }
                 case HomeActionKind::kStore:
-                    if (!bug_) {  // the planted bug: the home forgets to keep what it fetched
+                    // The bytes are those of the message that caused this step, so there must
+                    // be such bytes, and only one store.
+                    if (!carries_page || ++stores > 1) {
+                        fail("the home was to store bytes it does not have");
+                    }
+                    if (!bug_) {  // the planted bug: the home forgets to keep what it received
                         copy = msg.value;
                     }
                     break;
                 case HomeActionKind::kDropCopy:
                     copy.reset();
+                    break;
+                case HomeActionKind::kApplyAtomic:
+                    if (a.source == PageSource::kZero) {
+                        copy = 0;
+                    }
+                    if (copy != latest) {
+                        fail("lost update: an atomic add was applied to an old copy of page " +
+                             std::to_string(msg.page));
+                    }
+                    copy = ++latest;
+                    queue(kHome, to).push_back(
+                        {Opcode::kAtomicResult, kHome, to, msg.page, a.req, 0, false});
                     break;
                 default:
                     fail("the home aborted on page " + std::to_string(msg.page));
@@ -270,49 +368,61 @@ private:
     // docs/STATE_MACHINES.md, section 4.
     void check() {
         for (int p = 0; p < kPages; p++) {
+            // Names are built only when something has failed.
+            const auto name = [p] { return "page " + std::to_string(p); };
             const std::uint32_t latest = latest_.at(static_cast<std::size_t>(p));
             const HomeEntryView entry = home_entry(*dir_, PageId{static_cast<std::uint64_t>(p)});
             const std::optional<std::uint32_t>& copy = store_.at(static_cast<std::size_t>(p));
+            if (copy.has_value() != (entry.where == HomeWhere::kRam)) {
+                fail("the home's entry and its store disagree about " + name());
+            }
             int writers = 0;
-            int holders = 0;
+            int readable = 0;
+            // No lost update: who holds the bytes last written.
             bool held = latest == 0 || copy == latest;
             for (int n = 1; n <= kNodes; n++) {
                 const NodePage& mine = page(n, p);
-                const bool has_copy =
-                    mine.state == PageState::kShared || mine.state == PageState::kModified;
-                if (has_copy != mine.mapped.has_value()) {
-                    fail("a node's state and its mapping disagree");
+                const auto who = [n] { return "node " + std::to_string(n); };
+                const bool mapped = mine.state != PageState::kInvalid &&
+                                    mine.state != PageState::kReadPending &&
+                                    mine.state != PageState::kWritePending;
+                if (mapped != mine.mapped.has_value() ||
+                    mine.writable != (mine.state == PageState::kModified) ||
+                    is_stable(mine.state) != (mine.current == kNoReq)) {
+                    fail(who() + "'s state and its mapping or request disagree on " + name());
                 }
-                if (!has_copy) {
+                if (!mapped) {
                     continue;
                 }
-                holders++;
+                readable++;
                 writers += mine.state == PageState::kModified ? 1 : 0;
-                if (*mine.mapped != latest) {
-                    fail("stale read: node " + std::to_string(n) + " holds an old copy of page " +
-                         std::to_string(p));
+                // No stale read: every copy that can be read is the latest.
+                if (mine.mapped != latest) {
+                    fail("stale read: " + who() + " holds an old copy of " + name());
                 }
+                // The home knows the holders.
                 if ((entry.copyset >> slot_of(n).value & 1U) == 0) {
-                    fail("the home does not know node " + std::to_string(n) + " holds page " +
-                         std::to_string(p));
+                    fail("the home does not know " + who() + " holds " + name());
                 }
                 if (entry.state == HomeState::kExclusive && entry.owner != id_of(n)) {
-                    fail("a page is exclusive but a node other than its owner holds it");
+                    fail(name() + " is exclusive but a node other than its owner holds it");
                 }
-                held = true;
+                held = held || mine.state == PageState::kModified ||
+                       mine.state == PageState::kWritebackPending ||
+                       (mine.state == PageState::kUpgradePending && entry.owner == id_of(n));
             }
-            if (writers > 0 && holders > 1) {
-                fail("one writer or many readers: page " + std::to_string(p) + " has both");
+            if (writers > 0 && readable > 1) {
+                fail("one writer or many readers: " + name() + " has both");
             }
             for (const std::deque<Msg>& q : bus_) {
                 for (const Msg& m : q) {
                     held = held || (m.page == p && !m.zero && m.value == latest &&
                                     (m.op == Opcode::kWriteGrant || m.op == Opcode::kFetchData ||
-                                     m.op == Opcode::kReadData));
+                                     m.op == Opcode::kWriteback));
                 }
             }
             if (!held) {
-                fail("lost update: nobody holds the latest bytes of page " + std::to_string(p));
+                fail("lost update: nobody holds the latest bytes of " + name());
             }
         }
     }
@@ -327,7 +437,6 @@ private:
     std::array<std::deque<Msg>, static_cast<std::size_t>(kNodes) * kNodes> bus_;
     std::array<std::optional<std::uint32_t>, kPages> store_{};  // the home's copies
     std::array<std::uint32_t, kPages> latest_{};  // the value last written to each page
-    std::array<bool, kPages> published_{};        // the writer is done; readers may start
 };
 
 // Runs one seed. Empty if it passed, else "step N: what went wrong".
@@ -391,6 +500,31 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("%llu schedules passed\n", static_cast<unsigned long long>(count));
+        // What the schedules exercised, so a quiet path shows.
+        static constexpr std::array<std::pair<Opcode, const char*>, 15> kNames{{
+            {Opcode::kReadReq, "READ_REQ"},
+            {Opcode::kWriteReq, "WRITE_REQ"},
+            {Opcode::kUpgradeReq, "UPGRADE_REQ"},
+            {Opcode::kReadData, "READ_DATA"},
+            {Opcode::kWriteGrant, "WRITE_GRANT"},
+            {Opcode::kUpgradeGrant, "UPGRADE_GRANT"},
+            {Opcode::kInv, "INV"},
+            {Opcode::kInvAck, "INV_ACK"},
+            {Opcode::kFetch, "FETCH"},
+            {Opcode::kFetchInv, "FETCH_INV"},
+            {Opcode::kFetchData, "FETCH_DATA"},
+            {Opcode::kWriteback, "WRITEBACK"},
+            {Opcode::kWritebackAck, "WRITEBACK_ACK"},
+            {Opcode::kAtomicOp, "ATOMIC_OP"},
+            {Opcode::kAtomicResult, "ATOMIC_RESULT"},
+        }};
+        std::printf("delivered:");
+        for (const auto& [opcode, name] : kNames) {
+            std::printf(
+                " %s %llu", name,
+                static_cast<unsigned long long>(delivered().at(static_cast<std::size_t>(opcode))));
+        }
+        std::printf("\n");
         return 0;
     }
     std::printf("usage: sim_fuzz --schedules N | --seed S | --self-test\n");
