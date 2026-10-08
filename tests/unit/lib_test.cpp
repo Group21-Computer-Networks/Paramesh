@@ -7,6 +7,7 @@
 
 #include "lib/test_hook.h"
 #include "platform/ids.h"
+#include "rt/registry.h"
 
 #include <doctest/doctest.h>
 
@@ -536,6 +537,36 @@ TEST_CASE("a system call on a missing shared page fails with EFAULT, and succeed
         ::_exit(touch_program());
     }
     CHECK(wait_for(child, 30) == 0);
+}
+
+void a_task(const pm_task_ctx* /*ctx*/, std::uint64_t /*lo*/, std::uint64_t /*hi*/,
+            const void* /*arg*/) {}
+
+TEST_CASE("pm_init stops a program in which two tasks would be one on the wire, naming both") {
+    for (const bool same_name : {true, false}) {
+        std::array<int, 2> err{};
+        REQUIRE(::pipe(err.data()) == 0);
+        const pid_t child = ::fork();
+        REQUIRE(child >= 0);
+        if (child == 0) {
+            ::dup2(err[1], STDERR_FILENO);
+            if (same_name) {
+                static_cast<void>(pm_register_task("twin", a_task));
+                static_cast<void>(pm_register_task("twin", a_task));
+            } else {  // forced: a real collision of the 64-bit hash is not to be had
+                static_cast<void>(paramesh::rt_register_task_as("alpha", 7, a_task));
+                static_cast<void>(paramesh::rt_register_task_as("beta", 7, a_task));
+            }
+            static_cast<void>(pm_init(nullptr, nullptr, nullptr));
+            ::_exit(0);  // not reached: pm_init() must not return
+        }
+        ::close(err[1]);
+        CHECK(wait_for(child, 10) == 1);
+        CHECK(read_all(err[0]) ==
+              (same_name ? "pm_init: task 'twin' is registered twice\n"
+                         : "pm_init: tasks 'alpha' and 'beta' have the same ID (the hash of "
+                           "their names); rename one\n"));
+    }
 }
 
 TEST_CASE("pm_init without the launch environment reports a configuration error") {

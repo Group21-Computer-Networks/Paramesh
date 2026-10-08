@@ -1,7 +1,8 @@
 // src/rt/: the bump allocator behind pm_malloc; locks, barriers and the wait for outstanding
-// work, against a fake transport.
+// work, against a fake transport; the task registry and the caller of task bodies.
 
 #include "rt/region_allocator.h"
+#include "rt/registry.h"
 #include "rt/sync.h"
 
 #include <doctest/doctest.h>
@@ -14,8 +15,10 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -141,7 +144,8 @@ private:
     bool timed_ = false;
 };
 
-// abort_job ends the process with status 42, which the last test looks for in a child.
+// abort_job prints the status and the message and ends the process with status 42, which the
+// tests that expect an abort look for in a child.
 class FakeHost final : public paramesh::RuntimeHost {
 public:
     explicit FakeHost(NodeId self) : self_(self) {}
@@ -150,7 +154,10 @@ public:
     [[nodiscard]] NodeId home_of(paramesh::PageId /*page*/) const noexcept override {
         return kLauncher;
     }
-    [[noreturn]] void abort_job(Status /*status*/, std::string_view /*message*/) noexcept override {
+    [[noreturn]] void abort_job(Status status, std::string_view message) noexcept override {
+        static_cast<void>(std::fprintf(stderr, "abort %u: %.*s\n", static_cast<unsigned>(status),
+                                       static_cast<int>(message.size()), message.data()));
+        static_cast<void>(std::fflush(stderr));
         _exit(42);
     }
     void chunk_finished(NodeId /*ran_by*/, std::uint64_t /*task_id*/, std::uint64_t /*indexes*/,
@@ -195,7 +202,129 @@ int exit_status_of(Body body) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+// As exit_status_of, and what the child wrote to stderr.
+template <typename Body>
+std::string stderr_of(Body body, int& status) {
+    std::array<int, 2> err{};
+    REQUIRE(pipe(err.data()) == 0);
+    status = exit_status_of([&] {
+        dup2(err[1], STDERR_FILENO);
+        body();
+    });
+    close(err[1]);
+    std::string text;
+    std::array<char, 256> chunk{};
+    for (ssize_t got = 0; (got = read(err[0], chunk.data(), chunk.size())) > 0;) {
+        text.append(chunk.data(), static_cast<std::size_t>(got));
+    }
+    close(err[0]);
+    return text;
+}
+
+// What the test tasks are given: where to put their answer.
+struct Out {
+    std::uint64_t* sum;
+};
+
 }  // namespace
+
+// Tasks of this test program, registered before main() as any program's are.
+PM_TASK(rt_test_sum) {
+    const auto* out = static_cast<const Out*>(arg);
+    for (std::uint64_t i = lo; i < hi; i++) {
+        *out->sum += i;
+    }
+    *out->sum += 1000ULL * ctx->thread;
+}
+
+PM_TASK(rt_test_throws) {
+    throw std::runtime_error{"the matrix is singular"};
+}
+
+PM_TASK(rt_test_throws_a_number) {
+    throw 7;  // NOLINT(hicpp-exception-baseclass): a program may throw anything
+}
+
+TEST_CASE("a task's ID is the 64-bit FNV-1a hash of its name") {
+    CHECK(paramesh::rt_task_id("") == 0xcbf29ce484222325ULL);
+    CHECK(paramesh::rt_task_id("a") == 0xaf63dc4c8601ec8cULL);
+    CHECK(paramesh::rt_task_id("foobar") == 0x85944171f73967e8ULL);
+}
+
+TEST_CASE("a registered task is found by its ID and called with ctx, lo, hi and arg") {
+    const std::uint64_t id = paramesh::rt_task_id("rt_test_sum");
+    CHECK(paramesh::rt_find_task(id) != nullptr);
+    CHECK(std::string_view{paramesh::rt_task_name(id)} == "rt_test_sum");
+    CHECK(paramesh::rt_find_task(paramesh::rt_task_id("never_registered")) == nullptr);
+    CHECK(std::string_view{paramesh::rt_task_name(1)}.empty());
+    CHECK(paramesh::rt_check_registry().ok());  // this program's own tasks do not clash
+
+    FakeHost host{kLauncher};
+    std::uint64_t sum = 0;
+    const Out out{&sum};
+    const pm_task_ctx ctx{.node = 1, .thread = 2, .arg_len = sizeof out};
+    paramesh::rt_run_task(host, id, ctx, 3, 7, &out);
+    CHECK(sum == 3 + 4 + 5 + 6 + 2000);
+}
+
+TEST_CASE("a task without a name or a function is refused") {
+    const pm_task_fn body = paramesh::rt_find_task(paramesh::rt_task_id("rt_test_sum"));
+    REQUIRE(body != nullptr);
+    CHECK(paramesh::rt_register_task(nullptr, body).error().code ==
+          paramesh::Errc::kInvalidArgument);
+    CHECK(paramesh::rt_register_task("", body).error().code == paramesh::Errc::kInvalidArgument);
+    CHECK(paramesh::rt_register_task("nothing", nullptr).error().code ==
+          paramesh::Errc::kInvalidArgument);
+    CHECK(pm_register_task(nullptr, body) == PM_ERR_INVALID);
+    CHECK(pm_register_task("", body) == PM_ERR_INVALID);
+    CHECK(pm_register_task("nothing", nullptr) == PM_ERR_INVALID);
+    CHECK(paramesh::rt_find_task(paramesh::rt_task_id("nothing")) == nullptr);  // not kept
+}
+
+TEST_CASE("a task that throws ends the job with its name and what it threw") {
+    const auto run = [](const char* task) {
+        return [task] {
+            FakeHost host{NodeId{2}};
+            const pm_task_ctx ctx{};
+            paramesh::rt_run_task(host, paramesh::rt_task_id(task), ctx, 0, 1, nullptr);
+        };
+    };
+    const std::string failed = std::to_string(static_cast<unsigned>(Status::kTaskFailed));
+    int status = 0;
+    CHECK(stderr_of(run("rt_test_throws"), status) ==
+          "abort " + failed + ": task 'rt_test_throws' threw: the matrix is singular\n");
+    CHECK(status == 42);
+    CHECK(stderr_of(run("rt_test_throws_a_number"), status) ==
+          "abort " + failed +
+              ": task 'rt_test_throws_a_number' threw something that is not a std::exception\n");
+    CHECK(status == 42);
+    CHECK(stderr_of(run("never_registered"), status) ==
+          "abort " + failed + ": a chunk names a task this binary does not have\n");
+    CHECK(status == 42);
+}
+
+TEST_CASE("two tasks with one name, or two names with one ID, fail the check with both named") {
+    // In a child: the registry is the process's own, and this program's must stay clean.
+    const auto clash = [](const char* first, const char* second, std::uint64_t id) {
+        int status = 0;
+        return stderr_of(
+            [=] {
+                const pm_task_fn body = paramesh::rt_find_task(paramesh::rt_task_id("rt_test_sum"));
+                for (const char* name : {first, second}) {
+                    static_cast<void>(id == 0 ? paramesh::rt_register_task(name, body)
+                                              : paramesh::rt_register_task_as(name, id, body));
+                }
+                const paramesh::Result<void> checked = paramesh::rt_check_registry();
+                static_cast<void>(
+                    std::fprintf(stderr, "%s", checked.ok() ? "no clash" : checked.error().what));
+            },
+            status);
+    };
+    CHECK(clash("twin", "twin", 0) == "task 'twin' is registered twice");
+    CHECK(clash("alpha", "beta", 7) ==
+          "tasks 'alpha' and 'beta' have the same ID (the hash of their names); rename one");
+    CHECK(clash("alpha", "beta", 0) == "no clash");
+}
 
 TEST_CASE("handles: only the launcher makes them, each is new, and zero is never one") {
     Process launcher;

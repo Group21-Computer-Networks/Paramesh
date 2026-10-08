@@ -1,10 +1,10 @@
 // include/paramesh.h: compiles as C++20 here and as C11 in paramesh_h_test.c, declares what
 // the plan names, and PM_TASK registers a task from a C file and from a C++ file.
 //
-// Nothing implements the API yet, so this file supplies pm_register_task() itself. The task
-// that implements it in src/ (M3-1) replaces that stand-in with the real registry.
+// The tasks are looked up in the real registry of src/rt/, by the hash of their names.
 
 #include "paramesh.h"
+#include "rt/registry.h"
 
 #include <doctest/doctest.h>
 
@@ -22,22 +22,8 @@ struct SumArgs {
     std::uint64_t* out;
 };
 
-struct Registration {
-    std::string name;
-    pm_task_fn fn;
-};
-
-// A function-local static: PM_TASK's constructors run before main(), in no set order.
-std::vector<Registration>& registrations() {
-    static std::vector<Registration> all;
-    return all;
-}
-
 pm_task_fn find_task(const std::string& name) {
-    const auto& all = registrations();
-    const auto it =
-        std::find_if(all.begin(), all.end(), [&](const Registration& r) { return r.name == name; });
-    return it == all.end() ? nullptr : it->fn;
+    return paramesh::rt_find_task(paramesh::rt_task_id(name));
 }
 
 // Signatures, checked without calling anything.
@@ -76,14 +62,6 @@ static_assert(PM_TASK_ARG_MAX == 1024);
 
 }  // namespace
 
-extern "C" int pm_register_task(const char* name, pm_task_fn fn) {
-    if (name == nullptr || fn == nullptr || *name == '\0') {
-        return PM_ERR_INVALID;
-    }
-    registrations().push_back({name, fn});
-    return PM_OK;
-}
-
 // Same job as the C task in paramesh_h_test.c.
 PM_TASK(paramesh_h_test_cpp_task) {
     const auto* args = static_cast<const SumArgs*>(arg);
@@ -97,12 +75,11 @@ PM_TASK(paramesh_h_test_cpp_task) {
 // A task that uses none of its parameters must still compile with warnings as errors.
 PM_TASK(paramesh_h_test_empty_task) {}
 
-TEST_CASE("PM_TASK registers tasks from a C file and a C++ file before main") {
+TEST_CASE("PM_TASK registers tasks from a C file and a C++ file before main, found by hash") {
     CHECK(find_task("paramesh_h_test_c_task") != nullptr);
     CHECK(find_task("paramesh_h_test_cpp_task") != nullptr);
     CHECK(find_task("paramesh_h_test_empty_task") != nullptr);
     CHECK(find_task("never_registered") == nullptr);
-    CHECK(registrations().size() == 3);
 }
 
 TEST_CASE("a registered task is called with ctx, lo, hi and arg") {
