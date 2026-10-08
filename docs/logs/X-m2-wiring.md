@@ -58,6 +58,9 @@ and the next step.
 - `tests/unit/lib_test.cpp`: the M2 program, run by three processes. `start_job` now takes the
   program to run.
 - It passed on the first run and on every repeat; no fault in M2-1 to M2-4 came to light.
+- A slip in committing: the first commit on the branch is titled "the implementation log" but
+  also holds `job.cpp` and the test, because they were already staged. Left as it is rather
+  than rewrite a pushed branch.
 - State: Done-when met.
 
 ## Files touched
