@@ -1,15 +1,16 @@
-// The home machine of docs/STATE_MACHINES.md, sections 2.4 and 2.5, for the rows marked M1.
-// Any other request ends the job as "not supported before M2" (section 5).
+// The home machine of docs/STATE_MACHINES.md, sections 2.3 to 2.5 and 2.7: every row but the
+// hold window of section 2.6, which is AT-1's. Until then no hold runs, so the rows with
+// "hold running" never apply and HOLD_EXPIRED does nothing.
 //
-// How a kAbort action says which: its `opcode` is the refused request's opcode when the row
-// belongs to a later milestone, and Opcode::kHeartbeat when the pair is impossible.
+// An impossible pair gives one kAbort action.
 
 #include "coh/home_machine.h"
 
+#include <array>
+#include <cstddef>
 #include <deque>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
 
 namespace paramesh {
 
@@ -20,12 +21,16 @@ struct Entry {
     HomeWhere where = HomeWhere::kZero;
     HomeWait wait = HomeWait::kIdle;
     NodeId owner;
-    Slot owner_slot;
     std::uint64_t copyset = 0;
+    std::uint64_t pending = 0;  // W_INV: the slots whose INV_ACK has not come
     std::uint32_t version = 0;
     HomeEvent op;                 // the request being handled, while `wait` is not kIdle
     std::deque<HomeEvent> waitq;  // requests that arrived meanwhile, in order
 };
+
+// The node behind each copyset bit, learnt from the requests themselves: a node enters a
+// copyset only through a request, and every request carries both.
+using Nodes = std::array<NodeId, kMaxSlots>;
 
 constexpr std::uint64_t bit(Slot slot) noexcept {
     return std::uint64_t{1} << slot.value;
@@ -37,35 +42,22 @@ constexpr bool is_request(HomeEventKind kind) noexcept {
            kind == HomeEventKind::kAtomicOp;
 }
 
-constexpr Opcode opcode_of(HomeEventKind kind) noexcept {
-    switch (kind) {
-        case HomeEventKind::kReadReq:
-            return Opcode::kReadReq;
-        case HomeEventKind::kWriteReq:
-            return Opcode::kWriteReq;
-        case HomeEventKind::kUpgradeReq:
-            return Opcode::kUpgradeReq;
-        case HomeEventKind::kWriteback:
-            return Opcode::kWriteback;
-        case HomeEventKind::kAtomicOp:
-            return Opcode::kAtomicOp;
-        default:
-            return Opcode::kHeartbeat;
-    }
+HomeAction action(HomeActionKind kind, PageId page) {
+    HomeAction a;
+    a.kind = kind;
+    a.page = page;
+    return a;
 }
 
-HomeAction abort_action(PageId page, Opcode refused = Opcode::kHeartbeat) {
-    HomeAction a;
-    a.kind = HomeActionKind::kAbort;
-    a.page = page;
-    a.opcode = refused;
+HomeAction send(PageId page, Opcode opcode, NodeId to) {
+    HomeAction a = action(HomeActionKind::kSend, page);
+    a.opcode = opcode;
+    a.to = to;
     return a;
 }
 
 HomeAction reply(const HomeEvent& request, Opcode opcode, PageSource source, bool read_only) {
-    HomeAction a;
-    a.kind = HomeActionKind::kReply;
-    a.page = request.page;
+    HomeAction a = action(HomeActionKind::kReply, request.page);
     a.opcode = opcode;
     a.to = request.from;
     a.req = request.req;
@@ -74,85 +66,159 @@ HomeAction reply(const HomeEvent& request, Opcode opcode, PageSource source, boo
     return a;
 }
 
-// The bytes a grant carries when they come from the home's own copy.
-PageSource home_source(const Entry& e) noexcept {
+// The bytes a grant carries: the ones just received, or the home's own copy.
+PageSource source_of(const Entry& e, bool received) noexcept {
+    if (received) {
+        return PageSource::kReceived;
+    }
     return e.where == HomeWhere::kZero ? PageSource::kZero : PageSource::kHomeCopy;
 }
 
-void grant_read(Entry& e, const HomeEvent& request, PageSource source,
-                std::vector<HomeAction>& out) {
-    out.push_back(reply(request, Opcode::kReadData, source, true));
-    e.state = HomeState::kShared;
-    e.copyset |= bit(request.slot);
+// The page left its owner: the home handled its FETCH_DATA or WRITEBACK.
+void store_received(Entry& e, PageId page, std::vector<HomeAction>& out) {
+    out.push_back(action(HomeActionKind::kStore, page));
+    e.where = HomeWhere::kRam;
+    e.owner = kNoNode;
 }
 
-void grant_write(Entry& e, const HomeEvent& request, std::vector<HomeAction>& out) {
-    out.push_back(reply(request, Opcode::kWriteGrant, home_source(e), false));
-    if (e.where == HomeWhere::kRam) {
-        HomeAction drop;
-        drop.kind = HomeActionKind::kDropCopy;
-        drop.page = request.page;
-        out.push_back(drop);
+// Section 2.3: the step that ends the operation in e.op. `received` says the bytes of the
+// event that led here are the page. A step that needs a spilled home copy loads it first and
+// runs again on LOADED.
+void finish(Entry& e, bool received, std::vector<HomeAction>& out) {
+    const HomeEvent& op = e.op;
+    const bool upgrade =
+        op.kind == HomeEventKind::kUpgradeReq && (e.copyset & bit(op.slot)) != 0;  // no bytes
+    if (!received && !upgrade && e.where == HomeWhere::kSpill) {
+        out.push_back(action(HomeActionKind::kLoad, op.page));
+        e.wait = HomeWait::kLoad;
+        return;
+    }
+    e.wait = HomeWait::kIdle;
+    if (op.kind == HomeEventKind::kReadReq) {  // grant read
+        out.push_back(reply(op, Opcode::kReadData, source_of(e, received), true));
+        e.state = HomeState::kShared;
+        e.copyset |= bit(op.slot);
+        return;
+    }
+    if (op.kind == HomeEventKind::kAtomicOp) {  // apply atomic
+        HomeAction apply = action(HomeActionKind::kApplyAtomic, op.page);
+        apply.opcode = Opcode::kAtomicResult;
+        apply.to = op.from;
+        apply.req = op.req;
+        apply.source = source_of(e, false);  // kZero: start from a page of zeros
+        apply.offset_in_page = op.offset_in_page;
+        apply.operand = op.operand;
+        out.push_back(apply);
+        e.state = HomeState::kUncached;
+        e.where = HomeWhere::kRam;
+        e.copyset = 0;
+        e.version++;
+        return;
+    }
+    // grant write
+    out.push_back(upgrade ? reply(op, Opcode::kUpgradeGrant, PageSource::kNone, false)
+                          : reply(op, Opcode::kWriteGrant, source_of(e, received), false));
+    if (e.where == HomeWhere::kRam || e.where == HomeWhere::kSpill) {
+        out.push_back(action(HomeActionKind::kDropCopy, op.page));
     }
     e.state = HomeState::kExclusive;
     e.where = HomeWhere::kNone;
-    e.owner = request.from;
-    e.owner_slot = request.slot;
-    e.copyset = bit(request.slot);
+    e.owner = op.from;
+    e.copyset = bit(op.slot);
     e.version++;
 }
 
-// One event against an entry that is free to take it.
-void handle(Entry& e, const HomeEvent& event, std::vector<HomeAction>& out) {
-    const bool others = (e.copyset & ~bit(event.slot)) != 0;
+// Section 2.4: a request against an idle entry.
+void start(Entry& e, const HomeEvent& event, const Nodes& nodes, std::vector<HomeAction>& out) {
+    const bool exclusive = e.state == HomeState::kExclusive;
+    const bool from_owner = exclusive && event.from == e.owner;
+    if (event.kind == HomeEventKind::kWriteback) {
+        if (from_owner) {  // the evictor stays a reader until the acknowledgement reaches it
+            store_received(e, event.page, out);
+            e.state = HomeState::kShared;
+        }  // otherwise section 2.7: late, and the data is dropped
+        out.push_back(reply(event, Opcode::kWritebackAck, PageSource::kNone, false));
+        return;
+    }
+    if (from_owner && event.kind != HomeEventKind::kAtomicOp) {
+        out.push_back(action(HomeActionKind::kAbort, event.page));  // H2
+        return;
+    }
+    e.op = event;
+    if (exclusive) {
+        const bool keeps_copy = event.kind == HomeEventKind::kReadReq;
+        out.push_back(send(event.page, keeps_copy ? Opcode::kFetch : Opcode::kFetchInv, e.owner));
+        e.wait = keeps_copy ? HomeWait::kFetch : HomeWait::kFetchInv;
+        return;
+    }
+    // Who has to lose a read copy first: nobody for a read, every other holder for a write,
+    // every holder for an atomic operation.
+    std::uint64_t losers = 0;
+    if (event.kind == HomeEventKind::kAtomicOp) {
+        losers = e.copyset;
+    } else if (event.kind != HomeEventKind::kReadReq) {
+        losers = e.copyset & ~bit(event.slot);
+    }
+    if (losers == 0) {
+        finish(e, false, out);
+        return;
+    }
+    for (std::size_t slot = 0; slot < kMaxSlots; slot++) {
+        if ((losers >> slot & 1U) != 0) {
+            out.push_back(send(event.page, Opcode::kInv, nodes.at(slot)));
+        }
+    }
+    e.pending = losers;
+    e.wait = HomeWait::kInv;
+}
+
+// Section 2.5: an answer the entry may be waiting for.
+void answer(Entry& e, const HomeEvent& event, std::vector<HomeAction>& out) {
     switch (event.kind) {
-        case HomeEventKind::kReadReq:
-            if (e.state != HomeState::kExclusive) {
-                grant_read(e, event, home_source(e), out);
-            } else if (event.from == e.owner) {
-                out.push_back(
-                    abort_action(event.page));  // H2: the owner does not ask for its own page
-            } else {
-                HomeAction fetch;
-                fetch.kind = HomeActionKind::kSend;
-                fetch.page = event.page;
-                fetch.opcode = Opcode::kFetch;
-                fetch.to = e.owner;
-                out.push_back(fetch);
-                e.wait = HomeWait::kFetch;
-                e.op = event;
-            }
-            return;
-        case HomeEventKind::kWriteReq:
-            if (e.state == HomeState::kUncached || (e.state == HomeState::kShared && !others)) {
-                grant_write(e, event, out);
-            } else {
-                out.push_back(
-                    abort_action(event.page, Opcode::kWriteReq));  // needs INV or FETCH_INV: M2
-            }
-            return;
-        case HomeEventKind::kFetchData:
-            if (e.wait != HomeWait::kFetch || event.from != e.owner) {
-                out.push_back(abort_action(event.page));  // H1, H3
+        case HomeEventKind::kInvAck:
+            if (e.wait == HomeWait::kInv && (e.pending & bit(event.slot)) != 0) {
+                e.pending &= ~bit(event.slot);
+                e.copyset &= ~bit(event.slot);
+                if (e.pending == 0) {
+                    finish(e, false, out);
+                }
                 return;
             }
-            {
-                HomeAction store;
-                store.kind = HomeActionKind::kStore;
-                store.page = event.page;
-                out.push_back(store);
+            break;
+        case HomeEventKind::kFetchData:
+            if (event.from != e.owner) {
+                break;
             }
-            e.where = HomeWhere::kRam;
-            e.state = HomeState::kShared;
-            e.copyset = bit(e.owner_slot);
-            e.owner = kNoNode;
-            e.wait = HomeWait::kIdle;
-            grant_read(e, e.op, PageSource::kReceived, out);
-            return;
+            if (e.wait == HomeWait::kFetch) {  // the owner keeps a read copy
+                store_received(e, event.page, out);
+                e.state = HomeState::kShared;  // `copyset` is already the old owner alone
+                finish(e, true, out);
+                return;
+            }
+            if (e.wait == HomeWait::kFetchInv) {  // the owner gave the page up
+                const bool atomic = e.op.kind == HomeEventKind::kAtomicOp;
+                if (atomic) {
+                    store_received(e, event.page, out);
+                }
+                e.owner = kNoNode;
+                e.copyset = 0;
+                finish(e, !atomic, out);
+                return;
+            }
+            break;
+        case HomeEventKind::kLoaded:
+            if (e.wait == HomeWait::kLoad) {
+                e.where = HomeWhere::kRam;
+                finish(e, false, out);
+                return;
+            }
+            break;
+        case HomeEventKind::kHoldExpired:
+            return;  // no hold runs before AT-1
         default:
-            out.push_back(abort_action(event.page, opcode_of(event.kind)));
-            return;
+            break;
     }
+    out.push_back(action(HomeActionKind::kAbort, event.page));  // H1, H3
 }
 
 }  // namespace
@@ -163,6 +229,7 @@ class HomeDirectory {
 public:
     std::unordered_set<std::uint32_t> segments;
     std::unordered_map<std::uint64_t, Entry> entries;
+    Nodes nodes{};
 };
 
 void HomeDirectoryDeleter::operator()(HomeDirectory* directory) const noexcept {
@@ -190,21 +257,31 @@ HomeEntryView home_entry(const HomeDirectory& directory, PageId page) {
     return view;
 }
 
+void home_set_where(HomeDirectory& directory, PageId page, HomeWhere where) {
+    directory.entries[page.value].where = where;
+}
+
 void home_step(HomeDirectory& directory, const HomeEvent& event, std::vector<HomeAction>& out) {
-    if (!directory.segments.contains(segment_of(event.page).value)) {
-        out.push_back(abort_action(event.page));  // this node is not the page's home
+    if (!directory.segments.contains(segment_of(event.page).value) ||
+        event.slot.value >= kMaxSlots) {
+        out.push_back(action(HomeActionKind::kAbort, event.page));  // not the page's home
         return;
     }
     Entry& e = directory.entries[event.page.value];
-    if (e.wait != HomeWait::kIdle && is_request(event.kind)) {
+    if (!is_request(event.kind)) {
+        answer(e, event, out);
+    } else if (e.wait != HomeWait::kIdle) {
         e.waitq.push_back(event);  // home rule 1: one request per page at a time
         return;
+    } else {
+        directory.nodes.at(event.slot.value) = event.from;
+        start(e, event, directory.nodes, out);
     }
-    handle(e, event, out);
     while (e.wait == HomeWait::kIdle && !e.waitq.empty()) {
         const HomeEvent next = e.waitq.front();
         e.waitq.pop_front();
-        handle(e, next, out);
+        directory.nodes.at(next.slot.value) = next.from;
+        start(e, next, directory.nodes, out);
     }
 }
 
