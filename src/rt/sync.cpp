@@ -12,6 +12,11 @@ constexpr Error kNotAHandle{Errc::kInvalidArgument, 0,
 
 }  // namespace
 
+std::uint16_t& rt_thread_index() noexcept {
+    thread_local std::uint16_t index = kMainThread;
+    return index;
+}
+
 Sync::Sync(Transport& transport, RuntimeHost& host)
     : transport_(transport), host_(host), launcher_(host.self() == host.launcher()) {}
 
@@ -84,6 +89,11 @@ Result<void> Sync::wait_all() {
     std::unique_lock hold{mu_};
     changed_.wait(hold, [this] { return outstanding_ == 0; });
     return {};
+}
+
+std::uint64_t Sync::outstanding() const {
+    const std::scoped_lock hold{mu_};
+    return outstanding_;
 }
 
 bool Sync::holds_lock(NodeId node, std::uint16_t thread) const {

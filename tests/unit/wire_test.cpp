@@ -308,3 +308,51 @@ TEST_CASE("the atomic payloads: ATOMIC_OP is 24 bytes with op 1, ATOMIC_RESULT 1
     CHECK(encoded(paramesh::AtomicResultPayload{0x2008, 0xFFFFFFFFFFFFFFFEULL}) == result);
     CHECK(paramesh::wire_decode_atomic_result(op).error().code == Errc::kProtocol);  // 24 bytes
 }
+
+TEST_CASE("the task payloads: TASK_REQ, TASK_ASSIGN, NO_TASK and TASK_DONE") {
+    const Bytes ask = hex("00 05 00 00");
+    REQUIRE(paramesh::wire_decode_task_req(ask).ok());
+    CHECK(paramesh::wire_decode_task_req(ask).value().thread == 5);
+    CHECK(encoded(paramesh::TaskReqPayload{5}) == ask);
+    CHECK(paramesh::wire_decode_task_req(hex("00 05")).error().code == Errc::kProtocol);
+
+    // Chunk 3 of task 0x1122334455667788, indexes 16 to 32, call 2, with a 3-byte argument.
+    const Bytes assign =
+        hex("00 00 00 00 00 00 00 03 11 22 33 44 55 66 77 88 "
+            "00 00 00 00 00 00 00 10 00 00 00 00 00 00 00 20 "
+            "00 00 00 02 00 03 00 00 AA BB CC");
+    const auto chunk = paramesh::wire_decode_task_assign(assign);
+    REQUIRE(chunk.ok());
+    CHECK(chunk.value().chunk_id == 3);
+    CHECK(chunk.value().task_id == 0x1122334455667788ULL);
+    CHECK(chunk.value().lo == 16);
+    CHECK(chunk.value().hi == 32);
+    CHECK(chunk.value().call_id == 2);
+    CHECK(chunk.value().arg == hex("AA BB CC"));
+    CHECK(encoded(chunk.value()) == assign);
+    Bytes shorter = assign;
+    shorter.pop_back();  // the argument is not as long as the payload says
+    CHECK(paramesh::wire_decode_task_assign(shorter).error().code == Errc::kProtocol);
+    paramesh::TaskAssignPayload big;
+    big.arg.resize(paramesh::kMaxTaskArg);
+    CHECK(encoded(big).size() == 40 + paramesh::kMaxTaskArg);  // the largest
+    big.arg.resize(paramesh::kMaxTaskArg + 1);
+    Bytes room(2048);
+    CHECK(paramesh::wire_encode(big, room).error().code == Errc::kInvalidArgument);
+
+    CHECK(encoded(paramesh::NoTaskPayload{2}) == hex("02 00 00 00"));
+    CHECK(paramesh::wire_decode_no_task(hex("01 00 00 00")).value().reason == 1);
+    CHECK(paramesh::wire_decode_no_task(hex("03 00 00 00")).error().code == Errc::kProtocol);
+    CHECK(paramesh::wire_encode(paramesh::NoTaskPayload{0}, room).error().code ==
+          Errc::kInvalidArgument);
+
+    const Bytes done =
+        hex("00 00 00 00 00 00 00 03 00 00 00 00 00 0F 42 40 00 01 00 00 00 00 00 00");
+    const auto report = paramesh::wire_decode_task_done(done);
+    REQUIRE(report.ok());
+    CHECK(report.value().chunk_id == 3);
+    CHECK(report.value().cpu_ns == 1000000);
+    CHECK(report.value().thread == 1);
+    CHECK(encoded(paramesh::TaskDonePayload{3, 1000000, 1}) == done);
+    CHECK(paramesh::wire_decode_task_done(ask).error().code == Errc::kProtocol);
+}

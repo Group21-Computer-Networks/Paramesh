@@ -35,6 +35,10 @@ namespace paramesh {
 // The `thread` of the launcher's main thread (docs/PROTOCOL.md, LOCK_ACQ).
 inline constexpr std::uint16_t kMainThread = 0xFFFF;
 
+// The calling thread's index in its process: kMainThread unless the thread was started to run
+// tasks and given a number. Locks, barriers and task contexts all name a thread by it.
+std::uint16_t& rt_thread_index() noexcept;
+
 class Sync {
 public:
     // `transport` and `host` must outlive this. The process is the launcher when
@@ -57,6 +61,7 @@ public:
     void work_added(std::uint64_t items) noexcept;
     void work_done(std::uint64_t items) noexcept;
     Result<void> wait_all();
+    [[nodiscard]] std::uint64_t outstanding() const;
 
     // A LOCK_* or BARRIER_* frame arrived.
     void on_frame(const FrameHeader& header, std::span<const std::byte> payload) noexcept;
