@@ -1,6 +1,7 @@
-// One job process: the transport, the memory engine, the node and home machines and the home
-// store wired together behind paramesh.h. M1: start-up without pmd, read sharing, clean end,
-// and abort on a lost node or a reply timeout.
+// One job process: the transport, the memory engine, the node and home machines, the home
+// store and the lock manager wired together behind paramesh.h. So far: start-up without pmd,
+// read and write sharing, locks and barriers, clean end, and abort on a lost node or a reply
+// timeout. Not yet: atomics (M2-5), tasks (M3), eviction and spill (M4).
 //
 // Threads (docs/INTERNAL_API.md, section 1): every piece of protocol state below is touched
 // only on the network thread. The fault-handler thread and the application's threads hand
@@ -13,6 +14,8 @@
 #include "net/transport.h"
 #include "platform/factory.h"
 #include "rt/region_allocator.h"
+#include "rt/runtime.h"
+#include "rt/sync.h"
 #include "store/home_store.h"
 #include "store/placement.h"
 #include "wire/payloads.h"
@@ -33,6 +36,7 @@
 #include <fstream>
 #include <iterator>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -147,7 +151,14 @@ std::array<pm_test_fn, 16>& test_functions() {
     return functions;
 }
 
-class Job final : public NetHandler, public FaultSink, public StoreEvents {
+// The index of this thread in its process, for locks and barriers: the launcher's main() unless
+// the thread was started to run a function (docs/PROTOCOL.md, LOCK_ACQ).
+std::uint16_t& this_thread_index() {
+    thread_local std::uint16_t index = kMainThread;
+    return index;
+}
+
+class Job final : public NetHandler, public FaultSink, public StoreEvents, public RuntimeHost {
 public:
     explicit Job(Settings settings) : s_(std::move(settings)) {}
 
@@ -182,6 +193,7 @@ public:
             return PM_ERR_NETWORK;
         }
         net_ = std::move(net).value();
+        sync_.emplace(*net_, *this);
         for (const Member& member : s_.members) {
             if (member.node != s_.self && !net_->add_peer(member.node, member.at).ok()) {
                 return PM_ERR_CONFIG;
@@ -245,6 +257,9 @@ public:
         return PM_OK;
     }
 
+    // Locks and barriers. Null before pm_init() has built the job.
+    [[nodiscard]] Sync* sync() noexcept { return sync_.has_value() ? &*sync_ : nullptr; }
+
     int run_on_workers(std::uint32_t id) {
         std::array<std::byte, 40>
             assign{};  // a TASK_ASSIGN whose chunk ID is the function's number
@@ -305,6 +320,27 @@ public:
         }
         linger_ = net_->start_timer(kLinger);
     }
+
+    // ---- RuntimeHost: what src/rt/ asks of the job ----------------------------------------------
+    [[nodiscard]] NodeId self() const noexcept override { return s_.self; }
+    [[nodiscard]] NodeId launcher() const noexcept override { return s_.members.front().node; }
+    [[nodiscard]] NodeId home_of(PageId page) const noexcept override {
+        return slot_node_.at(homes_.at(segment_of(page).value).value);
+    }
+    [[noreturn]] void abort_job(Status status, std::string_view message) noexcept override {
+        if (std::this_thread::get_id() == thread_.get_id()) {
+            // ponytail: the network thread cannot wait for its own JOB_END to leave, so it only
+            // exits; the other processes then end the job as "node lost". Every caller on this
+            // thread reports a peer that broke the protocol.
+            exit_with(status, std::string{message});
+        }
+        abort_job(status, s_.self, std::string{message});
+        for (;;) {
+            ::pause();  // the abort exits the process shortly
+        }
+    }
+    void chunk_finished(NodeId /*ran_by*/, std::uint64_t /*task_id*/, std::uint64_t /*indexes*/,
+                        Nanos /*cpu*/) noexcept override {}  // M3
 
     // ---- FaultSink: fault-handler thread ---------------------------------------------------
     void on_fault(const FaultEvent& event) noexcept override {
@@ -524,9 +560,6 @@ private:
         have_map_ = true;
     }
 
-    [[nodiscard]] NodeId home_of(PageId page) const noexcept {
-        return slot_node_.at(homes_.at(segment_of(page).value).value);
-    }
     [[nodiscard]] Slot slot_of(NodeId node) const noexcept {
         for (std::size_t slot = 0; slot < slot_node_.size(); slot++) {
             if (slot_node_.at(slot) == node) {
@@ -559,19 +592,59 @@ private:
                     set_up();
                 }
                 return;
+            // The messages that carry a page ID and nothing else: to the home machine ...
             case Opcode::kReadReq:
-            case Opcode::kWriteReq: {
+            case Opcode::kWriteReq:
+            case Opcode::kUpgradeReq:
+            case Opcode::kInvAck:
+            // ... and to the node machine.
+            case Opcode::kUpgradeGrant:
+            case Opcode::kInv:
+            case Opcode::kFetch:
+            case Opcode::kFetchInv: {
                 const Result<PageIdPayload> request = wire_decode_page_id(payload);
                 if (!request.ok()) {
                     bad();
                     return;
                 }
-                const HomeEventKind kind = header.opcode == Opcode::kReadReq
-                                               ? HomeEventKind::kReadReq
-                                               : HomeEventKind::kWriteReq;
-                home_event(kind, header, request.value().page, {});
+                const PageId page = request.value().page;
+                switch (header.opcode) {
+                    case Opcode::kReadReq:
+                        home_event(HomeEventKind::kReadReq, header, page, {});
+                        break;
+                    case Opcode::kWriteReq:
+                        home_event(HomeEventKind::kWriteReq, header, page, {});
+                        break;
+                    case Opcode::kUpgradeReq:
+                        home_event(HomeEventKind::kUpgradeReq, header, page, {});
+                        break;
+                    case Opcode::kInvAck:
+                        home_event(HomeEventKind::kInvAck, header, page, {});
+                        break;
+                    case Opcode::kUpgradeGrant:
+                        node_event(NodeEventKind::kUpgradeGrant, page, header.req, {}, false);
+                        break;
+                    case Opcode::kInv:
+                        node_event(NodeEventKind::kInv, page, header.req, {}, false);
+                        break;
+                    case Opcode::kFetch:
+                        node_event(NodeEventKind::kFetch, page, header.req, {}, false);
+                        break;
+                    default:
+                        node_event(NodeEventKind::kFetchInv, page, header.req, {}, false);
+                        break;
+                }
                 return;
             }
+            case Opcode::kLockAcq:
+            case Opcode::kLockGrant:
+            case Opcode::kLockRel:
+            case Opcode::kBarrierEnter:
+            case Opcode::kBarrierRelease:
+                if (Sync* locks = sync(); locks != nullptr) {
+                    locks->on_frame(header, payload);
+                }
+                return;
             case Opcode::kFetchData: {
                 const Result<PagePayload> page = wire_decode_page(payload, header.flags);
                 if (!page.ok() || page.value().data.size() != kPageSize) {
@@ -595,15 +668,6 @@ private:
                            (header.flags & kFlagZeroPage) != 0);
                 return;
             }
-            case Opcode::kFetch: {
-                const Result<PageIdPayload> request = wire_decode_page_id(payload);
-                if (!request.ok()) {
-                    bad();
-                    return;
-                }
-                node_event(NodeEventKind::kFetch, request.value().page, header.req, {}, false);
-                return;
-            }
             case Opcode::kTaskAssign: {  // the test hook: run a registered function, then say so
                 const std::uint64_t id = get_u64(payload);
                 const pm_test_fn function =
@@ -613,6 +677,7 @@ private:
                     return;
                 }
                 std::thread{[this, function, id, launcher = header.src] {
+                    this_thread_index() = next_thread_++;
                     function();
                     std::array<std::byte, 24> done{};  // a TASK_DONE for that chunk ID
                     put_u64(done, 0, id);
@@ -642,7 +707,7 @@ private:
             }
             default:
                 abort_job(Status::kUnsupported, header.src,
-                          "a message that is not supported before M2");
+                          "a message this build does not handle yet");
         }
     }
 
@@ -681,9 +746,12 @@ private:
                     break;
                 case NodeActionKind::kReply: {
                     std::array<std::byte, 8 + kPageSize> buffer{};
-                    ok = mem_->read(page, std::span{buffer}.last<kPageSize>()).ok();
                     put_u64(buffer, 0, page.value);
-                    post(home_of(page), a.opcode, buffer, a.req,
+                    if (a.with_page) {
+                        ok = mem_->read(page, std::span{buffer}.last<kPageSize>()).ok();
+                    }
+                    post(home_of(page), a.opcode,
+                         std::span{buffer}.first(a.with_page ? buffer.size() : 8), a.req,
                          a.read_only ? kFlagReadOnly : std::uint16_t{0});
                     break;
                 }
@@ -702,6 +770,12 @@ private:
                 }
                 case NodeActionKind::kWriteProtect:
                     ok = mem_->write_protect(page, true).ok();
+                    break;
+                case NodeActionKind::kAllowWrites:
+                    ok = mem_->write_protect(page, false).ok();
+                    break;
+                case NodeActionKind::kDiscard:
+                    ok = mem_->zap(page).ok();
                     break;
                 case NodeActionKind::kWake:
                     ok = mem_->wake(page).ok();
@@ -740,7 +814,9 @@ private:
                     put_u64(buffer, 0, a.page.value);
                     std::uint16_t flags = a.read_only ? kFlagReadOnly : std::uint16_t{0};
                     std::size_t size = buffer.size();
-                    if (a.source == PageSource::kZero) {
+                    if (a.source == PageSource::kNone) {
+                        size = 8;  // UPGRADE_GRANT: the page ID alone
+                    } else if (a.source == PageSource::kZero) {
                         flags |= kFlagZeroPage;
                         size = 8;
                     } else if (a.source == PageSource::kReceived && data.size() == kPageSize) {
@@ -768,13 +844,13 @@ private:
                 case HomeActionKind::kDropCopy:
                     store_->drop(a.page);
                     break;
-                default:
-                    if (a.opcode != Opcode::kHeartbeat) {
-                        abort_job(Status::kUnsupported, header.src, "not supported before M2");
-                        return;
-                    }
+                case HomeActionKind::kAbort:
                     abort_job(Status::kInternal, s_.self,
                               "the home machine met an impossible event");
+                    return;
+                default:  // apply atomic: M2-5; load and the hold window: later milestones
+                    abort_job(Status::kUnsupported, s_.self,
+                              "a home action this build does not carry out yet");
                     return;
             }
         }
@@ -787,6 +863,7 @@ private:
     HomeDirectoryPtr dir_;
     std::unique_ptr<HomeStore> store_;
     std::unique_ptr<Transport> net_;
+    std::optional<Sync> sync_;
     std::thread thread_;
     std::size_t segments_ = 0;
     RegionAllocator allocator_{0};
@@ -808,6 +885,7 @@ private:
 
     // Shared.
     std::atomic<std::uint64_t> next_req_{1};
+    std::atomic<std::uint16_t> next_thread_{0};
     std::atomic<bool> aborting_{false};
     std::atomic<bool> ending_{false};
     std::atomic<std::uint64_t> region_bytes_{0};  // 0 until the segment map is applied
@@ -898,6 +976,46 @@ void* pm_malloc(size_t bytes) {
 
 int pm_touch(const void* p, size_t n, pm_access access) {
     return paramesh::job() != nullptr ? paramesh::job()->touch(p, n, access) : PM_ERR_STATE;
+}
+
+// Locks and barriers: each is the Sync call of the same name, made for the calling thread.
+namespace {
+
+int status_of(const paramesh::Result<void>& result) {
+    if (result.ok()) {
+        return PM_OK;
+    }
+    return result.error().code == paramesh::Errc::kInvalidArgument ? PM_ERR_INVALID : PM_ERR_STATE;
+}
+
+paramesh::Sync* locks() {
+    return paramesh::job() != nullptr ? paramesh::job()->sync() : nullptr;
+}
+
+}  // namespace
+
+pm_lock_t pm_lock_create(void) {
+    return locks() != nullptr ? locks()->lock_create() : pm_lock_t{0};
+}
+
+int pm_lock(pm_lock_t lock) {
+    return locks() != nullptr ? status_of(locks()->lock(lock, paramesh::this_thread_index()))
+                              : PM_ERR_STATE;
+}
+
+int pm_unlock(pm_lock_t lock) {
+    return locks() != nullptr ? status_of(locks()->unlock(lock, paramesh::this_thread_index()))
+                              : PM_ERR_STATE;
+}
+
+pm_barrier_t pm_barrier_create(uint32_t count) {
+    return locks() != nullptr ? locks()->barrier_create(count) : pm_barrier_t{0};
+}
+
+int pm_barrier_wait(pm_barrier_t barrier) {
+    return locks() != nullptr
+               ? status_of(locks()->barrier_wait(barrier, paramesh::this_thread_index()))
+               : PM_ERR_STATE;
 }
 
 void pm_test_register(uint32_t id, pm_test_fn fn) {
