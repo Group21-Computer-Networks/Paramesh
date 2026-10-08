@@ -1,7 +1,7 @@
 // One job process: the transport, the memory engine, the node and home machines, the home
 // store and the lock manager wired together behind paramesh.h. So far: start-up without pmd,
-// read and write sharing, locks, barriers and atomic adds, clean end, and abort on a lost node or a
-// reply timeout. Not yet: tasks (M3), eviction and spill (M4).
+// read and write sharing, locks, barriers, atomic adds and tasks, clean end, and abort on a lost
+// node or a reply timeout. Not yet: pmd (M3-7), eviction and spill (M4).
 //
 // Threads (docs/INTERNAL_API.md, section 1): every piece of protocol state below is touched
 // only on the network thread. The fault-handler thread and the application's threads hand
@@ -17,6 +17,7 @@
 #include "rt/registry.h"
 #include "rt/runtime.h"
 #include "rt/sync.h"
+#include "rt/tasks.h"
 #include "store/home_store.h"
 #include "store/placement.h"
 #include "wire/payloads.h"
@@ -26,6 +27,7 @@
 #include <paramesh.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -152,12 +154,10 @@ std::array<pm_test_fn, 16>& test_functions() {
     return functions;
 }
 
-// The index of this thread in its process, for locks and barriers: the launcher's main() unless
-// the thread was started to run a function (docs/PROTOCOL.md, LOCK_ACQ).
-std::uint16_t& this_thread_index() {
-    thread_local std::uint16_t index = kMainThread;
-    return index;
-}
+// The test hook's frames are TASK_ASSIGN and TASK_DONE with this bit in the chunk ID, which no
+// real chunk has. Its threads are numbered from kHookThreads, above any worker thread.
+constexpr std::uint64_t kHookChunk = std::uint64_t{1} << 63U;
+constexpr std::uint16_t kHookThreads = 0x8000;
 
 class Job final : public NetHandler, public FaultSink, public StoreEvents, public RuntimeHost {
 public:
@@ -167,7 +167,7 @@ public:
 
     // Brings the process into the job. Returns a pm_status; on a worker it returns PM_OK once
     // the job is up, and the caller then waits for the job to end.
-    int start(std::uint64_t region_bytes) {
+    int start(std::uint64_t region_bytes, std::uint32_t threads) {
         auto platform = platform_open({}, PlatformOptions{s_.self, s_.job, 2, LogLevel::kWarn});
         if (!platform.ok() || !hash_binary(*platform.value().hasher)) {
             return PM_ERR_PLATFORM;
@@ -205,11 +205,22 @@ public:
             run_on_network_thread();  // a job of one node: nobody to wait for
         }
 
-        std::unique_lock<std::mutex> lock{mutex_};
-        if (!changed_.wait_for(lock, s_.start_timeout, [this] { return up_; })) {
-            return PM_ERR_NETWORK;
+        {
+            std::unique_lock<std::mutex> lock{mutex_};
+            if (!changed_.wait_for(lock, s_.start_timeout, [this] { return up_; })) {
+                return PM_ERR_NETWORK;
+            }
         }
-        return PM_OK;
+        // The job is up: start this process's worker threads.
+        // ponytail: without pmd the quota is the program's own bound, or one thread for each
+        // processor here, and every node is taken to have as many; M3-7 takes it from pmd.
+        TasksConfig tasks;
+        tasks.threads = static_cast<std::uint16_t>(std::clamp<std::uint32_t>(
+            threads != 0 ? threads : std::thread::hardware_concurrency(), 1, kHookThreads - 1));
+        tasks.total_slots = static_cast<std::uint32_t>(tasks.threads * s_.members.size());
+        tasks.region_bytes = region_bytes_;
+        tasks_.emplace(*net_, *this, *sync_, tasks);
+        return tasks_->start().ok() ? PM_OK : PM_ERR_PLATFORM;
     }
 
     void* allocate(std::size_t bytes) {
@@ -279,13 +290,14 @@ public:
         return value;
     }
 
-    // Locks and barriers. Null before pm_init() has built the job.
+    // Locks and barriers, and tasks. Null before pm_init() has built the job.
     [[nodiscard]] Sync* sync() noexcept { return sync_.has_value() ? &*sync_ : nullptr; }
+    [[nodiscard]] Tasks* tasks() noexcept { return tasks_.has_value() ? &*tasks_ : nullptr; }
 
     int run_on_workers(std::uint32_t id) {
         std::array<std::byte, 40>
             assign{};  // a TASK_ASSIGN whose chunk ID is the function's number
-        put_u64(assign, 0, id);
+        put_u64(assign, 0, kHookChunk | id);
         {
             const std::lock_guard<std::mutex> lock{mutex_};
             hook_done_ = 0;
@@ -304,6 +316,9 @@ public:
 
     // Ends the job normally. Launcher only.
     void finish_job() {
+        if (tasks_.has_value()) {
+            tasks_->stop();
+        }
         ending_ = true;
         std::size_t workers = 0;
         for (const Member& member : s_.members) {
@@ -726,31 +741,12 @@ private:
                            (header.flags & kFlagZeroPage) != 0);
                 return;
             }
-            case Opcode::kTaskAssign: {  // the test hook: run a registered function, then say so
-                const std::uint64_t id = get_u64(payload);
-                const pm_test_fn function =
-                    id < test_functions().size() ? test_functions().at(id) : nullptr;
-                if (function == nullptr) {
-                    bad();
-                    return;
-                }
-                std::thread{[this, function, id, launcher = header.src] {
-                    this_thread_index() = next_thread_++;
-                    function();
-                    std::array<std::byte, 24> done{};  // a TASK_DONE for that chunk ID
-                    put_u64(done, 0, id);
-                    FrameHeader reply;
-                    reply.opcode = Opcode::kTaskDone;
-                    static_cast<void>(net_->send(launcher, reply, done, ReplyTimer::kNone));
-                }}.detach();
+            case Opcode::kTaskReq:
+            case Opcode::kNoTask:
+            case Opcode::kTaskAssign:
+            case Opcode::kTaskDone:
+                handle_task(header, payload);
                 return;
-            }
-            case Opcode::kTaskDone: {
-                const std::lock_guard<std::mutex> lock{mutex_};
-                hook_done_++;
-                changed_.notify_all();
-                return;
-            }
             case Opcode::kJobEnd: {
                 const Result<JobEndPayload> end = wire_decode_job_end(payload);
                 if (!end.ok()) {
@@ -767,6 +763,44 @@ private:
                 abort_job(Status::kUnsupported, header.src,
                           "a message this build does not handle yet");
         }
+    }
+
+    // TASK_REQ, TASK_ASSIGN, NO_TASK and TASK_DONE: to the task queue, unless the frame is one
+    // of the test hook's.
+    void handle_task(const FrameHeader& header, std::span<const std::byte> payload) noexcept {
+        const bool hook =
+            (header.opcode == Opcode::kTaskAssign || header.opcode == Opcode::kTaskDone) &&
+            (get_u64(payload) & kHookChunk) != 0;
+        if (!hook) {
+            if (Tasks* queue = tasks(); queue != nullptr) {
+                queue->on_frame(header, payload);
+            }
+            return;
+        }
+        if (header.opcode == Opcode::kTaskDone) {
+            const std::lock_guard<std::mutex> lock{mutex_};
+            hook_done_++;
+            changed_.notify_all();
+            return;
+        }
+        // Run a registered function on a thread of its own, then say so.
+        const std::uint64_t id = get_u64(payload) & ~kHookChunk;
+        const pm_test_fn function =
+            id < test_functions().size() ? test_functions().at(id) : nullptr;
+        if (function == nullptr) {
+            abort_job(Status::kProtocol, header.src,
+                      "malformed frame from node " + std::to_string(header.src.value));
+            return;
+        }
+        std::thread{[this, function, id, launcher = header.src] {
+            rt_thread_index() = next_thread_++;
+            function();
+            std::array<std::byte, 24> done{};  // a TASK_DONE for that chunk ID
+            put_u64(done, 0, kHookChunk | id);
+            FrameHeader reply;
+            reply.opcode = Opcode::kTaskDone;
+            static_cast<void>(net_->send(launcher, reply, done, ReplyTimer::kNone));
+        }}.detach();
     }
 
     // ---- the node machine
@@ -954,6 +988,7 @@ private:
     std::unique_ptr<HomeStore> store_;
     std::unique_ptr<Transport> net_;
     std::optional<Sync> sync_;
+    std::optional<Tasks> tasks_;  // after what it uses, so it goes first
     std::thread thread_;
     std::size_t segments_ = 0;
     RegionAllocator allocator_{0};
@@ -975,7 +1010,7 @@ private:
 
     // Shared.
     std::atomic<std::uint64_t> next_req_{1};
-    std::atomic<std::uint16_t> next_thread_{0};
+    std::atomic<std::uint16_t> next_thread_{kHookThreads};
     std::atomic<bool> aborting_{false};
     std::atomic<bool> ending_{false};
     std::atomic<std::uint64_t> region_bytes_{0};  // 0 until the segment map is applied
@@ -1052,7 +1087,7 @@ int pm_init(int* /*argc*/, char*** /*argv*/, const pm_config* cfg) {
         return PM_ERR_CONFIG;
     }
     paramesh::job() = std::make_unique<paramesh::Job>(std::move(settings));
-    const int status = paramesh::job()->start(bytes);
+    const int status = paramesh::job()->start(bytes, cfg != nullptr ? cfg->threads_per_node : 0);
     if (status == PM_OK && !paramesh::job()->is_launcher()) {
         for (;;) {
             ::pause();  // a worker serves until JOB_END, which exits the process
@@ -1062,8 +1097,10 @@ int pm_init(int* /*argc*/, char*** /*argv*/, const pm_config* cfg) {
 }
 
 int pm_finalize(void) {
-    if (paramesh::job() == nullptr || !paramesh::job()->is_launcher()) {
-        return PM_ERR_STATE;
+    if (paramesh::job() == nullptr || !paramesh::job()->is_launcher() ||
+        paramesh::rt_thread_index() != paramesh::kMainThread ||
+        (paramesh::job()->sync() != nullptr && paramesh::job()->sync()->outstanding() != 0)) {
+        return PM_ERR_STATE;  // also: work still outstanding
     }
     paramesh::job()->finish_job();
     paramesh::job().reset();
@@ -1071,7 +1108,8 @@ int pm_finalize(void) {
 }
 
 void* pm_malloc(size_t bytes) {
-    return paramesh::job() != nullptr && paramesh::job()->is_launcher()
+    return paramesh::job() != nullptr && paramesh::job()->is_launcher() &&
+                   paramesh::rt_thread_index() == paramesh::kMainThread  // not from a task
                ? paramesh::job()->allocate(bytes)
                : nullptr;
 }
@@ -1096,6 +1134,63 @@ paramesh::Sync* locks() {
 
 }  // namespace
 
+// Tasks: pm_parallel_for is pm_parallel_for_data with no array.
+namespace {
+
+int queue_tasks(const char* task, uint64_t lo, uint64_t hi, uint64_t grain, const void* arg,
+                size_t arg_len, const void* data, size_t stride) {
+    paramesh::Tasks* tasks = paramesh::job() != nullptr ? paramesh::job()->tasks() : nullptr;
+    if (tasks == nullptr) {
+        return PM_ERR_STATE;
+    }
+    if (task == nullptr || (arg == nullptr && arg_len > 0)) {
+        return PM_ERR_INVALID;
+    }
+    paramesh::ParallelFor call;
+    call.task = task;
+    call.lo = lo;
+    call.hi = hi;
+    call.grain = grain;
+    call.arg = std::span{static_cast<const std::byte*>(arg), arg_len};
+    call.data = data;
+    call.stride = stride;
+    const paramesh::Result<void> queued = tasks->parallel_for(call);
+    if (queued.ok()) {
+        return PM_OK;
+    }
+    switch (queued.error().code) {
+        case paramesh::Errc::kInvalidArgument:
+            return PM_ERR_INVALID;
+        case paramesh::Errc::kNotFound:
+            return PM_ERR_UNKNOWN_TASK;
+        default:
+            return PM_ERR_STATE;
+    }
+}
+
+}  // namespace
+
+int pm_parallel_for(const char* task, uint64_t lo, uint64_t hi, uint64_t grain, const void* arg,
+                    size_t arg_len) {
+    return queue_tasks(task, lo, hi, grain, arg, arg_len, nullptr, 0);
+}
+
+int pm_parallel_for_data(const char* task, uint64_t lo, uint64_t hi, uint64_t grain,
+                         const void* arg, size_t arg_len, const void* data, size_t stride) {
+    if (data == nullptr || stride == 0) {
+        return PM_ERR_INVALID;
+    }
+    return queue_tasks(task, lo, hi, grain, arg, arg_len, data, stride);
+}
+
+int pm_wait_all(void) {
+    paramesh::Sync* sync = paramesh::job() != nullptr ? paramesh::job()->sync() : nullptr;
+    if (sync == nullptr || paramesh::rt_thread_index() != paramesh::kMainThread) {
+        return PM_ERR_STATE;
+    }
+    return sync->wait_all().ok() ? PM_OK : PM_ERR_STATE;
+}
+
 uint64_t pm_atomic_add(uint64_t* addr, uint64_t delta) {
     if (paramesh::job() == nullptr) {
         static_cast<void>(std::fprintf(stderr, "pm_atomic_add: there is no job\n"));
@@ -1109,12 +1204,12 @@ pm_lock_t pm_lock_create(void) {
 }
 
 int pm_lock(pm_lock_t lock) {
-    return locks() != nullptr ? status_of(locks()->lock(lock, paramesh::this_thread_index()))
+    return locks() != nullptr ? status_of(locks()->lock(lock, paramesh::rt_thread_index()))
                               : PM_ERR_STATE;
 }
 
 int pm_unlock(pm_lock_t lock) {
-    return locks() != nullptr ? status_of(locks()->unlock(lock, paramesh::this_thread_index()))
+    return locks() != nullptr ? status_of(locks()->unlock(lock, paramesh::rt_thread_index()))
                               : PM_ERR_STATE;
 }
 
@@ -1124,7 +1219,7 @@ pm_barrier_t pm_barrier_create(uint32_t count) {
 
 int pm_barrier_wait(pm_barrier_t barrier) {
     return locks() != nullptr
-               ? status_of(locks()->barrier_wait(barrier, paramesh::this_thread_index()))
+               ? status_of(locks()->barrier_wait(barrier, paramesh::rt_thread_index()))
                : PM_ERR_STATE;
 }
 
