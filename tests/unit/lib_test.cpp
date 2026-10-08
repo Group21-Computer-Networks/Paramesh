@@ -1,6 +1,6 @@
 // src/lib/: three job processes on localhost run the M1 program (read sharing) and the M2
-// program (write sharing, locks, a barrier), started the way docs/PROTOCOL.md section 10
-// describes for a job without pmd: by environment variables.
+// programs (write sharing, locks, a barrier; atomic adds), started the way docs/PROTOCOL.md
+// section 10 describes for a job without pmd: by environment variables.
 //
 // The processes map the real region, so these tests are skipped under ThreadSanitizer and
 // where user-mode userfaultfd is missing, as in mem_test.cpp.
@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 // The environment is read and set only in processes that have one thread at that moment.
@@ -220,6 +221,73 @@ int write_program() {
     return pm_finalize() == PM_OK ? 0 : 10;
 }
 
+// ---- the atomic program: every node adds to the same numbers ---------------------------------
+
+constexpr std::uint64_t kAtomicAdds = 200;
+constexpr std::size_t kCounters = 7;  // one at the start of each of seven segments
+constexpr std::size_t kNumbersPerSegment = paramesh::kSegmentSize / sizeof(std::uint64_t);
+
+// Counter s: one number every node adds to with pm_atomic_add, and in the three numbers after
+// it, in the same page, one for each node to write the ordinary way.
+std::uint64_t* counter(std::size_t s) {
+    return numbers() + s * kNumbersPerSegment;
+}
+
+// Runs on all three nodes at once. With seven segments each node is, very likely, the home of
+// some counters and a stranger to others.
+void add_everywhere() {
+    const std::size_t node = node_number();
+    std::array<std::uint64_t, kCounters> last{};
+    for (std::uint64_t i = 0; i < kAtomicAdds; i++) {
+        for (std::size_t s = 0; s < kCounters; s++) {
+            volatile std::uint64_t* number = counter(s);
+            const std::uint64_t old = pm_atomic_add(counter(s), 1);
+            if (i > 0 && old <= last.at(s)) {
+                pm_test_fail("pm_atomic_add returned a value that did not grow");
+            }
+            last.at(s) = old;
+            if (i % 8 == 0) {
+                // An ordinary read leaves a read copy here, which the next add must invalidate;
+                // an ordinary write makes this node the page's owner, and the home must take
+                // the page back before it adds.
+                if (*number <= old) {
+                    pm_test_fail("a read after pm_atomic_add saw an older value");
+                }
+                number[node] = number[node] + 1;
+            }
+        }
+    }
+}
+
+int atomic_program() {
+    pm_test_register(6, add_everywhere);
+    pm_config config{};
+    config.region_bytes = kRegionBytes;
+    if (pm_init(nullptr, nullptr, &config) != PM_OK) {
+        return 2;
+    }
+    if (pm_malloc(kCounters * paramesh::kSegmentSize) != numbers()) {
+        return 3;
+    }
+    std::thread mine{add_everywhere};  // the launcher adds while the workers do
+    const int ran = pm_test_run_on_workers(6);
+    mine.join();
+    if (ran != PM_OK) {
+        return 4;
+    }
+    for (std::size_t s = 0; s < kCounters; s++) {
+        if (*counter(s) != 3 * kAtomicAdds) {
+            return 5;  // an add was lost or counted twice
+        }
+        for (std::size_t node = 1; node <= 3; node++) {
+            if (counter(s)[node] != kAtomicAdds / 8) {
+                return 6;  // an ordinary write was lost when the home took the page back
+            }
+        }
+    }
+    return pm_finalize() == PM_OK ? 0 : 7;
+}
+
 std::uint16_t free_port() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr{};
@@ -325,21 +393,93 @@ TEST_CASE("three processes write one shared page and lose no update, with and wi
     CHECK(read_all(job.launcher_stderr).empty());
 }
 
-// A job of one node, in a child process: a system call on shared memory before and after
-// pm_touch. Returns 0 if everything was as paramesh.h says, else the number of the step that
-// was not.
-int touch_program() {
+TEST_CASE("concurrent atomic adds from three processes sum exactly" * doctest::skip(!can_run())) {
+    const Started job = start_job("0", atomic_program);
+    CHECK(wait_for(job.pids[0], 120) == 0);
+    CHECK(wait_for(job.pids[1], 10) == 0);
+    CHECK(wait_for(job.pids[2], 10) == 0);
+    CHECK(read_all(job.launcher_stderr).empty());
+}
+
+// Makes this process a job of one node. False if pm_init() failed.
+bool start_alone(const char* job) {
     ::setenv("PARAMESH_ROLE", "launcher", 1);
-    ::setenv("PARAMESH_JOB_ID", "43", 1);
+    ::setenv("PARAMESH_JOB_ID", job, 1);
     ::setenv("PARAMESH_NODE_ID", "1", 1);
     const std::string here = "127.0.0.1:" + std::to_string(free_port());
     ::setenv("PARAMESH_LISTEN", here.c_str(), 1);
     ::setenv("PARAMESH_PEERS", ("1@" + here).c_str(), 1);
     pm_config config{};
     config.region_bytes = kRegionBytes;
-    if (pm_init(nullptr, nullptr, &config) != PM_OK) {
+    return pm_init(nullptr, nullptr, &config) == PM_OK;
+}
+
+// A job of one node, which is then the home of every page: what pm_atomic_add returns, and
+// what it does with an address it cannot use. `bad` chooses that address: 0 none, 1 not a
+// multiple of 8, 2 outside the region.
+int add_alone_program(int bad) {
+    if (!start_alone("44")) {
         return 1;
     }
+    auto* number = static_cast<std::uint64_t*>(pm_malloc(2 * paramesh::kPageSize));
+    if (number == nullptr) {
+        return 2;
+    }
+    if (pm_atomic_add(number, 5) != 0 || pm_atomic_add(number, 7) != 5 || *number != 12) {
+        return 3;  // a page never written counts from zero
+    }
+    *number = 100;  // this node now holds the page for writing; its own home takes it back
+    if (pm_atomic_add(number, 1) != 100 || *number != 101) {
+        return 4;
+    }
+    if (pm_atomic_add(number, ~std::uint64_t{0}) != 101 || *number != 100) {
+        return 5;  // modulo 2^64: adding the largest number subtracts one
+    }
+    std::uint64_t* last = number + paramesh::kPageSize / sizeof(std::uint64_t) - 1;
+    if (pm_atomic_add(last, 9) != 0 || *last != 9 || *number != 100) {
+        return 6;  // the last number of a page
+    }
+    if (bad == 1) {
+        auto* crooked = reinterpret_cast<std::uint64_t*>(reinterpret_cast<char*>(number) + 4);
+        static_cast<void>(pm_atomic_add(crooked, 1));  // ends the job
+        return 7;
+    }
+    if (bad == 2) {
+        std::uint64_t local = 0;
+        static_cast<void>(pm_atomic_add(&local, 1));  // ends the job
+        return 8;
+    }
+    return pm_finalize() == PM_OK ? 0 : 9;
+}
+
+TEST_CASE("pm_atomic_add returns the old value, and an address it cannot use ends the job" *
+          doctest::skip(!can_run())) {
+    for (const int bad : {0, 1, 2}) {
+        std::array<int, 2> err{};
+        REQUIRE(::pipe(err.data()) == 0);
+        const pid_t child = ::fork();
+        REQUIRE(child >= 0);
+        if (child == 0) {
+            ::dup2(err[1], STDERR_FILENO);
+            ::_exit(add_alone_program(bad));
+        }
+        ::close(err[1]);
+        CHECK(wait_for(child, 30) == (bad == 0 ? 0 : 1));
+        CHECK(read_all(err[0]) ==
+              (bad == 0 ? ""
+                        : "job 44 aborted: pm_atomic_add: the address is not an 8-byte-aligned "
+                          "number in the shared region\n"));
+    }
+}
+
+// A job of one node, in a child process: a system call on shared memory before and after
+// pm_touch. Returns 0 if everything was as paramesh.h says, else the number of the step that
+// was not.
+int touch_program() {
+    if (!start_alone("43")) {
+        return 1;
+    }
+    pm_config config{};
     auto* buffer = static_cast<char*>(pm_malloc(4 * paramesh::kPageSize));
     std::array<char, 16> name = {"/tmp/pm-XXXXXX"};
     const int file = ::mkstemp(name.data());
