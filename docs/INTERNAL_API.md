@@ -33,7 +33,7 @@ Third-party headers are included only by the adapters in `src/platform/` and by 
 
 **Names.** Everything is in the one namespace `paramesh`. A free function carries its
 directory as a prefix, as the HLD's names do: `coh_step`, `home_step`, `mem_open`,
-`store_open`, `net_open`, `rt_open`, `wire_decode_header`.
+`store_open`, `net_open`, `rt_task_id`, `wire_decode_header`.
 
 **Errors.** A function that can fail returns `Result<T>`. Nothing throws. `platform`, `wire`,
 `mem`, `store` and `net` never end the job themselves: they return the error, and `src/lib/`
@@ -912,7 +912,27 @@ the only thread that may wait on a timer.
 
 ## 8. `rt`: the task runtime
 
-Header: `src/rt/runtime.h`. Implemented by M1-6, M2-4, M2-5, M3-1 and M3-2.
+Header: `src/rt/runtime.h`: what the runtime needs from the job process, one
+`pm_parallel_for` call as it is handed over, and the task registry.
+
+**[CHANGED at the M3 gate, 2026-10-10]** The draft had one `Runtime` class behind `rt_open()`
+that carried out every runtime function of `paramesh.h`. It was never built, and the person
+approved bringing this section in line with the code (`docs/logs/M3-gate.md`,
+`docs/logs/X-m3-runtime-api.md`). The runtime is these pieces, each created and owned by the
+job process in `src/lib/`, which is the runtime's only user:
+
+| Header | What it is | Built by |
+| --- | --- | --- |
+| `rt/sync.h` | `Sync`: locks and barriers, kept by the launcher, and the count of outstanding chunks that `pm_wait_all` waits on | M2-4 |
+| `rt/tasks.h` | `Tasks`: the launcher's queue of chunks and every process's worker threads | M3-2, M3-3 |
+| `rt/registry.h` | Looking a task up by its ID, and `rt_run_task`, the one caller of task bodies | M3-1 |
+| `rt/region_allocator.h` | `RegionAllocator`: the bump allocator behind `pm_malloc` | M1-6 |
+
+Those four headers are not frozen; their declarations are in the headers themselves.
+`pm_malloc` and `pm_atomic_add` are carried out in `src/lib/`: an atomic add is one frame to
+the page's home, which may be the caller's own node, and only the job process can deliver a
+frame to itself.
+
 
 ```cpp
 // What the runtime needs from the job process. Implemented by src/lib/, and by a fake in the
@@ -952,61 +972,6 @@ struct ParallelFor {
     const void* data = nullptr;  // nullptr for pm_parallel_for
     std::size_t stride = 0;
 };
-
-// Each function carries out the paramesh.h function it is named after, and its Result maps
-// to that function's pm_status: kInvalidArgument to PM_ERR_INVALID, kState to PM_ERR_STATE,
-// kNotFound to PM_ERR_UNKNOWN_TASK, kNoMemory to PM_ERR_NOMEM.
-class Runtime {
-public:
-    Runtime() = default;
-    Runtime(const Runtime&) = delete;
-    Runtime& operator=(const Runtime&) = delete;
-    Runtime(Runtime&&) = delete;
-    Runtime& operator=(Runtime&&) = delete;
-    virtual ~Runtime() = default;
-
-    // pm_malloc. nullptr when the region is full or the caller is not the launcher's main().
-    virtual void* allocate(std::size_t bytes) noexcept = 0;
-
-    virtual Result<void> parallel_for(const ParallelFor& call) = 0;
-    virtual Result<void> wait_all() = 0;
-
-    virtual pm_lock_t lock_create() noexcept = 0;
-    virtual Result<void> lock(pm_lock_t lock) = 0;
-    virtual Result<void> unlock(pm_lock_t lock) = 0;
-    virtual pm_barrier_t barrier_create(std::uint32_t count) noexcept = 0;
-    virtual Result<void> barrier_wait(pm_barrier_t barrier) = 0;
-
-    // pm_atomic_add: returns the old value. A bad address ends the job through
-    // RuntimeHost::abort_job.
-    virtual std::uint64_t atomic_add(std::uint64_t* addr, std::uint64_t delta) = 0;
-
-    // A frame of the task or synchronisation group arrived (TASK_*, LOCK_*, BARRIER_*,
-    // ATOMIC_RESULT). Called on the network thread; must not block.
-    virtual void on_frame(const FrameHeader& header,
-                          std::span<const std::byte> payload) noexcept = 0;
-
-    // pmd pushed a new thread quota. A thread over the quota parks at its next task boundary.
-    virtual void set_quota(std::uint16_t threads) noexcept = 0;
-
-    // A member is leaving or has left: give it no more chunks, and after `grace` put the
-    // chunks it has not finished back in the queue. Launcher only.
-    virtual void member_leaving(NodeId node, Nanos grace) noexcept = 0;
-
-    // Starts the worker threads; stop() ends them and returns when they have exited.
-    virtual Result<void> start() = 0;
-    virtual void stop() noexcept = 0;
-};
-
-struct RuntimeConfig {
-    std::uint64_t region_bytes = 0;
-    std::uint16_t threads = 0;  // the first quota
-    bool is_launcher = false;
-};
-
-// `transport` and `host` must outlive the runtime.
-Result<std::unique_ptr<Runtime>> rt_open(const RuntimeConfig& config, Transport& transport,
-                                         RuntimeHost& host);
 
 // The task registry is process-wide and filled before pm_init() by PM_TASK's constructors.
 // Errc::kInvalidArgument for an empty name or a null function.
