@@ -1,12 +1,13 @@
 // src/pmd/ and src/tools/: the minimal daemon and pmrun. The tests play the part of a peer
 // daemon on the control channel, and this executable, started by a daemon or by pmrun, plays
 // a job process on the local socket (see main.cpp for how a test executable becomes a helper
-// process). The last tests run three daemons and the real pmrun executable.
+// process). The last tests run three daemons and the real pmrun executable, first with
+// stand-in job processes and then with this executable as a real ParaMesh program.
 
 #include "pmd/pmd.h"
 
+#include "net/frame_io.h"
 #include "platform/factory.h"
-#include "pmd/frame_io.h"
 #include "wire/payloads.h"
 
 #include <doctest/doctest.h>
@@ -14,6 +15,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <paramesh.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -461,9 +463,99 @@ struct ThreeNodes {
     }
 };
 
+// ---- this executable as a real ParaMesh program, started by pmrun and by daemons --------------
+
+constexpr std::uint64_t kSquares = 64ULL * 512;  // 64 pages of numbers
+
+struct SquareArgs {
+    std::uint64_t* squares;
+    std::uint64_t* by_node;    // by_node[n]: indexes node n ran, n below 8
+    std::uint64_t* by_thread;  // by_thread[t]: chunks run by a thread with index t, t below 64
+    std::uint64_t* started;    // started[n]: node n has begun a chunk
+    std::uint64_t slow;        // 1: every chunk takes a long time (for the test of Ctrl+C)
+};
+
+bool region_can_be_mapped() {
+    return std::string_view{PARAMESH_SANITIZER_NAME} != "thread";  // as in lib_test.cpp
+}
+
+// Counts the processes whose command line names `marker`.
+int processes_naming(const std::string& marker) {
+    int found = 0;
+    for (const auto& entry : std::filesystem::directory_iterator{"/proc"}) {
+        const std::string line = contents(entry.path().string() + "/cmdline");
+        found += line.find(marker) != std::string::npos ? 1 : 0;
+    }
+    return found;
+}
+
+}  // namespace
+
+PM_TASK(pmd_test_square) {
+    const auto* args = static_cast<const SquareArgs*>(arg);
+    // The first chunks wait until every node has begun one, so that each node runs some.
+    volatile std::uint64_t* started = args->started;
+    started[ctx->node] = 1;
+    for (int waited = 0; waited < 10000 && (started[1] & started[2] & started[3]) == 0; waited++) {
+        ::usleep(1000);
+    }
+    for (std::uint64_t i = lo; i < hi; i++) {
+        args->squares[i] = i * i;
+    }
+    if (args->slow != 0) {
+        ::usleep(600U * 1000000U);  // ten minutes: far longer than the test waits
+    }
+    pm_atomic_add(&args->by_thread[ctx->thread < 64 ? ctx->thread : 63], 1);
+    pm_atomic_add(&args->by_node[ctx->node < 8 ? ctx->node : 0], hi - lo);
+}
+
+namespace {
+
+// The launcher's side; a worker does not return from pm_init(). Writes its report, or the
+// number of the step that failed.
+int program(const std::string& report, bool slow) {
+    const pm_config config{.region_bytes = 4ULL << 20U, .threads_per_node = 0};
+    if (pm_init(nullptr, nullptr, &config) != PM_OK) {
+        return 30;
+    }
+    SquareArgs args{};
+    args.squares = static_cast<std::uint64_t*>(pm_malloc(kSquares * sizeof(std::uint64_t)));
+    args.by_node = static_cast<std::uint64_t*>(pm_malloc(8 * sizeof(std::uint64_t)));
+    args.by_thread = static_cast<std::uint64_t*>(pm_malloc(64 * sizeof(std::uint64_t)));
+    args.started = static_cast<std::uint64_t*>(pm_malloc(8 * sizeof(std::uint64_t)));
+    args.slow = slow ? 1 : 0;
+    if (args.squares == nullptr || args.by_node == nullptr || args.by_thread == nullptr ||
+        args.started == nullptr) {
+        return 31;
+    }
+    write_report(report + ".up", "pid=" + std::to_string(::getpid()) + "\n");
+    if (pm_parallel_for_data("pmd_test_square", 0, kSquares, 512, &args, sizeof args, args.squares,
+                             sizeof(std::uint64_t)) != PM_OK ||
+        pm_wait_all() != PM_OK) {
+        return 32;
+    }
+    std::uint64_t wrong = 0;
+    for (std::uint64_t i = 0; i < kSquares; i++) {
+        wrong += args.squares[i] != i * i ? 1U : 0U;
+    }
+    std::uint64_t over_quota = 0;  // chunks run by a thread the quota of 3 does not allow
+    for (std::size_t thread = 3; thread < 64; thread++) {
+        over_quota += args.by_thread[thread];
+    }
+    const bool every_node = args.by_node[1] != 0 && args.by_node[2] != 0 && args.by_node[3] != 0;
+    write_report(report, "wrong=" + std::to_string(wrong) + "\nindexes=" +
+                             std::to_string(args.by_node[1] + args.by_node[2] + args.by_node[3]) +
+                             "\nevery_node=" + (every_node ? "yes" : "no") +
+                             "\nover_quota=" + std::to_string(over_quota) + "\n");
+    return pm_finalize() == PM_OK ? 0 : 33;
+}
+
 }  // namespace
 
 extern "C" int paramesh_test_helper(int argc, char** argv) {
+    if (argc == 4 && std::string_view{argv[1]} == "--as-program") {
+        return program(argv[2], std::string_view{argv[3]} == "slow");
+    }
     if (argc == 4 && std::string_view{argv[1]} == "--as-job-process") {
         return job_process(argv[2], argv[3]);
     }
@@ -657,4 +749,46 @@ TEST_CASE("pmrun says what is wrong when it cannot start a job") {
     CHECK(exit_status(start_pmrun({"--state-dir", nowhere, "/no/such/program"}), 20) == 2);
     CHECK(exit_status(start_pmrun({"-n", "9", "/bin/true"}), 20) == 2);
     CHECK(exit_status(start_pmrun({}), 20) == 2);
+}
+
+TEST_CASE("a ParaMesh program started by pmrun runs its tasks on three nodes, within the quota" *
+          doctest::skip(!region_can_be_mapped())) {
+    const ThreeNodes nodes;
+    const std::string report = nodes.reports + "/program";
+    CHECK(exit_status(start_pmrun({"-n", "3", "--state-dir", nodes.one.state_dir, own_path(),
+                                   "--as-program", report, "quick"}),
+                      180) == 0);
+    const std::string said = contents(report);
+    CHECK(field(said, "wrong") == "0");
+    CHECK(field(said, "indexes") == std::to_string(kSquares));
+    CHECK(field(said, "every_node") == "yes");
+    // Each daemon's --cap-cores is 3 and the program asks for no bound of its own: no thread
+    // with an index of 3 or more ran a chunk, on a machine with more processors than that.
+    CHECK(field(said, "over_quota") == "0");
+    for (int tenths = 0; tenths < 100 && processes_naming(report) != 0; tenths++) {
+        ::usleep(100000);  // the workers end on JOB_END
+    }
+    CHECK(processes_naming(report) == 0);
+}
+
+TEST_CASE("Ctrl+C on pmrun ends a running ParaMesh job on every node" *
+          doctest::skip(!region_can_be_mapped())) {
+    const ThreeNodes nodes;
+    const std::string report = nodes.reports + "/program";
+    const pid_t pmrun = start_pmrun({"-n", "3", "--state-dir", nodes.one.state_dir, own_path(),
+                                     "--as-program", report, "slow"});
+    for (int tenths = 0; tenths < 1800 && contents(report + ".up").empty(); tenths++) {
+        ::usleep(100000);  // until the job is up and about to queue its tasks
+    }
+    REQUIRE_FALSE(contents(report + ".up").empty());
+    ::usleep(500000);                      // the chunks are running: each sleeps for ten minutes
+    CHECK(processes_naming(report) == 4);  // pmrun, the launcher, two workers
+
+    REQUIRE(::kill(pmrun, SIGINT) == 0);
+    CHECK(exit_status(pmrun, 30) == 130);
+    for (int tenths = 0; tenths < 100 && processes_naming(report) != 0; tenths++) {
+        ::usleep(100000);
+    }
+    CHECK(processes_naming(report) == 0);
+    CHECK(contents(report).empty());  // the job did not finish: it was ended
 }
