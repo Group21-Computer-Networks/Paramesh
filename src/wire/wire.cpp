@@ -518,4 +518,167 @@ Result<TaskDonePayload> wire_decode_task_done(std::span<const std::byte> in) {
     return payload;
 }
 
+namespace {
+
+// str16: a 16-bit length and that many bytes, no terminator.
+void put_str16(Writer& w, const std::string& text) {
+    w.put(text.size(), 2);
+    w.bytes(std::as_bytes(std::span{text}));
+}
+
+std::string get_str16(Reader& r) {
+    const std::span<const std::byte> bytes = r.take(r.get(2));
+    std::string text(bytes.size(), '\0');
+    std::transform(bytes.begin(), bytes.end(), text.begin(),
+                   [](std::byte b) { return std::to_integer<char>(b); });
+    return text;
+}
+
+constexpr std::size_t kMaxStr16 = 65535;
+
+}  // namespace
+
+Result<std::size_t> wire_encode(const SpawnReqPayload& payload, std::span<std::byte> out) {
+    const auto too_long = [](const std::string& s) { return s.size() > kMaxStr16; };
+    if (too_long(payload.path) || too_long(payload.cwd) || payload.argv.size() > kMaxStr16 ||
+        std::any_of(payload.argv.begin(), payload.argv.end(), too_long)) {
+        return kUnsendable;
+    }
+    Writer w{out.first(std::min(out.size(), kMaxSpawnReq))};
+    w.put(payload.launcher_node.value, 2);
+    w.put(payload.flags, 2);
+    w.put(payload.launcher_addr, 4);
+    w.put(payload.launcher_port, 2);
+    w.put(payload.threads_per_node, 2);
+    w.put(payload.region_bytes, 8);
+    w.bytes(payload.binary_hash);
+    put_str16(w, payload.path);
+    put_str16(w, payload.cwd);
+    w.put(payload.argv.size(), 2);
+    for (const std::string& argument : payload.argv) {
+        put_str16(w, argument);
+    }
+    return w.done();
+}
+
+Result<SpawnReqPayload> wire_decode_spawn_req(std::span<const std::byte> in) {
+    if (in.size() > kMaxSpawnReq) {
+        return kMalformed;
+    }
+    Reader r{in};
+    SpawnReqPayload payload;
+    payload.launcher_node = NodeId{static_cast<std::uint16_t>(r.get(2))};
+    payload.flags = static_cast<std::uint16_t>(r.get(2));
+    payload.launcher_addr = static_cast<std::uint32_t>(r.get(4));
+    payload.launcher_port = static_cast<std::uint16_t>(r.get(2));
+    payload.threads_per_node = static_cast<std::uint16_t>(r.get(2));
+    payload.region_bytes = r.get(8);
+    const std::span<const std::byte> hash = r.take(payload.binary_hash.size());
+    std::copy(hash.begin(), hash.end(), payload.binary_hash.begin());
+    payload.path = get_str16(r);
+    payload.cwd = get_str16(r);
+    const std::size_t argc = r.get(2);
+    for (std::size_t i = 0; i < argc && i < in.size(); i++) {  // each one takes two bytes or more
+        payload.argv.push_back(get_str16(r));
+    }
+    if (!r.exact() || payload.argv.size() != argc) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const SpawnOkPayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    w.put(payload.node.value, 2);
+    w.put(payload.data_port, 2);
+    w.put(payload.cores, 2);
+    w.put(0, 2);  // reserved
+    w.put(payload.ram_commit, 8);
+    w.put(payload.spill_commit, 8);
+    return w.done();
+}
+
+Result<SpawnOkPayload> wire_decode_spawn_ok(std::span<const std::byte> in) {
+    Reader r{in};
+    SpawnOkPayload payload;
+    payload.node = NodeId{static_cast<std::uint16_t>(r.get(2))};
+    payload.data_port = static_cast<std::uint16_t>(r.get(2));
+    payload.cores = static_cast<std::uint16_t>(r.get(2));
+    r.take(2);
+    payload.ram_commit = r.get(8);
+    payload.spill_commit = r.get(8);
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const SpawnDeclinePayload& payload, std::span<std::byte> out) {
+    if (payload.message.size() > kMaxMessage) {
+        return kUnsendable;
+    }
+    Writer w{out};
+    w.put(static_cast<std::uint16_t>(payload.status), 2);
+    put_str16(w, payload.message);
+    return w.done();
+}
+
+Result<SpawnDeclinePayload> wire_decode_spawn_decline(std::span<const std::byte> in) {
+    Reader r{in};
+    SpawnDeclinePayload payload;
+    const std::uint64_t status = r.get(2);
+    payload.message = get_str16(r);
+    if (!r.exact() || payload.message.size() > kMaxMessage ||
+        status > static_cast<std::uint64_t>(Status::kStartTimeout)) {
+        return kMalformed;
+    }
+    payload.status = static_cast<Status>(status);
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const LRegisterPayload& payload, std::span<std::byte> out) {
+    if (payload.role != 1 && payload.role != 2) {
+        return kUnsendable;
+    }
+    Writer w{out};
+    w.put(payload.pid, 4);
+    w.put(payload.role, 1);
+    w.put(0, 1);  // reserved
+    w.put(payload.data_port, 2);
+    w.bytes(payload.binary_hash);
+    return w.done();
+}
+
+Result<LRegisterPayload> wire_decode_l_register(std::span<const std::byte> in) {
+    Reader r{in};
+    LRegisterPayload payload;
+    payload.pid = static_cast<std::uint32_t>(r.get(4));
+    payload.role = static_cast<std::uint8_t>(r.get(1));
+    r.take(1);
+    payload.data_port = static_cast<std::uint16_t>(r.get(2));
+    const std::span<const std::byte> hash = r.take(payload.binary_hash.size());
+    std::copy(hash.begin(), hash.end(), payload.binary_hash.begin());
+    if (!r.exact() || (payload.role != 1 && payload.role != 2)) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const LQuotaPayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    w.put(payload.threads, 2);
+    w.put(0, 2);  // reserved
+    return w.done();
+}
+
+Result<LQuotaPayload> wire_decode_l_quota(std::span<const std::byte> in) {
+    Reader r{in};
+    const LQuotaPayload payload{static_cast<std::uint16_t>(r.get(2))};
+    r.take(2);
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
 }  // namespace paramesh

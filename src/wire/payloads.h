@@ -113,6 +113,49 @@ struct TaskDonePayload {
     std::uint16_t thread = 0;
 };
 
+// SPAWN_REQ: a launcher's pmd asks a peer's pmd to start one worker process.
+struct SpawnReqPayload {
+    NodeId launcher_node;
+    std::uint16_t flags = 0;
+    std::uint32_t launcher_addr = 0;  // IPv4, host byte order
+    std::uint16_t launcher_port = 0;
+    std::uint16_t threads_per_node = 0;
+    std::uint64_t region_bytes = 0;
+    std::array<std::byte, 32> binary_hash{};
+    std::string path;               // absolute, the same on every node
+    std::string cwd;                // the launcher's working directory
+    std::vector<std::string> argv;  // without the program name
+};
+inline constexpr std::size_t kMaxSpawnReq = 65536;
+
+// SPAWN_OK: the worker is running and has registered.
+struct SpawnOkPayload {
+    NodeId node;
+    std::uint16_t data_port = 0;
+    std::uint16_t cores = 0;
+    std::uint64_t ram_commit = 0;
+    std::uint64_t spill_commit = 0;
+};
+
+// SPAWN_DECLINE: why not, and a text for the launcher's log (at most 512 bytes).
+struct SpawnDeclinePayload {
+    Status status = Status::kInternal;
+    std::string message;
+};
+
+// L_REGISTER: the first frame a job process sends its pmd.
+struct LRegisterPayload {
+    std::uint32_t pid = 0;
+    std::uint8_t role = 0;  // 1 launcher, 2 worker
+    std::uint16_t data_port = 0;
+    std::array<std::byte, 32> binary_hash{};
+};
+
+// L_QUOTA: the most worker threads that may run chunks.
+struct LQuotaPayload {
+    std::uint16_t threads = 0;
+};
+
 Result<std::size_t> wire_encode(const PageIdPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const PagePayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const JoinJobPayload& payload, std::span<std::byte> out);
@@ -126,6 +169,11 @@ Result<std::size_t> wire_encode(const TaskReqPayload& payload, std::span<std::by
 Result<std::size_t> wire_encode(const TaskAssignPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const NoTaskPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const TaskDonePayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const SpawnReqPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const SpawnOkPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const SpawnDeclinePayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const LRegisterPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const LQuotaPayload& payload, std::span<std::byte> out);
 
 Result<PageIdPayload> wire_decode_page_id(std::span<const std::byte> in);
 // `flags` are the frame's: with ZERO_PAGE the payload must carry no data, without it 4,096 bytes.
@@ -141,6 +189,11 @@ Result<TaskReqPayload> wire_decode_task_req(std::span<const std::byte> in);
 Result<TaskAssignPayload> wire_decode_task_assign(std::span<const std::byte> in);
 Result<NoTaskPayload> wire_decode_no_task(std::span<const std::byte> in);
 Result<TaskDonePayload> wire_decode_task_done(std::span<const std::byte> in);
+Result<SpawnReqPayload> wire_decode_spawn_req(std::span<const std::byte> in);
+Result<SpawnOkPayload> wire_decode_spawn_ok(std::span<const std::byte> in);
+Result<SpawnDeclinePayload> wire_decode_spawn_decline(std::span<const std::byte> in);
+Result<LRegisterPayload> wire_decode_l_register(std::span<const std::byte> in);
+Result<LQuotaPayload> wire_decode_l_quota(std::span<const std::byte> in);
 
 }  // namespace paramesh
 

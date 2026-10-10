@@ -356,3 +356,87 @@ TEST_CASE("the task payloads: TASK_REQ, TASK_ASSIGN, NO_TASK and TASK_DONE") {
     CHECK(encoded(paramesh::TaskDonePayload{3, 1000000, 1}) == done);
     CHECK(paramesh::wire_decode_task_done(ask).error().code == Errc::kProtocol);
 }
+
+TEST_CASE("the daemon payloads: SPAWN_REQ, SPAWN_OK, SPAWN_DECLINE, L_REGISTER and L_QUOTA") {
+    paramesh::SpawnReqPayload spawn;
+    spawn.launcher_node = paramesh::NodeId{3};
+    spawn.flags = 1;
+    spawn.launcher_addr = 0x0A000001;
+    spawn.launcher_port = 5000;
+    spawn.threads_per_node = 4;
+    spawn.region_bytes = 0x10000000;
+    spawn.binary_hash.fill(std::byte{0xAB});
+    spawn.path = "/a";
+    spawn.cwd = "/b";
+    spawn.argv = {"x", ""};
+    const Bytes bytes = encoded(spawn);
+    // The fixed part, then str16 "/a", str16 "/b", argc 2, str16 "x", str16 "".
+    Bytes expected = hex("00 03 00 01 0A 00 00 01 13 88 00 04 00 00 00 00 10 00 00 00");
+    expected.insert(expected.end(), 32, std::byte{0xAB});
+    const Bytes tail = hex("00 02 2F 61 00 02 2F 62 00 02 00 01 78 00 00");
+    expected.insert(expected.end(), tail.begin(), tail.end());
+    CHECK(bytes == expected);
+    const auto back = paramesh::wire_decode_spawn_req(bytes);
+    REQUIRE(back.ok());
+    CHECK(back.value().launcher_node == paramesh::NodeId{3});
+    CHECK(back.value().launcher_addr == 0x0A000001);
+    CHECK(back.value().launcher_port == 5000);
+    CHECK(back.value().threads_per_node == 4);
+    CHECK(back.value().region_bytes == 0x10000000);
+    CHECK(back.value().binary_hash == spawn.binary_hash);
+    CHECK(back.value().path == "/a");
+    CHECK(back.value().cwd == "/b");
+    CHECK(back.value().argv == spawn.argv);
+    Bytes cut = bytes;
+    cut.pop_back();  // the last argument's length is missing
+    CHECK(paramesh::wire_decode_spawn_req(cut).error().code == Errc::kProtocol);
+    cut = bytes;
+    cut.push_back(std::byte{0});  // a byte too many
+    CHECK(paramesh::wire_decode_spawn_req(cut).error().code == Errc::kProtocol);
+
+    const Bytes ok = hex("00 05 10 92 00 03 00 00 00 00 00 00 00 00 00 07 00 00 00 00 00 00 00 09");
+    const auto accepted = paramesh::wire_decode_spawn_ok(ok);
+    REQUIRE(accepted.ok());
+    CHECK(accepted.value().node == paramesh::NodeId{5});
+    CHECK(accepted.value().data_port == 4242);
+    CHECK(accepted.value().cores == 3);
+    CHECK(accepted.value().ram_commit == 7);
+    CHECK(accepted.value().spill_commit == 9);
+    CHECK(encoded(accepted.value()) == ok);
+    CHECK(paramesh::wire_decode_spawn_ok(hex("00 05")).error().code == Errc::kProtocol);
+
+    const Bytes decline = hex("00 05 00 02 6E 6F");  // BINARY_MISMATCH, "no"
+    const auto declined = paramesh::wire_decode_spawn_decline(decline);
+    REQUIRE(declined.ok());
+    CHECK(declined.value().status == paramesh::Status::kBinaryMismatch);
+    CHECK(declined.value().message == "no");
+    CHECK(encoded(declined.value()) == decline);
+    CHECK(paramesh::wire_decode_spawn_decline(hex("00 63 00 00")).error().code ==
+          Errc::kProtocol);  // no such status
+    Bytes room(1024);
+    CHECK(
+        paramesh::wire_encode(
+            paramesh::SpawnDeclinePayload{paramesh::Status::kInternal, std::string(513, 'x')}, room)
+            .error()
+            .code == Errc::kInvalidArgument);
+
+    paramesh::LRegisterPayload process;
+    process.pid = 0x01020304;
+    process.role = 2;
+    process.data_port = 4242;
+    process.binary_hash.fill(std::byte{0xCD});
+    Bytes registered = hex("01 02 03 04 02 00 10 92");
+    registered.insert(registered.end(), 32, std::byte{0xCD});
+    CHECK(encoded(process) == registered);
+    const auto job = paramesh::wire_decode_l_register(registered);
+    REQUIRE(job.ok());
+    CHECK(job.value().pid == 0x01020304);
+    CHECK(job.value().role == 2);
+    CHECK(job.value().data_port == 4242);
+    registered[4] = std::byte{3};  // neither launcher nor worker
+    CHECK(paramesh::wire_decode_l_register(registered).error().code == Errc::kProtocol);
+
+    CHECK(encoded(paramesh::LQuotaPayload{3}) == hex("00 03 00 00"));
+    CHECK(paramesh::wire_decode_l_quota(hex("00 03 00 00")).value().threads == 3);
+    CHECK(paramesh::wire_decode_l_quota(hex("00 03")).error().code == Errc::kProtocol);
+}
