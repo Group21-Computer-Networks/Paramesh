@@ -1,9 +1,9 @@
 # M3 gate
 
 - Milestone: M3
-- Status: open
-- Closed by:
-- Closed on:
+- Status: closed
+- Closed by: Amirishetty Sai Vignesh
+- Closed on: 2026-10-10
 
 <!--
 Only the person closes a gate. An agent may prepare this file and fill in checks it ran,
@@ -30,12 +30,12 @@ Evidence: the command, the log or result file, the trace, or "seen by <who>".
 | FR-3.3: the same binary on every node, checked by hash | a daemon and a peer | pass | `unit.pmd_test`, "a binary with a different hash is refused with "binary mismatch"": `SPAWN_DECLINE`, status `BINARY_MISMATCH`, no process started. M3-4 |
 | FR-9.1: at least two nodes run chunks of one job | three simulated nodes, through `pmrun` | pass | matrix multiply, n = 4096: `chunks by node: 1:28 2:11 3:10`; runs below |
 | FR-9.2 on one machine: two simulated nodes are faster than one (not the gate's own measurement) | one, two and three simulated nodes, four threads each | pass | n = 4096, median of three runs: one node 8.22 s, two nodes 6.82 s (1.21 times faster), three nodes 7.72 s (1.06 times); runs below |
-| FR-9.2: n = 4096 is faster on two cabled laptops than on one | two cabled laptops | pending | not run; commands under "Hardware runs" |
+| FR-9.2: n = 4096 is faster on two cabled laptops than on one | two cabled laptops | n/a | waived by Amirishetty Sai Vignesh in chat, 2026-10-10 ("Waive for now"); the run is in `docs/TODO.md`, commands under "Hardware runs" |
 
 ## Hardware runs
 
 <!-- Which laptops, kernel versions, the cable or switch, and anything unusual. -->
-Not run yet. On each laptop, a Release build at the same path, and a daemon. With A at
+Waived at this gate; not run. On each laptop, a Release build at the same path, and a daemon. With A at
 10.0.0.1 and B at 10.0.0.2:
 
 ```bash
@@ -100,8 +100,15 @@ Each "Still open" point or flagged question the person answered at this gate:
 the point's number, the answer, and where it is now recorded (the frozen file, AGENTS.md, docs/TODO.md).
 "None" if none.
 -->
-None so far. Two questions wait for this gate: the frozen `rt/runtime.h`, and whether
-`task.affinity` becomes a tunable.
+Asked in chat on 2026-10-10 and answered by Amirishetty Sai Vignesh:
+
+| Point | Answer | Recorded in |
+| --- | --- | --- |
+| The frozen `src/rt/runtime.h` describes a `Runtime` class that was never built | "Trim it to what exists": one small extra task, X-m3-runtime-api, edits `rt/runtime.h` and `docs/INTERNAL_API.md` to describe the code as it is. No behaviour changes. This is the approval for that change to two frozen files. | `docs/TODO.md` until the task is done; then its log |
+| `PARAMESH_CFG_TASK_AFFINITY`, a key the plan's Tunables table does not have | Kept, as `task.affinity`, on by default | `docs/TODO.md`: the plan's table is the person's to edit |
+| FR-9.2 on two cabled laptops | Waived for now | `docs/TODO.md` |
+
+**How the gate was closed.** To "Do you close the M3 gate?" the answer was "Yes, close it".
 
 ## Follow-ups
 
