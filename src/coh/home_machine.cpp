@@ -1,11 +1,12 @@
-// The home machine of docs/STATE_MACHINES.md, sections 2.3 to 2.5 and 2.7: every row but the
-// hold window of section 2.6, which is AT-1's. Until then no hold runs, so the rows with
-// "hold running" never apply and HOLD_EXPIRED does nothing.
+// The home machine of docs/STATE_MACHINES.md, sections 2.3 to 2.7: every row, and the hold
+// window of section 2.6 (AT-1). With no thrash period or no initial hold in the configuration
+// the hold window is off and no request is ever held back.
 //
 // An impossible pair gives one kAbort action.
 
 #include "coh/home_machine.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <deque>
@@ -26,6 +27,21 @@ struct Entry {
     std::uint32_t version = 0;
     HomeEvent op;                 // the request being handled, while `wait` is not kIdle
     std::deque<HomeEvent> waitq;  // requests that arrived meanwhile, in order
+    // Section 2.6, the hold window.
+    NodeId last_writer;           // the node write access was last granted to
+    Nanos counting_since{};       // the start of the period transfers are being counted in
+    std::uint32_t transfers = 0;  // ownership transfers in that period
+    Nanos hold{};                 // the hold duration; zero while the page is not thrashing
+    Nanos hold_until{};           // the end of the hold window that is running, if one is
+    bool hold_armed = false;      // HOLD_EXPIRED has been asked for and has not come
+};
+
+// What one step works with besides the entry.
+struct Step {
+    const HomeConfig* config;
+    const std::array<NodeId, kMaxSlots>* nodes;
+    Nanos now;
+    std::vector<HomeAction>* out;
 };
 
 // The node behind each copyset bit, learnt from the requests themselves: a node enters a
@@ -81,10 +97,57 @@ void store_received(Entry& e, PageId page, std::vector<HomeAction>& out) {
     e.owner = kNoNode;
 }
 
+// Section 2.6. Write access has just been granted to op.from. If that is a node other than
+// the last writer, it is an ownership transfer: count it, and if the count in the period is
+// above the threshold the page is thrashing, and the new owner keeps it for a hold window
+// that doubles for as long as the fight goes on.
+void count_transfer(Entry& e, const HomeEvent& op, const Step& step) {
+    const NodeId previous = e.last_writer;
+    e.last_writer = op.from;
+    const HomeConfig& config = *step.config;
+    if (previous == kNoNode || previous == op.from || config.thrash_period <= Nanos{} ||
+        config.hold_initial <= Nanos{}) {
+        return;
+    }
+    // ponytail: periods laid end to end, not a window that slides: a fight that straddles
+    // two periods is noticed a little later. A ring of the last transfer times if it matters.
+    if (step.now - e.counting_since > config.thrash_period) {
+        e.counting_since = step.now;
+        e.transfers = 0;
+    }
+    e.transfers++;
+    if (e.transfers <= config.thrash_transfers) {
+        e.hold = Nanos{};
+        e.hold_until = Nanos{};
+        return;
+    }
+    if (e.hold == Nanos{}) {
+        e.hold = config.hold_initial;
+        HomeAction report = action(HomeActionKind::kReportThrash, op.page);
+        report.to = op.from;
+        report.other = previous;
+        step.out->push_back(report);
+    } else {
+        e.hold = std::min(e.hold * 2, config.hold_max);
+    }
+    e.hold_until = step.now + e.hold;
+}
+
+// True if the hold window keeps this request waiting: it would pass write access to another
+// node while the window runs. Readers, and the owner itself, are not held.
+bool held_back(const Entry& e, const HomeEvent& request, Nanos now) noexcept {
+    const bool writer = request.kind == HomeEventKind::kWriteReq ||
+                        request.kind == HomeEventKind::kUpgradeReq ||
+                        request.kind == HomeEventKind::kAtomicOp;
+    return writer && e.state == HomeState::kExclusive && now < e.hold_until &&
+           request.from != e.owner;
+}
+
 // Section 2.3: the step that ends the operation in e.op. `received` says the bytes of the
 // event that led here are the page. A step that needs a spilled home copy loads it first and
 // runs again on LOADED.
-void finish(Entry& e, bool received, std::vector<HomeAction>& out) {
+void finish(Entry& e, bool received, const Step& step) {
+    std::vector<HomeAction>& out = *step.out;
     const HomeEvent& op = e.op;
     const bool upgrade =
         op.kind == HomeEventKind::kUpgradeReq && (e.copyset & bit(op.slot)) != 0;  // no bytes
@@ -126,10 +189,13 @@ void finish(Entry& e, bool received, std::vector<HomeAction>& out) {
     e.owner = op.from;
     e.copyset = bit(op.slot);
     e.version++;
+    count_transfer(e, op, step);
 }
 
 // Section 2.4: a request against an idle entry.
-void start(Entry& e, const HomeEvent& event, const Nodes& nodes, std::vector<HomeAction>& out) {
+void start(Entry& e, const HomeEvent& event, const Step& step) {
+    std::vector<HomeAction>& out = *step.out;
+    const Nodes& nodes = *step.nodes;
     const bool exclusive = e.state == HomeState::kExclusive;
     const bool from_owner = exclusive && event.from == e.owner;
     if (event.kind == HomeEventKind::kWriteback) {
@@ -160,7 +226,7 @@ void start(Entry& e, const HomeEvent& event, const Nodes& nodes, std::vector<Hom
         losers = e.copyset & ~bit(event.slot);
     }
     if (losers == 0) {
-        finish(e, false, out);
+        finish(e, false, step);
         return;
     }
     for (std::size_t slot = 0; slot < kMaxSlots; slot++) {
@@ -173,14 +239,15 @@ void start(Entry& e, const HomeEvent& event, const Nodes& nodes, std::vector<Hom
 }
 
 // Section 2.5: an answer the entry may be waiting for.
-void answer(Entry& e, const HomeEvent& event, std::vector<HomeAction>& out) {
+void answer(Entry& e, const HomeEvent& event, const Step& step) {
+    std::vector<HomeAction>& out = *step.out;
     switch (event.kind) {
         case HomeEventKind::kInvAck:
             if (e.wait == HomeWait::kInv && (e.pending & bit(event.slot)) != 0) {
                 e.pending &= ~bit(event.slot);
                 e.copyset &= ~bit(event.slot);
                 if (e.pending == 0) {
-                    finish(e, false, out);
+                    finish(e, false, step);
                 }
                 return;
             }
@@ -192,7 +259,7 @@ void answer(Entry& e, const HomeEvent& event, std::vector<HomeAction>& out) {
             if (e.wait == HomeWait::kFetch) {  // the owner keeps a read copy
                 store_received(e, event.page, out);
                 e.state = HomeState::kShared;  // `copyset` is already the old owner alone
-                finish(e, true, out);
+                finish(e, true, step);
                 return;
             }
             if (e.wait == HomeWait::kFetchInv) {  // the owner gave the page up
@@ -202,19 +269,17 @@ void answer(Entry& e, const HomeEvent& event, std::vector<HomeAction>& out) {
                 }
                 e.owner = kNoNode;
                 e.copyset = 0;
-                finish(e, !atomic, out);
+                finish(e, !atomic, step);
                 return;
             }
             break;
         case HomeEventKind::kLoaded:
             if (e.wait == HomeWait::kLoad) {
                 e.where = HomeWhere::kRam;
-                finish(e, false, out);
+                finish(e, false, step);
                 return;
             }
             break;
-        case HomeEventKind::kHoldExpired:
-            return;  // no hold runs before AT-1
         default:
             break;
     }
@@ -230,6 +295,7 @@ public:
     std::unordered_set<std::uint32_t> segments;
     std::unordered_map<std::uint64_t, Entry> entries;
     Nodes nodes{};
+    HomeConfig config;
 };
 
 void HomeDirectoryDeleter::operator()(HomeDirectory* directory) const noexcept {
@@ -237,8 +303,10 @@ void HomeDirectoryDeleter::operator()(HomeDirectory* directory) const noexcept {
     const std::unique_ptr<HomeDirectory> owned{directory};
 }
 
-Result<HomeDirectoryPtr> home_open(const HomeConfig& /*config*/) {
-    return HomeDirectoryPtr{std::make_unique<HomeDirectory>().release()};
+Result<HomeDirectoryPtr> home_open(const HomeConfig& config) {
+    auto directory = std::make_unique<HomeDirectory>();
+    directory->config = config;
+    return HomeDirectoryPtr{directory.release()};
 }
 
 Result<void> home_add_segment(HomeDirectory& directory, SegmentId segment) {
@@ -268,20 +336,34 @@ void home_step(HomeDirectory& directory, const HomeEvent& event, std::vector<Hom
         return;
     }
     Entry& e = directory.entries[event.page.value];
-    if (!is_request(event.kind)) {
-        answer(e, event, out);
-    } else if (e.wait != HomeWait::kIdle) {
-        e.waitq.push_back(event);  // home rule 1: one request per page at a time
-        return;
+    const Step step{&directory.config, &directory.nodes, event.now, &out};
+    if (event.kind == HomeEventKind::kHoldExpired) {
+        e.hold_armed = false;  // whether the window is really over is seen below, from the time
+    } else if (!is_request(event.kind)) {
+        answer(e, event, step);
     } else {
-        directory.nodes.at(event.slot.value) = event.from;
-        start(e, event, directory.nodes, out);
+        e.waitq.push_back(event);  // home rule 1: one request per page at a time
     }
-    while (e.wait == HomeWait::kIdle && !e.waitq.empty()) {
-        const HomeEvent next = e.waitq.front();
-        e.waitq.pop_front();
-        directory.nodes.at(next.slot.value) = next.from;
-        start(e, next, directory.nodes, out);
+    // Take the next request for as long as the entry is free: the first in the queue that the
+    // hold window does not hold back.
+    while (e.wait == HomeWait::kIdle) {
+        const auto next = std::find_if(
+            e.waitq.begin(), e.waitq.end(),
+            [&](const HomeEvent& request) { return !held_back(e, request, event.now); });
+        if (next == e.waitq.end()) {
+            break;
+        }
+        const HomeEvent request = *next;
+        e.waitq.erase(next);
+        directory.nodes.at(request.slot.value) = request.from;
+        start(e, request, step);
+    }
+    // Only held-back requests are left: they are taken when the window ends.
+    if (e.wait == HomeWait::kIdle && !e.waitq.empty() && !e.hold_armed) {
+        HomeAction arm = action(HomeActionKind::kArmHoldTimer, event.page);
+        arm.at = e.hold_until;
+        out.push_back(arm);
+        e.hold_armed = true;
     }
 }
 
