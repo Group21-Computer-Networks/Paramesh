@@ -43,6 +43,7 @@
 #include <iterator>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -75,6 +76,10 @@ struct Settings {
     std::string pmd_socket;  // PARAMESH_PMD_SOCKET; empty when the job runs without pmd
     LogLevel log_level = LogLevel::kWarn;  // log.level
     bool affinity = true;                  // PARAMESH_CFG_TASK_AFFINITY=0 turns M3-3 off
+    // The hold window against thrashing (AT-1), with the plan's proposed defaults.
+    // PARAMESH_CFG_THRASH_THRESHOLD sets the count; 0 turns the window off.
+    HomeConfig thrash{8, std::chrono::milliseconds{100}, std::chrono::milliseconds{1},
+                      std::chrono::milliseconds{64}};
 };
 
 // "127.0.0.1:47100" -> endpoint. False if it is not that.
@@ -131,6 +136,13 @@ bool read_settings(Settings& s) {
             s.log_level = LogLevel::kInfo;
         } else if (name == "error") {
             s.log_level = LogLevel::kError;
+        }
+    }
+    if (const char* threshold = env("PARAMESH_CFG_THRASH_THRESHOLD")) {
+        s.thrash.thrash_transfers =
+            static_cast<std::uint32_t>(std::strtoul(threshold, nullptr, 10));
+        if (s.thrash.thrash_transfers == 0) {
+            s.thrash.thrash_period = Nanos{};  // off
         }
     }
     if (const char* affinity = env("PARAMESH_CFG_TASK_AFFINITY")) {
@@ -217,7 +229,7 @@ public:
         segments_ = static_cast<std::size_t>((region_bytes + kSegmentSize - 1) / kSegmentSize);
 
         auto mem = mem_open(RegionConfig{kRegionMaxBytes}, *this);
-        auto dir = home_open({});
+        auto dir = home_open(s_.thrash);
         auto store = store_open({}, *this);
         if (!mem.ok() || !dir.ok() || !store.ok()) {
             return PM_ERR_PLATFORM;
@@ -441,8 +453,20 @@ public:
             ::pause();  // the abort exits the process shortly
         }
     }
-    void chunk_finished(NodeId /*ran_by*/, std::uint64_t /*task_id*/, std::uint64_t /*indexes*/,
-                        Nanos /*cpu*/) noexcept override {}  // M3
+    // The launcher hears of every chunk. The first time a node finishes a chunk of a task, the
+    // log says so: with the thrash report, which names nodes, it tells which tasks fought.
+    void chunk_finished(NodeId ran_by, std::uint64_t task_id, std::uint64_t /*indexes*/,
+                        Nanos /*cpu*/) noexcept override {
+        {
+            const std::lock_guard<std::mutex> lock{mutex_};
+            if (!task_seen_.insert({ran_by.value, task_id}).second) {
+                return;
+            }
+        }
+        platform_.logger->log(LogLevel::kInfo, "task_on_node",
+                              JsonObject{{"task", JsonValue{std::string{rt_task_name(task_id)}}},
+                                         {"on", JsonValue{std::int64_t{ran_by.value}}}});
+    }
 
     // ---- FaultSink: fault-handler thread ---------------------------------------------------
     void on_fault(const FaultEvent& event) noexcept override {
@@ -502,6 +526,11 @@ public:
         }
         if (s_.members.size() == 1) {
             advance_start();
+        }
+        if (const auto held = hold_timers_.find(timer.value); held != hold_timers_.end()) {
+            const PageId page = held->second;
+            hold_timers_.erase(held);
+            home_event(HomeEventKind::kHoldExpired, FrameHeader{}, page, {});
         }
         std::deque<FaultEvent> faults;
         std::deque<Add> adds;
@@ -1153,11 +1182,22 @@ private:
                     post(a.to, Opcode::kAtomicResult, result, a.req);
                     break;
                 }
+                case HomeActionKind::kArmHoldTimer:
+                    hold_timers_[net_->start_timer(std::max(a.at - event.now, Nanos{})).value] =
+                        a.page;
+                    break;
+                case HomeActionKind::kReportThrash:
+                    platform_.logger->log(
+                        LogLevel::kInfo, "page_thrash",
+                        JsonObject{{"page", JsonValue{static_cast<std::int64_t>(a.page.value)}},
+                                   {"node_a", JsonValue{std::int64_t{a.other.value}}},
+                                   {"node_b", JsonValue{std::int64_t{a.to.value}}}});
+                    break;
                 case HomeActionKind::kAbort:
                     abort_job(Status::kInternal, s_.self,
                               "the home machine met an impossible event");
                     return;
-                default:  // load and the hold window: later milestones
+                default:  // load: M4
                     abort_job(Status::kUnsupported, s_.self,
                               "a home action this build does not carry out yet");
                     return;
@@ -1195,6 +1235,7 @@ private:
     std::unordered_map<std::uint64_t, ReqId> current_;
     std::deque<Local> local_;
     std::uint64_t pages_in_ = 0;
+    std::unordered_map<std::uint64_t, PageId> hold_timers_;  // by timer: the page it is for
     std::vector<HomeAction> actions_;
 
     // Shared.
@@ -1208,6 +1249,7 @@ private:
     std::condition_variable changed_;
     std::deque<FaultEvent> faults_;
     std::deque<Add> adds_;
+    std::set<std::pair<std::uint16_t, std::uint64_t>> task_seen_;  // (node, task) logged
     std::unordered_map<std::uint64_t, std::optional<std::uint64_t>> add_results_;
     std::string abort_message_;
     bool up_ = false;
