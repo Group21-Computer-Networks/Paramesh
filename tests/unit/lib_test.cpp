@@ -349,6 +349,25 @@ PM_TASK(lib_test_fill) {
     ::usleep(2000);  // long enough that no node has to take another's chunks for want of work
 }
 
+// Neighbours in one page: chunk i of the first task writes number 2i, of the second 2i + 1.
+void write_many(const MarkArgs* args, std::uint64_t which) {
+    volatile std::uint64_t* number = &args->hits[which];
+    *number = 0;
+    for (int i = 0; i < 300000; i++) {
+        *number = *number + 1;
+    }
+}
+
+PM_TASK(lib_test_left) {
+    write_many(static_cast<const MarkArgs*>(arg), 2 * lo);
+    static_cast<void>(hi);
+}
+
+PM_TASK(lib_test_right) {
+    write_many(static_cast<const MarkArgs*>(arg), 2 * lo + 1);
+    static_cast<void>(hi);
+}
+
 // Throws on any node but the launcher.
 PM_TASK(lib_test_throws) {
     if (ctx->node != 1) {
@@ -457,6 +476,37 @@ int fill_program() {
         }
     }
     return pm_finalize() == PM_OK ? 0 : 6;
+}
+
+// The false-sharing program: 24 chunks of each of two tasks, every chunk writing its own number,
+// all the numbers in one page.
+int neighbours_program() {
+    pm_config config{};
+    config.region_bytes = kRegionBytes;
+    config.threads_per_node = 2;
+    if (pm_init(nullptr, nullptr, &config) != PM_OK) {
+        return 2;
+    }
+    auto* numbers = static_cast<std::uint64_t*>(pm_malloc(paramesh::kPageSize));
+    if (numbers == nullptr) {
+        return 3;
+    }
+    const MarkArgs args{numbers, nullptr};
+    for (std::uint64_t i = 0; i < 24; i++) {
+        if (pm_parallel_for("lib_test_left", i, i + 1, 1, &args, sizeof args) != PM_OK ||
+            pm_parallel_for("lib_test_right", i, i + 1, 1, &args, sizeof args) != PM_OK) {
+            return 4;
+        }
+    }
+    if (pm_wait_all() != PM_OK) {
+        return 5;
+    }
+    for (std::uint64_t i = 0; i < 48; i++) {
+        if (numbers[i] != 300000) {
+            return 6;  // a write was lost while the page changed hands
+        }
+    }
+    return pm_finalize() == PM_OK ? 0 : 7;
 }
 
 std::uint16_t free_port() {
@@ -592,10 +642,11 @@ TEST_CASE("a task that throws on a worker ends the job everywhere, with its name
           "job 42 aborted: task 'lib_test_throws' threw: the matrix is singular\n");
 }
 
-// Runs the affinity program and returns the page transfers its three processes logged,
-// summed, or -1 if the run failed or a process logged none.
-long page_transfers(const char* setting) {
-    const Started job = start_job("0", fill_program, setting);
+// Runs a program with one more setting and returns the page transfers its three processes
+// logged, summed, or -1 if the run failed or a process logged none. `log`, if given, gets
+// everything the processes logged.
+long page_transfers(const char* setting, int (*run)() = fill_program, std::string* said = nullptr) {
+    const Started job = start_job("0", run, setting);
     const bool ok = wait_for(job.pids[0], 120) == 0 && wait_for(job.pids[1], 10) == 0 &&
                     wait_for(job.pids[2], 10) == 0;
     const std::string log = read_all(job.launcher_stderr);
@@ -609,6 +660,9 @@ long page_transfers(const char* setting) {
     INFO(log);
     CHECK(ok);
     CHECK(lines == 3);
+    if (said != nullptr) {
+        *said = log;
+    }
     return ok && lines == 3 ? total : -1;
 }
 
@@ -619,6 +673,26 @@ TEST_CASE("with data affinity on, fewer page transfers are logged for the same r
     MESSAGE("page transfers: " << with_affinity << " with affinity, " << without << " without");
     CHECK(with_affinity >= 0);
     CHECK(with_affinity < without);
+}
+
+TEST_CASE("the hold window: neighbours in one page cost far fewer page transfers with it" *
+          doctest::skip(!can_run())) {
+    std::string with_log;
+    std::string without_log;
+    const long with_hold =
+        page_transfers("PARAMESH_CFG_THRASH_THRESHOLD=8", neighbours_program, &with_log);
+    const long without =
+        page_transfers("PARAMESH_CFG_THRASH_THRESHOLD=0", neighbours_program, &without_log);
+    MESSAGE("page transfers: " << with_hold << " with the hold window, " << without << " without");
+    CHECK(with_hold >= 0);
+    CHECK(with_hold * 2 < without);
+    // The report: the home names the page and the two nodes, and the launcher's log says
+    // which tasks ran on which node.
+    CHECK(with_log.find("\"event\":\"page_thrash\"") != std::string::npos);
+    CHECK(with_log.find("\"page\":0") != std::string::npos);
+    CHECK(with_log.find("\"task\":\"lib_test_left\"") != std::string::npos);
+    CHECK(with_log.find("\"task\":\"lib_test_right\"") != std::string::npos);
+    CHECK(without_log.find("page_thrash") == std::string::npos);  // off: nothing is held
 }
 
 TEST_CASE("concurrent atomic adds from three processes sum exactly" * doctest::skip(!can_run())) {
