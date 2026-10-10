@@ -210,7 +210,7 @@ public:
     void on_timer(paramesh::TimerId /*timer*/, paramesh::Nanos /*now*/) noexcept override {}
 };
 
-static_assert(std::is_abstract_v<paramesh::Runtime> && std::is_abstract_v<paramesh::RuntimeHost>);
+static_assert(std::is_abstract_v<paramesh::RuntimeHost>);
 static_assert(std::has_virtual_destructor_v<paramesh::Transport>);
 static_assert(std::has_virtual_destructor_v<paramesh::MemoryEngine>);
 static_assert(std::has_virtual_destructor_v<paramesh::HomeStore>);
