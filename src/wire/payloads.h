@@ -143,6 +143,37 @@ struct SpawnDeclinePayload {
     std::string message;
 };
 
+// L_RUN_REFUSED and L_ABORT have the layout of SPAWN_DECLINE: a status and a text.
+using StatusTextPayload = SpawnDeclinePayload;
+
+// L_RUN_REQ: pmrun asks the local pmd for a job of `nodes` nodes running this executable.
+struct LRunReqPayload {
+    std::uint16_t nodes = 1;  // 1 to 8
+    std::array<std::byte, 32> binary_hash{};
+    std::string path;
+    std::string cwd;
+    std::vector<std::string> argv;  // without the program name
+};
+
+// L_RUN_OK: the new job's ID, and this node's.
+struct LRunOkPayload {
+    JobId job;
+    NodeId node;
+};
+
+// L_ADMIT_REQ: the launcher asks its pmd to admit the job and start the workers.
+struct LAdmitReqPayload {
+    std::uint64_t region_bytes = 0;
+    std::uint16_t threads_per_node = 0;
+};
+
+// L_ADMIT_OK: the launcher's own quota and the job's members, the launcher first. The slots
+// are 0: the launcher gives them out.
+struct LAdmitOkPayload {
+    std::uint16_t quota = 0;
+    std::vector<SegMapMember> members;  // 1 to 8
+};
+
 // L_REGISTER: the first frame a job process sends its pmd.
 struct LRegisterPayload {
     std::uint32_t pid = 0;
@@ -174,6 +205,10 @@ Result<std::size_t> wire_encode(const SpawnOkPayload& payload, std::span<std::by
 Result<std::size_t> wire_encode(const SpawnDeclinePayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const LRegisterPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const LQuotaPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const LRunReqPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const LRunOkPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const LAdmitReqPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const LAdmitOkPayload& payload, std::span<std::byte> out);
 
 Result<PageIdPayload> wire_decode_page_id(std::span<const std::byte> in);
 // `flags` are the frame's: with ZERO_PAGE the payload must carry no data, without it 4,096 bytes.
@@ -194,6 +229,10 @@ Result<SpawnOkPayload> wire_decode_spawn_ok(std::span<const std::byte> in);
 Result<SpawnDeclinePayload> wire_decode_spawn_decline(std::span<const std::byte> in);
 Result<LRegisterPayload> wire_decode_l_register(std::span<const std::byte> in);
 Result<LQuotaPayload> wire_decode_l_quota(std::span<const std::byte> in);
+Result<LRunReqPayload> wire_decode_l_run_req(std::span<const std::byte> in);
+Result<LRunOkPayload> wire_decode_l_run_ok(std::span<const std::byte> in);
+Result<LAdmitReqPayload> wire_decode_l_admit_req(std::span<const std::byte> in);
+Result<LAdmitOkPayload> wire_decode_l_admit_ok(std::span<const std::byte> in);
 
 }  // namespace paramesh
 

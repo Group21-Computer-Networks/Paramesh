@@ -440,3 +440,69 @@ TEST_CASE("the daemon payloads: SPAWN_REQ, SPAWN_OK, SPAWN_DECLINE, L_REGISTER a
     CHECK(paramesh::wire_decode_l_quota(hex("00 03 00 00")).value().threads == 3);
     CHECK(paramesh::wire_decode_l_quota(hex("00 03")).error().code == Errc::kProtocol);
 }
+
+TEST_CASE("the launch payloads: L_RUN_REQ, L_RUN_OK, L_ADMIT_REQ and L_ADMIT_OK") {
+    paramesh::LRunReqPayload run;
+    run.nodes = 3;
+    run.binary_hash.fill(std::byte{0xEE});
+    run.path = "/a";
+    run.cwd = "/b";
+    run.argv = {"x"};
+    Bytes expected = hex("00 03 00 00");
+    expected.insert(expected.end(), 32, std::byte{0xEE});
+    const Bytes tail = hex("00 02 2F 61 00 02 2F 62 00 01 00 01 78");
+    expected.insert(expected.end(), tail.begin(), tail.end());
+    CHECK(encoded(run) == expected);
+    const auto back = paramesh::wire_decode_l_run_req(expected);
+    REQUIRE(back.ok());
+    CHECK(back.value().nodes == 3);
+    CHECK(back.value().binary_hash == run.binary_hash);
+    CHECK(back.value().path == "/a");
+    CHECK(back.value().cwd == "/b");
+    CHECK(back.value().argv == run.argv);
+    Bytes none = expected;
+    none[1] = std::byte{0};  // a job of no nodes
+    CHECK(paramesh::wire_decode_l_run_req(none).error().code == Errc::kProtocol);
+    none[1] = std::byte{9};  // or of more than eight
+    CHECK(paramesh::wire_decode_l_run_req(none).error().code == Errc::kProtocol);
+    Bytes room(1024);
+    run.nodes = 0;
+    CHECK(paramesh::wire_encode(run, room).error().code == Errc::kInvalidArgument);
+
+    const Bytes ok = hex("00 01 00 02 00 01 00 00");  // job 0x00010002 of node 1
+    const auto named = paramesh::wire_decode_l_run_ok(ok);
+    REQUIRE(named.ok());
+    CHECK(named.value().job == paramesh::JobId{0x00010002});
+    CHECK(named.value().node == paramesh::NodeId{1});
+    CHECK(encoded(named.value()) == ok);
+
+    const Bytes ask = hex("00 00 00 00 00 20 00 00 00 04 00 00 00 00 00 00");
+    const auto wants = paramesh::wire_decode_l_admit_req(ask);
+    REQUIRE(wants.ok());
+    CHECK(wants.value().region_bytes == 0x200000);
+    CHECK(wants.value().threads_per_node == 4);
+    CHECK(encoded(wants.value()) == ask);
+    CHECK(paramesh::wire_decode_l_admit_req(ok).error().code == Errc::kProtocol);  // 8 bytes
+
+    // Quota 3; the launcher (node 1, port 5000) and one worker (node 2 at 10.0.0.2:6000).
+    const Bytes admitted =
+        hex("00 03 02 00 "
+            "00 01 00 01 00 00 00 00 13 88 00 00 00 00 00 00 00 00 00 00 "
+            "00 02 00 00 0A 00 00 02 17 70 00 00 00 00 00 00 00 00 00 07");
+    const auto members = paramesh::wire_decode_l_admit_ok(admitted);
+    REQUIRE(members.ok());
+    CHECK(members.value().quota == 3);
+    REQUIRE(members.value().members.size() == 2);
+    CHECK(members.value().members[0].flags == paramesh::kMemberLauncher);
+    CHECK(members.value().members[0].port == 5000);
+    CHECK(members.value().members[1].node == paramesh::NodeId{2});
+    CHECK(members.value().members[1].addr == 0x0A000002);
+    CHECK(members.value().members[1].port == 6000);
+    CHECK(members.value().members[1].ram_weight == 7);
+    CHECK(encoded(members.value()) == admitted);
+    Bytes short_one = admitted;
+    short_one.pop_back();
+    CHECK(paramesh::wire_decode_l_admit_ok(short_one).error().code == Errc::kProtocol);
+    CHECK(paramesh::wire_encode(paramesh::LAdmitOkPayload{}, room).error().code ==
+          Errc::kInvalidArgument);  // no members
+}

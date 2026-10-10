@@ -1,7 +1,12 @@
-// The per-node daemon, minimal form (M3-4): it listens on the daemon control channel for
-// SPAWN_REQ and starts a worker process for the job, and on the local socket for the
-// L_REGISTER of job processes, to which it answers with their thread quota.
-// docs/PROTOCOL.md, sections 6, 9 and 10.
+// The per-node daemon, minimal form (M3-4, M3-5). docs/PROTOCOL.md, sections 6, 8.1, 9, 10.
+//
+// For a job launched elsewhere: on SPAWN_REQ from another daemon it starts a worker process,
+// and answers SPAWN_OK when the worker has registered.
+// For a job launched here: it gives pmrun a job ID (L_RUN_REQ); when the launcher asks for
+// admission (L_ADMIT_REQ) it asks its peers, in the order of --peers, for N-1 workers, takes
+// the next peer for each that declines, and answers with the members (L_ADMIT_OK). If pmrun
+// goes away while the job runs, the launcher is told to end it (L_ABORT).
+// Every job process that registers on the local socket is told its thread quota.
 //
 // One thread runs everything (run()). Exceptions are allowed here and are caught where the
 // thread starts, in main.cpp.
@@ -19,9 +24,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace paramesh {
@@ -79,6 +86,37 @@ private:
         std::array<std::byte, 32> hash{};
     };
 
+    // A job launched on this node, from L_RUN_REQ until its launcher has gone.
+    struct Run {
+        JobId job;
+        LRunReqPayload request;
+        std::uint64_t pmrun = 0;  // connection IDs; 0 when there is none
+        std::uint64_t launcher = 0;
+        LAdmitReqPayload wants;             // from L_ADMIT_REQ
+        std::vector<SegMapMember> members;  // the launcher first
+        std::size_t next_peer = 0;          // index in --peers of the next peer to ask
+        std::size_t asked = 0;              // SPAWN_REQs not yet answered
+        bool admitting = false;
+    };
+    // One SPAWN_REQ this daemon sent and has no answer to.
+    struct Ask {
+        JobId job;
+        std::uint64_t connection = 0;
+        Endpoint peer;
+    };
+
+    void on_run_req(Connection& connection, const FrameHeader& header,
+                    std::span<const std::byte> payload);
+    void on_admit_req(Connection& connection, const FrameHeader& header,
+                      std::span<const std::byte> payload);
+    void on_spawn_answer(const FrameHeader& header, std::span<const std::byte> payload);
+    void on_closed(const Connection& connection);
+    void ask_peers(Run& run);
+    void ask_next_peer(Run& run);
+    void finish_admission(Run& run);
+    std::uint32_t next_job_number();
+    Run* run_of(JobId job);
+
     void accept_on(int listener, bool local);
     bool read_from(Connection& connection);
     void handle(Connection& connection, const FrameHeader& header,
@@ -100,9 +138,12 @@ private:
     int local_listener_ = -1;
     int stop_fd_ = -1;
     std::uint64_t next_connection_ = 1;
-    std::vector<Connection> connections_;
+    std::deque<Connection> connections_;  // a deque: handling a frame may add one
     std::vector<Spawn> spawns_;
     std::vector<pid_t> children_;  // every worker started and not yet collected
+    std::vector<Run> runs_;
+    std::unordered_map<std::uint64_t, Ask> asks_;  // by the SPAWN_REQ's request number
+    std::uint64_t next_req_ = 1;
 };
 
 }  // namespace paramesh

@@ -231,6 +231,7 @@ void Pmd::run() {
             if (fds[i].revents != 0 && !read_from(connection)) {
                 ::close(connection.fd);
                 connection.fd = -1;
+                on_closed(connection);
             }
         }
         std::erase_if(connections_, [](const Connection& c) { return c.fd < 0; });
@@ -288,8 +289,15 @@ void Pmd::handle(Connection& connection, const FrameHeader& header,
                  std::span<const std::byte> payload) {
     if (!connection.local && header.opcode == Opcode::kSpawnReq) {
         on_spawn_req(connection, header, payload);
+    } else if (!connection.local &&
+               (header.opcode == Opcode::kSpawnOk || header.opcode == Opcode::kSpawnDecline)) {
+        on_spawn_answer(header, payload);
     } else if (connection.local && header.opcode == Opcode::kLRegister) {
         on_register(connection, header, payload);
+    } else if (connection.local && header.opcode == Opcode::kLRunReq) {
+        on_run_req(connection, header, payload);
+    } else if (connection.local && header.opcode == Opcode::kLAdmitReq) {
+        on_admit_req(connection, header, payload);
     } else {
         platform_.logger->log(
             LogLevel::kWarn, "frame_ignored",
@@ -398,12 +406,206 @@ void Pmd::on_register(Connection& connection, const FrameHeader& header,
         }
         spawns_.erase(spawn);
     }
+    if (Run* run = run_of(header.job); run != nullptr && process.role == 1) {
+        run->launcher = connection.id;  // the launcher pmrun started for a job of this node
+        run->members.assign(
+            1, SegMapMember{config_.node, Slot{0}, kMemberLauncher, 0, process.data_port, 0});
+    }
     reply(connection.id, Opcode::kLQuota, header.job, kNoNode, kNoReq,
           LQuotaPayload{config_.cap_cores});
     platform_.logger->log(LogLevel::kInfo, "register",
                           JsonObject{{"job", JsonValue{std::int64_t{header.job.value}}},
                                      {"pid", JsonValue{std::int64_t{process.pid}}},
                                      {"role", JsonValue{std::int64_t{process.role}}}});
+}
+
+Pmd::Run* Pmd::run_of(JobId job) {
+    const auto found =
+        std::find_if(runs_.begin(), runs_.end(), [job](const Run& r) { return r.job == job; });
+    return found != runs_.end() ? &*found : nullptr;
+}
+
+// The low half of the next job ID: a counter kept in the state directory, never 0 and never
+// that of a job still running here (docs/PROTOCOL.md, L_RUN_OK).
+std::uint32_t Pmd::next_job_number() {
+    const std::string path = config_.state_dir + "/job_counter";
+    std::uint32_t number = 0;
+    std::ifstream{path} >> number;
+    const auto in_use = [this](std::uint32_t low) {
+        return run_of(JobId{(std::uint32_t{config_.node.value} << 16U) | low}) != nullptr;
+    };
+    number = number % 65535 + 1;
+    while (in_use(number)) {
+        number = number % 65535 + 1;
+    }
+    std::ofstream{path, std::ios::trunc} << number << '\n';
+    return number;
+}
+
+// L_RUN_REQ from pmrun: name the job. Nothing starts until its launcher asks for admission.
+void Pmd::on_run_req(Connection& connection, const FrameHeader& /*header*/,
+                     std::span<const std::byte> payload) {
+    Result<LRunReqPayload> request = wire_decode_l_run_req(payload);
+    if (!request.ok()) {
+        reply(connection.id, Opcode::kLRunRefused, JobId{0}, kNoNode, kNoReq,
+              StatusTextPayload{Status::kProtocol, "a malformed L_RUN_REQ"});
+        return;
+    }
+    Run run;
+    run.job = JobId{(std::uint32_t{config_.node.value} << 16U) | next_job_number()};
+    run.request = std::move(request).value();
+    run.pmrun = connection.id;
+    reply(connection.id, Opcode::kLRunOk, run.job, kNoNode, kNoReq,
+          LRunOkPayload{run.job, config_.node});
+    platform_.logger->log(LogLevel::kInfo, "run",
+                          JsonObject{{"job", JsonValue{std::int64_t{run.job.value}}},
+                                     {"nodes", JsonValue{std::int64_t{run.request.nodes}}},
+                                     {"path", JsonValue{run.request.path}}});
+    runs_.push_back(std::move(run));
+}
+
+// L_ADMIT_REQ from the launcher: ask peers for the other N-1 members.
+// ponytail: no capacity check and no L_ADMIT_REFUSED; admission by capacity is M4-4.
+void Pmd::on_admit_req(Connection& connection, const FrameHeader& header,
+                       std::span<const std::byte> payload) {
+    Run* run = run_of(header.job);
+    const Result<LAdmitReqPayload> wants = wire_decode_l_admit_req(payload);
+    if (run == nullptr || run->launcher != connection.id || run->admitting || !wants.ok()) {
+        return;
+    }
+    run->wants = wants.value();
+    run->admitting = true;
+    ask_peers(*run);
+    finish_admission(*run);
+}
+
+// Asks peers until the job has, or has asked for, all the members it wants, or no peer is left.
+void Pmd::ask_peers(Run& run) {
+    while (run.members.size() + run.asked < run.request.nodes &&
+           run.next_peer < config_.peers.size()) {
+        ask_next_peer(run);
+    }
+}
+
+// Sends SPAWN_REQ to the next peer of --peers this job has not asked. A peer that cannot be
+// reached counts as one that declined: the caller's loop goes on to the one after.
+void Pmd::ask_next_peer(Run& run) {
+    const Endpoint peer = config_.peers[run.next_peer++];
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = htonl(peer.ipv4);
+    to.sin_port = htons(peer.port);
+    sockaddr_in mine{};
+    socklen_t length = sizeof mine;
+    // ponytail: one connection for each request, and a blocking connect on the daemon's one
+    // thread; keep a connection to each peer and connect without blocking when a peer can be
+    // far away or slow.
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API
+    if (fd < 0 || ::connect(fd, reinterpret_cast<const sockaddr*>(&to), sizeof to) != 0 ||
+        ::getsockname(fd, reinterpret_cast<sockaddr*>(&mine), &length) != 0) {
+        // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        platform_.logger->log(LogLevel::kWarn, "peer_unreachable",
+                              JsonObject{{"peer", JsonValue{dotted(peer.ipv4)}},
+                                         {"port", JsonValue{std::int64_t{peer.port}}}});
+        return;
+    }
+    connections_.push_back(Connection{next_connection_++, fd, false, {}});
+    const std::uint64_t connection = connections_.back().id;
+
+    SpawnReqPayload request;
+    request.launcher_node = config_.node;
+    request.launcher_addr = ntohl(mine.sin_addr.s_addr);  // this node, as that peer reaches it
+    request.launcher_port = run.members.front().port;
+    request.threads_per_node = run.wants.threads_per_node;
+    request.region_bytes = run.wants.region_bytes;
+    request.binary_hash = run.request.binary_hash;
+    request.path = run.request.path;
+    request.cwd = run.request.cwd;
+    request.argv = run.request.argv;
+    const ReqId req{next_req_++};
+    asks_[req.value] = Ask{run.job, connection, peer};
+    run.asked++;
+    reply(connection, Opcode::kSpawnReq, run.job, kNoNode, req, request);
+}
+
+// SPAWN_OK or SPAWN_DECLINE from a peer this daemon asked.
+void Pmd::on_spawn_answer(const FrameHeader& header, std::span<const std::byte> payload) {
+    const auto asked = asks_.find(header.req.value);
+    if (asked == asks_.end()) {
+        return;
+    }
+    const Ask ask = asked->second;
+    asks_.erase(asked);
+    Run* run = run_of(ask.job);
+    if (run == nullptr) {
+        return;  // the job ended while the peer was starting its worker
+    }
+    run->asked--;
+    const Result<SpawnOkPayload> ok = wire_decode_spawn_ok(payload);
+    if (header.opcode == Opcode::kSpawnOk && ok.ok()) {
+        run->members.push_back(SegMapMember{ok.value().node, Slot{0}, 0, ask.peer.ipv4,
+                                            ok.value().data_port, ok.value().ram_commit});
+    } else {
+        const Result<StatusTextPayload> why = wire_decode_spawn_decline(payload);
+        platform_.logger->log(
+            LogLevel::kWarn, "peer_declined",
+            JsonObject{{"job", JsonValue{std::int64_t{run->job.value}}},
+                       {"peer", JsonValue{dotted(ask.peer.ipv4)}},
+                       {"why", JsonValue{why.ok() ? why.value().message : std::string{"?"}}}});
+        ask_peers(*run);  // the next peer takes its place
+    }
+    finish_admission(*run);
+}
+
+// Answers the launcher once no request is outstanding: with N members, or with as many as
+// accepted when the peers ran out (docs/PROTOCOL.md, [GATE P8]).
+void Pmd::finish_admission(Run& run) {
+    if (!run.admitting || run.asked != 0) {
+        return;
+    }
+    run.admitting = false;
+    reply(run.launcher, Opcode::kLAdmitOk, run.job, kNoNode, kNoReq,
+          LAdmitOkPayload{config_.cap_cores, run.members});
+    platform_.logger->log(
+        LogLevel::kInfo, "admitted",
+        JsonObject{{"job", JsonValue{std::int64_t{run.job.value}}},
+                   {"members", JsonValue{static_cast<std::int64_t>(run.members.size())}},
+                   {"asked_for", JsonValue{std::int64_t{run.request.nodes}}}});
+}
+
+// A connection has closed. pmrun going away while its job runs means the user interrupted it:
+// the launcher is told to end the job. The launcher going away ends the job here. A peer
+// going away with a request outstanding counts as one that declined.
+void Pmd::on_closed(const Connection& connection) {
+    for (auto ask = asks_.begin(); ask != asks_.end();) {
+        if (ask->second.connection != connection.id) {
+            ++ask;
+            continue;
+        }
+        Run* run = run_of(ask->second.job);
+        ask = asks_.erase(ask);
+        if (run != nullptr) {
+            run->asked--;
+            ask_peers(*run);
+            finish_admission(*run);
+        }
+    }
+    for (Run& run : runs_) {
+        if (run.pmrun == connection.id) {
+            run.pmrun = 0;
+            if (run.launcher != 0) {
+                reply(run.launcher, Opcode::kLAbort, run.job, kNoNode, kNoReq,
+                      StatusTextPayload{Status::kUserAbort, "interrupted"});
+            }
+        }
+    }
+    std::erase_if(runs_, [&](const Run& run) {
+        return run.launcher == connection.id || (run.launcher == 0 && run.pmrun == 0);
+    });
 }
 
 // Collects the workers that have exited. One that never registered is reported to its asker.
@@ -431,7 +633,7 @@ void Pmd::reply(std::uint64_t connection, Opcode opcode, JobId job, NodeId to, R
     const auto found =
         std::find_if(connections_.begin(), connections_.end(),
                      [connection](const Connection& c) { return c.id == connection; });
-    std::array<std::byte, 600> bytes{};  // the largest reply, SPAWN_DECLINE, is 516 bytes
+    std::vector<std::byte> bytes(kMaxSpawnReq);  // the largest frame it sends, SPAWN_REQ
     const Result<std::size_t> size = wire_encode(payload, bytes);
     if (found == connections_.end() || found->fd < 0 || !size.ok()) {
         return;  // whoever asked has gone
