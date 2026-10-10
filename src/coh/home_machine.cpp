@@ -38,10 +38,10 @@ struct Entry {
 
 // What one step works with besides the entry.
 struct Step {
-    const HomeConfig& config;
-    const std::array<NodeId, kMaxSlots>& nodes;
+    const HomeConfig* config;
+    const std::array<NodeId, kMaxSlots>* nodes;
     Nanos now;
-    std::vector<HomeAction>& out;
+    std::vector<HomeAction>* out;
 };
 
 // The node behind each copyset bit, learnt from the requests themselves: a node enters a
@@ -104,7 +104,7 @@ void store_received(Entry& e, PageId page, std::vector<HomeAction>& out) {
 void count_transfer(Entry& e, const HomeEvent& op, const Step& step) {
     const NodeId previous = e.last_writer;
     e.last_writer = op.from;
-    const HomeConfig& config = step.config;
+    const HomeConfig& config = *step.config;
     if (previous == kNoNode || previous == op.from || config.thrash_period <= Nanos{} ||
         config.hold_initial <= Nanos{}) {
         return;
@@ -126,7 +126,7 @@ void count_transfer(Entry& e, const HomeEvent& op, const Step& step) {
         HomeAction report = action(HomeActionKind::kReportThrash, op.page);
         report.to = op.from;
         report.other = previous;
-        step.out.push_back(report);
+        step.out->push_back(report);
     } else {
         e.hold = std::min(e.hold * 2, config.hold_max);
     }
@@ -147,7 +147,7 @@ bool held_back(const Entry& e, const HomeEvent& request, Nanos now) noexcept {
 // event that led here are the page. A step that needs a spilled home copy loads it first and
 // runs again on LOADED.
 void finish(Entry& e, bool received, const Step& step) {
-    std::vector<HomeAction>& out = step.out;
+    std::vector<HomeAction>& out = *step.out;
     const HomeEvent& op = e.op;
     const bool upgrade =
         op.kind == HomeEventKind::kUpgradeReq && (e.copyset & bit(op.slot)) != 0;  // no bytes
@@ -194,8 +194,8 @@ void finish(Entry& e, bool received, const Step& step) {
 
 // Section 2.4: a request against an idle entry.
 void start(Entry& e, const HomeEvent& event, const Step& step) {
-    std::vector<HomeAction>& out = step.out;
-    const Nodes& nodes = step.nodes;
+    std::vector<HomeAction>& out = *step.out;
+    const Nodes& nodes = *step.nodes;
     const bool exclusive = e.state == HomeState::kExclusive;
     const bool from_owner = exclusive && event.from == e.owner;
     if (event.kind == HomeEventKind::kWriteback) {
@@ -240,7 +240,7 @@ void start(Entry& e, const HomeEvent& event, const Step& step) {
 
 // Section 2.5: an answer the entry may be waiting for.
 void answer(Entry& e, const HomeEvent& event, const Step& step) {
-    std::vector<HomeAction>& out = step.out;
+    std::vector<HomeAction>& out = *step.out;
     switch (event.kind) {
         case HomeEventKind::kInvAck:
             if (e.wait == HomeWait::kInv && (e.pending & bit(event.slot)) != 0) {
@@ -336,7 +336,7 @@ void home_step(HomeDirectory& directory, const HomeEvent& event, std::vector<Hom
         return;
     }
     Entry& e = directory.entries[event.page.value];
-    const Step step{directory.config, directory.nodes, event.now, out};
+    const Step step{&directory.config, &directory.nodes, event.now, &out};
     if (event.kind == HomeEventKind::kHoldExpired) {
         e.hold_armed = false;  // whether the window is really over is seen below, from the time
     } else if (!is_request(event.kind)) {
