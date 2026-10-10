@@ -1,14 +1,16 @@
 // src/coh/ home machine: every row of docs/STATE_MACHINES.md sections 2.4 and 2.5, in the
-// order the tables list them. The rows with "hold running" are AT-1's: no hold runs yet.
+// order the tables list them, and then the hold window of section 2.6.
 //
 // Actions are compared as text, one word each: "INV>3" (send to node 3), "READ_DATA>3:zero"
-// (reply, and where its page comes from), "atomic>3:home", "store", "load", "drop", "abort".
+// (reply, and where its page comes from), "atomic>3:home", "store", "load", "drop", "abort",
+// "arm@15" (ask for HOLD_EXPIRED at 15 ms) and "thrash>3/2" (report: nodes 3 and 2 fight).
 
 #include "coh/home_machine.h"
 
 #include <doctest/doctest.h>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -34,9 +36,10 @@ constexpr PageId kPage{9};
 struct Home {
     paramesh::HomeDirectoryPtr directory;
     std::uint64_t next_req = 100;
+    std::chrono::milliseconds now{0};  // the time the next event carries
 
-    Home() {
-        auto opened = paramesh::home_open({});
+    explicit Home(const paramesh::HomeConfig& config = {}) {
+        auto opened = paramesh::home_open(config);
         REQUIRE(opened.ok());
         directory = std::move(opened).value();
         REQUIRE(paramesh::home_add_segment(*directory, paramesh::SegmentId{0}).ok());
@@ -49,6 +52,7 @@ struct Home {
         event.from = NodeId{node};
         event.slot = paramesh::Slot{static_cast<std::uint8_t>(node)};
         event.req = paramesh::ReqId{next_req++};
+        event.now = now;
         std::vector<HomeAction> out;
         paramesh::home_step(*directory, event, out);
         return out;
@@ -107,6 +111,14 @@ std::string text(const std::vector<HomeAction>& actions) {
                 break;
             case HomeActionKind::kDropCopy:
                 all += "drop";
+                break;
+            case HomeActionKind::kArmHoldTimer:
+                all += "arm@" +
+                       std::to_string(
+                           std::chrono::duration_cast<std::chrono::milliseconds>(a.at).count());
+                break;
+            case HomeActionKind::kReportThrash:
+                all += "thrash" + to + "/" + std::to_string(a.other.value);
                 break;
             default:
                 all += "abort";
@@ -517,4 +529,133 @@ TEST_CASE("queued requests of every kind are taken in order as each operation en
     CHECK(entry.state == HomeState::kUncached);
     CHECK(entry.queued == 0);
     CHECK(entry.version == 3);  // two write grants and one atomic operation
+}
+
+namespace {
+
+// More than 2 transfers in 100 ms is thrashing; the hold starts at 10 ms and doubles to 40.
+paramesh::HomeConfig quick_to_hold() {
+    paramesh::HomeConfig config;
+    config.thrash_transfers = 2;
+    config.thrash_period = std::chrono::milliseconds{100};
+    config.hold_initial = std::chrono::milliseconds{10};
+    config.hold_max = std::chrono::milliseconds{40};
+    return config;
+}
+
+// Passes write access from its owner to `to`: the request, then the owner's FETCH_DATA.
+// Returns what the home does on the FETCH_DATA.
+std::string pass_to(Home& home, std::uint16_t to) {
+    const std::uint16_t owner = home.entry().owner.value;
+    REQUIRE(home.does(kWrite, to) == "FETCH_INV>" + std::to_string(owner));
+    return home.does(kFetchData, owner);
+}
+
+// Nodes 2 and 3 pass the page back and forth until the home holds it: node 2 writes first,
+// then 3, 2, 3, and the third transfer is one too many. Node 3 owns it, held until 10 ms.
+void fight(Home& home) {
+    home.send(kWrite, 2);
+    REQUIRE(pass_to(home, 3) == "WRITE_GRANT>3:received");
+    REQUIRE(pass_to(home, 2) == "WRITE_GRANT>2:received");
+    REQUIRE(pass_to(home, 3) == "WRITE_GRANT>3:received thrash>3/2");
+}
+
+}  // namespace
+
+TEST_CASE("hold window: off by default, however often the page changes hands") {
+    Home home;
+    home.send(kWrite, 2);
+    for (int round = 0; round < 20; round++) {
+        CHECK(pass_to(home, 3) == "WRITE_GRANT>3:received");
+        CHECK(pass_to(home, 2) == "WRITE_GRANT>2:received");
+    }
+}
+
+TEST_CASE(
+    "hold window: a page that changes hands too often is held, and the home says who fights") {
+    Home home{quick_to_hold()};
+    fight(home);
+
+    // A writer other than the owner waits, and the home asks to be told when the window ends.
+    home.now = std::chrono::milliseconds{4};
+    CHECK(home.does(kWrite, 2) == "arm@10");
+    CHECK(home.entry().queued == 1);
+    CHECK(home.entry().wait == HomeWait::kIdle);
+    CHECK(home.does(kUpgrade, 4).empty());  // held too; the timer is already asked for
+    CHECK(home.does(kAtomic, 4).empty());   // and an atomic operation from another node
+    CHECK(home.entry().queued == 3);
+
+    // The window ends: the held requests are taken in the order they came.
+    home.now = std::chrono::milliseconds{10};
+    CHECK(home.does(kHoldExpired, 0) == "FETCH_INV>3");
+    CHECK(home.entry().queued == 2);
+    // Node 2 gets the page: a fourth transfer in the period, so the hold doubles to 20 ms and
+    // the two behind it wait again, until 30 ms. No second report: the fight is the same one.
+    CHECK(home.does(kFetchData, 3) == "WRITE_GRANT>2:received arm@30");
+    home.now = std::chrono::milliseconds{30};
+    CHECK(home.does(kHoldExpired, 0) == "FETCH_INV>2");
+    // Node 4 gets the page, held for 40 ms, the most. What is left in the queue is node 4's
+    // own atomic operation, and the owner is not held: the home takes the page back at once.
+    CHECK(home.does(kFetchData, 2) == "WRITE_GRANT>4:received FETCH_INV>4");
+    CHECK(home.does(kFetchData, 4) == "store atomic>4:home");
+    CHECK(home.entry().queued == 0);
+}
+
+TEST_CASE("hold window: readers and the owner are not held, and a reader ends the window") {
+    Home owner{quick_to_hold()};
+    fight(owner);
+    owner.now = std::chrono::milliseconds{4};
+    CHECK(owner.does(kAtomic, 3) == "FETCH_INV>3");  // the owner's own atomic operation
+
+    Home home{quick_to_hold()};
+    fight(home);
+    home.now = std::chrono::milliseconds{4};
+    CHECK(home.does(kWrite, 2) == "arm@10");
+    // A read is served at once, ahead of the writer that waits.
+    CHECK(home.does(kRead, 4) == "FETCH>3");
+    // The page is shared now, so the window is over: the writer is taken without waiting for
+    // 10 ms, and invalidates both readers.
+    CHECK(home.does(kFetchData, 3) == "store READ_DATA>4:received INV>3 INV>4");
+    CHECK(home.entry().queued == 0);
+    // The timer still fires; by then there is nothing for it to do.
+    home.send(kInvAck, 3);
+    home.send(kInvAck, 4);
+    home.now = std::chrono::milliseconds{10};
+    CHECK(home.does(kHoldExpired, 0).empty());
+}
+
+TEST_CASE(
+    "hold window: a timer that fires early is asked for again; a quiet period ends the hold") {
+    Home home{quick_to_hold()};
+    fight(home);
+    home.now = std::chrono::milliseconds{4};
+    CHECK(home.does(kWrite, 2) == "arm@10");
+    home.now = std::chrono::milliseconds{9};
+    CHECK(home.does(kHoldExpired, 0) == "arm@10");  // not over yet
+    CHECK(home.entry().queued == 1);
+    home.now = std::chrono::milliseconds{10};
+    CHECK(home.does(kHoldExpired, 0) == "FETCH_INV>3");
+    home.does(kFetchData, 3);  // node 2 has it, held until 30 ms
+
+    // Nobody asks for more than the period. The next transfer is the first of a new period:
+    // the fight has stopped, the hold is reset, and a writer is served at once.
+    home.now = std::chrono::milliseconds{250};
+    CHECK(pass_to(home, 3) == "WRITE_GRANT>3:received");
+    home.now = std::chrono::milliseconds{251};
+    CHECK(home.does(kWrite, 2) == "FETCH_INV>3");
+    // If the fight starts again, it is reported again and the hold starts from 10 ms.
+    CHECK(home.does(kFetchData, 3) == "WRITE_GRANT>2:received");
+    CHECK(pass_to(home, 3) == "WRITE_GRANT>3:received thrash>3/2");
+    CHECK(home.does(kWrite, 2) == "arm@261");
+}
+
+TEST_CASE("hold window: the same node writing again and again is no transfer") {
+    Home home{quick_to_hold()};
+    home.send(kWrite, 2);
+    for (int round = 0; round < 10; round++) {
+        // Node 2 writes back and takes the page again: nobody else is involved.
+        CHECK(home.does(kWriteback, 2) == "store WRITEBACK_ACK>2");
+        CHECK(home.does(kUpgrade, 2) == "UPGRADE_GRANT>2 drop");
+    }
+    CHECK(home.does(kWrite, 3) == "FETCH_INV>2");  // and nothing is held
 }
