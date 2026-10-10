@@ -1,106 +1,102 @@
-/* counter: every node of the job adds to one shared number, and the total is exact.
+/* counter: the nodes of a job add to one shared number, and the total is exact.
  *
  *     counter [adds]
  *
- * Twice over: first each node adds 1, `adds` times (default 1000), taking a lock around every
- * read-add-write; then each node adds with pm_atomic_add() and no lock. All nodes add at the
- * same time, the launcher included. Exit status 0 if both totals are nodes x adds.
+ * Twice over: `adds` tasks (default 3000) each add 1 to a shared number, first taking a lock
+ * around every read-add-write, then with pm_atomic_add() and no lock. The tasks run on every
+ * node of the job at the same time. Exit status 0 if both totals are `adds`.
  *
- * Start it on several nodes with tests/multi/run_local.sh or tests/multi/run_netns.sh;
- * tests/multi/counter.sh does both. */
-
-#include "lib/test_hook.h"
+ * Start it with pmrun, or with tests/multi/run_local.sh or run_netns.sh;
+ * tests/multi/counter.sh does all three. */
 
 #include <paramesh.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
-/* Until tasks carry arguments (M3), a worker finds the shared data where the first allocation
- * of a job always is: at the start of the shared region. */
-#define REGION_BASE ((uintptr_t)0x600000000000)
+#define NODE_IDS 65536 /* a node ID is 16 bits */
 
 struct Shared {
-    pm_lock_t lock;
-    uint64_t nodes;       /* how many nodes took part: each adds 1 when it starts */
-    uint64_t with_lock;   /* changed only under `lock` */
+    uint64_t with_lock;   /* changed only under the lock */
     uint64_t with_atomic; /* changed only by pm_atomic_add() */
+    uint64_t failed;      /* lock calls that did not return PM_OK */
 };
 
-static uint64_t g_adds;
+struct AddArgs {
+    pm_lock_t lock;
+    struct Shared* shared;
+    uint64_t* by_node; /* by_node[node]: adds that node made, both ways together */
+};
 
-static struct Shared* shared(void) {
-    return (struct Shared*)REGION_BASE;
-}
-
-/* What every node runs in the first phase. */
-static void add_with_lock(void) {
-    pm_atomic_add(&shared()->nodes, 1);
-    for (uint64_t i = 0; i < g_adds; i++) {
-        if (pm_lock(shared()->lock) != PM_OK) {
-            pm_test_fail("counter: pm_lock failed");
-        }
-        shared()->with_lock = shared()->with_lock + 1;
-        if (pm_unlock(shared()->lock) != PM_OK) {
-            pm_test_fail("counter: pm_unlock failed");
-        }
+/* Adds under the lock. Unlike most tasks this one may not be run twice on the same indexes:
+ * it shows what the lock is for, and a job that loses a node while it runs would count some
+ * adds again. */
+PM_TASK(add_with_lock) {
+    const struct AddArgs* args = arg;
+    uint64_t failed = 0;
+    for (uint64_t i = lo; i < hi; i++) {
+        failed += pm_lock(args->lock) != PM_OK;
+        args->shared->with_lock = args->shared->with_lock + 1;
+        failed += pm_unlock(args->lock) != PM_OK;
     }
+    pm_atomic_add(&args->shared->failed, failed);
+    pm_atomic_add(&args->by_node[ctx->node], hi - lo);
 }
 
-/* And in the second. */
-static void add_atomically(void) {
-    for (uint64_t i = 0; i < g_adds; i++) {
-        pm_atomic_add(&shared()->with_atomic, 1);
+PM_TASK(add_atomically) {
+    const struct AddArgs* args = arg;
+    for (uint64_t i = lo; i < hi; i++) {
+        pm_atomic_add(&args->shared->with_atomic, 1);
     }
-}
-
-static void* run(void* function) {
-    (*(pm_test_fn*)function)();
-    return NULL;
-}
-
-/* Runs `function` on every worker and, at the same time, on a thread of the launcher. */
-static int on_every_node(uint32_t id, pm_test_fn function) {
-    pthread_t mine = 0;
-    if (pthread_create(&mine, NULL, run, (void*)&function) != 0) {
-        return 0;
-    }
-    const int ran = pm_test_run_on_workers(id);
-    return pthread_join(mine, NULL) == 0 && ran == PM_OK;
+    pm_atomic_add(&args->by_node[ctx->node], hi - lo);
 }
 
 int main(int argc, char** argv) {
-    g_adds = argc > 1 ? strtoull(argv[1], NULL, 10) : 1000;
-    if (g_adds == 0 || g_adds > 10000000) {
-        fprintf(stderr, "usage: counter [adds, 1 to 10000000]\n");
+    const uint64_t adds = argc > 1 ? strtoull(argv[1], NULL, 10) : 3000;
+    if (adds == 0 || adds > 100000000) {
+        fprintf(stderr, "usage: counter [adds, 1 to 100000000]\n");
         return 2;
     }
-    pm_test_register(0, add_with_lock);
-    pm_test_register(1, add_atomically);
-
-    const int status = pm_init(&argc, &argv, NULL); /* a worker does not return from this */
+    const pm_config config = {.region_bytes = (uint64_t)4 << 20};
+    const int status = pm_init(&argc, &argv, &config); /* a worker does not return from this */
     if (status != PM_OK) {
         fprintf(stderr, "counter: pm_init: %s\n", pm_strerror(status));
         return 1;
     }
-    if (pm_malloc(sizeof(struct Shared)) != shared()) {
-        fprintf(stderr, "counter: the shared data is not where the workers will look\n");
-        return 1;
-    }
-    shared()->lock = pm_lock_create();
-    if (shared()->lock.id == 0 || !on_every_node(0, add_with_lock) ||
-        !on_every_node(1, add_atomically)) {
-        fprintf(stderr, "counter: the job could not run the two phases\n");
+    struct AddArgs args = {.lock = pm_lock_create(),
+                           .shared = pm_malloc(sizeof(struct Shared)),
+                           .by_node = pm_malloc(NODE_IDS * sizeof(uint64_t))};
+    if (args.lock.id == 0 || args.shared == NULL || args.by_node == NULL) {
+        fprintf(stderr, "counter: could not set up the shared data\n");
         return 1;
     }
 
-    const uint64_t nodes = shared()->nodes;
-    const uint64_t with_lock = shared()->with_lock;
-    const uint64_t with_atomic = shared()->with_atomic;
-    const int exact = with_lock == nodes * g_adds && with_atomic == nodes * g_adds;
-    printf("counter: %llu nodes, %llu adds each: %llu with a lock, %llu with pm_atomic_add: %s\n",
-           (unsigned long long)nodes, (unsigned long long)g_adds, (unsigned long long)with_lock,
-           (unsigned long long)with_atomic, exact ? "ok" : "WRONG");
+    int ran = pm_parallel_for("add_with_lock", 0, adds, 0, &args, sizeof args);
+    if (ran == PM_OK) {
+        ran = pm_wait_all();
+    }
+    if (ran == PM_OK) {
+        ran = pm_parallel_for("add_atomically", 0, adds, 0, &args, sizeof args);
+    }
+    if (ran == PM_OK) {
+        ran = pm_wait_all();
+    }
+    if (ran != PM_OK) {
+        fprintf(stderr, "counter: the tasks could not run: %s\n", pm_strerror(ran));
+        return 1;
+    }
+
+    const int exact = args.shared->with_lock == adds && args.shared->with_atomic == adds &&
+                      args.shared->failed == 0;
+    printf("counter: %llu adds each way: %llu with a lock, %llu with pm_atomic_add: %s\n",
+           (unsigned long long)adds, (unsigned long long)args.shared->with_lock,
+           (unsigned long long)args.shared->with_atomic, exact ? "ok" : "WRONG");
+    printf("counter: adds by node:");
+    for (uint32_t node = 0; node < NODE_IDS; node++) {
+        if (args.by_node[node] != 0) {
+            printf(" %u:%llu", node, (unsigned long long)args.by_node[node]);
+        }
+    }
+    printf("\n");
     return pm_finalize() == PM_OK && exact ? 0 : 1;
 }
