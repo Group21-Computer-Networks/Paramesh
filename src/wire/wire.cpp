@@ -242,6 +242,29 @@ Result<JoinJobPayload> wire_decode_join_job(std::span<const std::byte> in) {
 
 namespace {
 
+// One member entry of 20 bytes, as SEG_MAP and L_ADMIT_OK carry it.
+void put_member(Writer& w, const SegMapMember& member) noexcept {
+    w.put(member.node.value, 2);
+    w.put(member.slot.value, 1);
+    w.put(member.flags, 1);
+    w.put(member.addr, 4);
+    w.put(member.port, 2);
+    w.put(0, 2);
+    w.put(member.ram_weight, 8);
+}
+
+SegMapMember get_member(Reader& r) noexcept {
+    SegMapMember member;
+    member.node = NodeId{static_cast<std::uint16_t>(r.get(2))};
+    member.slot = Slot{static_cast<std::uint8_t>(r.get(1))};
+    member.flags = static_cast<std::uint8_t>(r.get(1));
+    member.addr = static_cast<std::uint32_t>(r.get(4));
+    member.port = static_cast<std::uint16_t>(r.get(2));
+    r.get(2);
+    member.ram_weight = r.get(8);
+    return member;
+}
+
 // A map is sendable, and acceptable, when it has 1 to 8 members with distinct slots below 64,
 // 1 to 2,048 segments, and every segment's home is the slot of a member.
 bool valid(const SegMapPayload& map) noexcept {
@@ -272,13 +295,7 @@ Result<std::size_t> wire_encode(const SegMapPayload& payload, std::span<std::byt
     w.put(payload.members.size(), 1);
     w.put(0, 1);
     for (const SegMapMember& member : payload.members) {
-        w.put(member.node.value, 2);
-        w.put(member.slot.value, 1);
-        w.put(member.flags, 1);
-        w.put(member.addr, 4);
-        w.put(member.port, 2);
-        w.put(0, 2);
-        w.put(member.ram_weight, 8);
+        put_member(w, member);
     }
     for (const Slot home : payload.homes) {
         w.put(home.value, 1);
@@ -298,15 +315,7 @@ Result<SegMapPayload> wire_decode_seg_map(std::span<const std::byte> in) {
     }
     SegMapPayload payload;
     for (std::size_t i = 0; i < members; i++) {
-        SegMapMember member;
-        member.node = NodeId{static_cast<std::uint16_t>(r.get(2))};
-        member.slot = Slot{static_cast<std::uint8_t>(r.get(1))};
-        member.flags = static_cast<std::uint8_t>(r.get(1));
-        member.addr = static_cast<std::uint32_t>(r.get(4));
-        member.port = static_cast<std::uint16_t>(r.get(2));
-        r.get(2);
-        member.ram_weight = r.get(8);
-        payload.members.push_back(member);
+        payload.members.push_back(get_member(r));
     }
     for (std::size_t i = 0; i < segments; i++) {
         payload.homes.push_back(Slot{static_cast<std::uint8_t>(r.get(1))});
@@ -675,6 +684,121 @@ Result<LQuotaPayload> wire_decode_l_quota(std::span<const std::byte> in) {
     Reader r{in};
     const LQuotaPayload payload{static_cast<std::uint16_t>(r.get(2))};
     r.take(2);
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const LRunReqPayload& payload, std::span<std::byte> out) {
+    const auto too_long = [](const std::string& s) { return s.size() > kMaxStr16; };
+    if (payload.nodes == 0 || payload.nodes > kMaxMembers || too_long(payload.path) ||
+        too_long(payload.cwd) || payload.argv.size() > kMaxStr16 ||
+        std::any_of(payload.argv.begin(), payload.argv.end(), too_long)) {
+        return kUnsendable;
+    }
+    Writer w{out.first(std::min(out.size(), kMaxSpawnReq))};
+    w.put(payload.nodes, 2);
+    w.put(0, 2);  // reserved
+    w.bytes(payload.binary_hash);
+    put_str16(w, payload.path);
+    put_str16(w, payload.cwd);
+    w.put(payload.argv.size(), 2);
+    for (const std::string& argument : payload.argv) {
+        put_str16(w, argument);
+    }
+    return w.done();
+}
+
+Result<LRunReqPayload> wire_decode_l_run_req(std::span<const std::byte> in) {
+    if (in.size() > kMaxSpawnReq) {
+        return kMalformed;
+    }
+    Reader r{in};
+    LRunReqPayload payload;
+    payload.nodes = static_cast<std::uint16_t>(r.get(2));
+    r.take(2);
+    const std::span<const std::byte> hash = r.take(payload.binary_hash.size());
+    std::copy(hash.begin(), hash.end(), payload.binary_hash.begin());
+    payload.path = get_str16(r);
+    payload.cwd = get_str16(r);
+    const std::size_t argc = r.get(2);
+    for (std::size_t i = 0; i < argc && i < in.size(); i++) {
+        payload.argv.push_back(get_str16(r));
+    }
+    if (!r.exact() || payload.argv.size() != argc || payload.nodes == 0 ||
+        payload.nodes > kMaxMembers) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const LRunOkPayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    w.put(payload.job.value, 4);
+    w.put(payload.node.value, 2);
+    w.put(0, 2);  // reserved
+    return w.done();
+}
+
+Result<LRunOkPayload> wire_decode_l_run_ok(std::span<const std::byte> in) {
+    Reader r{in};
+    LRunOkPayload payload;
+    payload.job = JobId{static_cast<std::uint32_t>(r.get(4))};
+    payload.node = NodeId{static_cast<std::uint16_t>(r.get(2))};
+    r.take(2);
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const LAdmitReqPayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    w.put(payload.region_bytes, 8);
+    w.put(payload.threads_per_node, 2);
+    w.put(0, 6);  // reserved
+    return w.done();
+}
+
+Result<LAdmitReqPayload> wire_decode_l_admit_req(std::span<const std::byte> in) {
+    Reader r{in};
+    LAdmitReqPayload payload;
+    payload.region_bytes = r.get(8);
+    payload.threads_per_node = static_cast<std::uint16_t>(r.get(2));
+    r.take(6);
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const LAdmitOkPayload& payload, std::span<std::byte> out) {
+    if (payload.members.empty() || payload.members.size() > kMaxMembers) {
+        return kUnsendable;
+    }
+    Writer w{out};
+    w.put(payload.quota, 2);
+    w.put(payload.members.size(), 1);
+    w.put(0, 1);  // reserved
+    for (const SegMapMember& member : payload.members) {
+        put_member(w, member);
+    }
+    return w.done();
+}
+
+Result<LAdmitOkPayload> wire_decode_l_admit_ok(std::span<const std::byte> in) {
+    Reader r{in};
+    LAdmitOkPayload payload;
+    payload.quota = static_cast<std::uint16_t>(r.get(2));
+    const std::size_t members = r.get(1);
+    r.take(1);
+    if (members == 0 || members > kMaxMembers || in.size() != 4 + kMemberSize * members) {
+        return kMalformed;
+    }
+    for (std::size_t i = 0; i < members; i++) {
+        payload.members.push_back(get_member(r));
+    }
     if (!r.exact()) {
         return kMalformed;
     }
