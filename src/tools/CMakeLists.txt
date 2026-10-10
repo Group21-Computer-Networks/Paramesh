@@ -1,7 +1,6 @@
 # pm and pmrun. Exceptions allowed, caught at every thread entry point. The executables are
 # added here by the tasks that first give them a main().
-# pmrun reads and writes frames on the local socket with the daemon's own two functions.
-paramesh_module(tools DEPS paramesh::platform paramesh::wire paramesh::pmd)
+paramesh_module(tools DEPS paramesh::platform paramesh::wire paramesh::net)
 
 # Each tool's main() is in <tool>_main.cpp and stays out of the library, which the unit tests
 # also link.

@@ -1,7 +1,8 @@
 // One frame of docs/PROTOCOL.md section 3 at a time on a stream socket, blocking: for the
-// daemon's replies, and for what talks to the daemon (tools, tests).
-#ifndef PARAMESH_PMD_FRAME_IO_H
-#define PARAMESH_PMD_FRAME_IO_H
+// local socket between a job process or a tool and its daemon, and for the daemon's replies.
+// The job data plane does not use this: it has the transport of transport.h.
+#ifndef PARAMESH_NET_FRAME_IO_H
+#define PARAMESH_NET_FRAME_IO_H
 
 #include "platform/checksum.h"
 #include "platform/result.h"
@@ -29,4 +30,4 @@ Result<Frame> frame_read(int fd, const Checksum& checksum);
 
 }  // namespace paramesh
 
-#endif  // PARAMESH_PMD_FRAME_IO_H
+#endif  // PARAMESH_NET_FRAME_IO_H
