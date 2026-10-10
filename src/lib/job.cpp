@@ -11,6 +11,7 @@
 #include "coh/node_machine.h"
 #include "lib/test_hook.h"
 #include "mem/memory_engine.h"
+#include "net/frame_io.h"
 #include "net/transport.h"
 #include "platform/factory.h"
 #include "rt/region_allocator.h"
@@ -25,6 +26,8 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <paramesh.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -69,6 +72,7 @@ struct Settings {
     Endpoint listen;
     std::vector<Member> members;  // launcher first; slots in this order
     Nanos start_timeout = std::chrono::seconds{10};
+    std::string pmd_socket;  // PARAMESH_PMD_SOCKET; empty when the job runs without pmd
     LogLevel log_level = LogLevel::kWarn;  // log.level
     bool affinity = true;                  // PARAMESH_CFG_TASK_AFFINITY=0 turns M3-3 off
 };
@@ -94,15 +98,18 @@ const char* env(const char* name) {
     return std::getenv(name);  // NOLINT(concurrency-mt-unsafe)
 }
 
-// The environment of docs/PROTOCOL.md, section 10, for a process started without pmd.
+// The environment of docs/PROTOCOL.md, section 10. With PARAMESH_PMD_SOCKET the process was
+// started by pmrun or by a pmd and learns its peers from the daemon; without it, from
+// PARAMESH_LISTEN and PARAMESH_PEERS.
 bool read_settings(Settings& s) {
     const char* role = env("PARAMESH_ROLE");
     const char* job = env("PARAMESH_JOB_ID");
     const char* node = env("PARAMESH_NODE_ID");
+    const char* socket = env("PARAMESH_PMD_SOCKET");
     const char* listen = env("PARAMESH_LISTEN");
     const char* peers = env("PARAMESH_PEERS");
-    if (role == nullptr || job == nullptr || node == nullptr || listen == nullptr ||
-        peers == nullptr) {
+    if (role == nullptr || job == nullptr || node == nullptr ||
+        (socket == nullptr && (listen == nullptr || peers == nullptr))) {
         return false;
     }
     if (std::string_view{role} == "launcher") {
@@ -128,6 +135,25 @@ bool read_settings(Settings& s) {
     }
     if (const char* affinity = env("PARAMESH_CFG_TASK_AFFINITY")) {
         s.affinity = std::string_view{affinity} != "0";
+    }
+    if (socket != nullptr) {
+        s.pmd_socket = socket;
+        // Any address, a port the system chooses. The launcher is the first member: a worker
+        // knows its address from PARAMESH_LAUNCHER, and its node ID is the high half of the
+        // job ID (docs/PROTOCOL.md, L_RUN_OK). The rest come from pmd or from SEG_MAP.
+        const char* launcher = env("PARAMESH_LAUNCHER");
+        Member first{s.self, Slot{0}, {}};
+        if (s.role == kWorker) {
+            first.node = NodeId{static_cast<std::uint16_t>(s.job.value >> 16U)};
+            if (launcher == nullptr || !parse_endpoint(launcher, first.at) ||
+                first.node == s.self) {
+                return false;
+            }
+            s.members = {first, Member{s.self, Slot{1}, {}}};
+        } else {
+            s.members = {first};
+        }
+        return s.role != 0 && s.job.value != 0 && s.self != kNoNode;
     }
     bool found_self = false;
     std::string_view rest{peers};
@@ -205,11 +231,22 @@ public:
         config.self = JoinInfo{s_.self, s_.role, s_.listen.port,
                                static_cast<std::uint32_t>(::getpid()), hash_};
         auto net = net_open(config, *platform_.checksum, *this);
-        if (!net.ok() || !net.value()->listen(s_.listen).ok()) {
+        if (!net.ok()) {
             return PM_ERR_NETWORK;
         }
+        const Result<std::uint16_t> port = net.value()->listen(s_.listen);
+        if (!port.ok()) {
+            return PM_ERR_NETWORK;
+        }
+        s_.listen.port = port.value();
         net_ = std::move(net).value();
         sync_.emplace(*net_, *this);
+        if (!s_.pmd_socket.empty()) {
+            const int joined = join_through_pmd(region_bytes, threads);
+            if (joined != PM_OK) {
+                return joined;
+            }
+        }
         for (const Member& member : s_.members) {
             if (member.node != s_.self && !net_->add_peer(member.node, member.at).ok()) {
                 return PM_ERR_CONFIG;
@@ -226,12 +263,18 @@ public:
                 return PM_ERR_NETWORK;
             }
         }
-        // The job is up: start this process's worker threads.
-        // ponytail: without pmd the quota is the program's own bound, or one thread for each
-        // processor here, and every node is taken to have as many; M3-7 takes it from pmd.
+        // The job is up: start this process's worker threads. Their number is the program's
+        // own bound, never above the quota from pmd. Without pmd there is no quota, and a
+        // program with no bound gets one thread for each processor here.
+        // ponytail: the default grain takes every node to have as many threads as this one;
+        // L_ADMIT_OK does not carry the other nodes' quotas.
+        std::uint32_t most = quota_ != 0 ? quota_ : std::thread::hardware_concurrency();
+        if (threads != 0) {
+            most = std::min(most, threads);
+        }
         TasksConfig tasks;
-        tasks.threads = static_cast<std::uint16_t>(std::clamp<std::uint32_t>(
-            threads != 0 ? threads : std::thread::hardware_concurrency(), 1, kHookThreads - 1));
+        tasks.threads =
+            static_cast<std::uint16_t>(std::clamp<std::uint32_t>(most, 1, kHookThreads - 1));
         tasks.total_slots = static_cast<std::uint32_t>(tasks.threads * s_.members.size());
         tasks.region_bytes = region_bytes_;
         tasks.affinity = s_.affinity;
@@ -350,6 +393,11 @@ public:
         }
         net_->stop();
         thread_.join();
+        if (pmd_thread_.joinable()) {
+            ::shutdown(pmd_fd_, SHUT_RDWR);  // ends the wait in watch_pmd()
+            pmd_thread_.join();
+            ::close(pmd_fd_);
+        }
         log_pages();
     }
 
@@ -556,7 +604,102 @@ private:
 
     // ---- start-up ------------------------------------------------------------------------------
 
-    [[nodiscard]] bool all_joined() const { return joined_.size() + 1 == s_.members.size(); }
+    [[nodiscard]] bool all_joined() const {
+        return std::all_of(s_.members.begin(), s_.members.end(), [this](const Member& m) {
+            return m.node == s_.self || joined_.contains(m.node.value);
+        });
+    }
+
+    // ---- the local pmd (docs/PROTOCOL.md, sections 8.1 and 9) ----------------------------------
+
+    template <typename Payload>
+    bool tell_pmd(Opcode opcode, const Payload& payload) {
+        std::array<std::byte, 64> bytes{};
+        const Result<std::size_t> size = wire_encode(payload, bytes);
+        FrameHeader header;
+        header.opcode = opcode;
+        header.job = s_.job;
+        header.src = s_.self;
+        return size.ok() && frame_write(pmd_fd_, *platform_.checksum, header,
+                                        std::span{bytes}.first(size.value()))
+                                .ok();
+    }
+
+    // Registers with the local pmd and takes this process's thread quota from it. The
+    // launcher then asks for admission: pmd starts the workers and answers with the members.
+    // Called by start() before the network thread runs.
+    int join_through_pmd(std::uint64_t region_bytes, std::uint32_t threads) {
+        sockaddr_un to{};
+        to.sun_family = AF_UNIX;
+        if (s_.pmd_socket.size() >= sizeof to.sun_path) {
+            return PM_ERR_CONFIG;
+        }
+        std::copy(s_.pmd_socket.begin(), s_.pmd_socket.end(), std::begin(to.sun_path));
+        pmd_fd_ = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API
+        if (pmd_fd_ < 0 ||
+            ::connect(pmd_fd_, reinterpret_cast<const sockaddr*>(&to), sizeof to) != 0 ||
+            !tell_pmd(Opcode::kLRegister, LRegisterPayload{static_cast<std::uint32_t>(::getpid()),
+                                                           s_.role, s_.listen.port, hash_})) {
+            return PM_ERR_NETWORK;
+        }
+        const Result<Frame> told = frame_read(pmd_fd_, *platform_.checksum);
+        const Result<LQuotaPayload> quota = told.ok() ? wire_decode_l_quota(told.value().payload)
+                                                      : Result<LQuotaPayload>{told.error()};
+        if (!quota.ok() || told.value().header.opcode != Opcode::kLQuota) {
+            return PM_ERR_NETWORK;
+        }
+        quota_ = quota.value().threads;
+
+        if (is_launcher()) {
+            const auto bound = static_cast<std::uint16_t>(std::min<std::uint32_t>(threads, 65535));
+            if (!tell_pmd(Opcode::kLAdmitReq, LAdmitReqPayload{region_bytes, bound})) {
+                return PM_ERR_NETWORK;
+            }
+            const Result<Frame> answer = frame_read(pmd_fd_, *platform_.checksum);
+            if (answer.ok() && answer.value().header.opcode == Opcode::kLAdmitRefused) {
+                return PM_ERR_REFUSED;
+            }
+            const Result<LAdmitOkPayload> admitted =
+                answer.ok() ? wire_decode_l_admit_ok(answer.value().payload)
+                            : Result<LAdmitOkPayload>{answer.error()};
+            if (!admitted.ok() || answer.value().header.opcode != Opcode::kLAdmitOk ||
+                admitted.value().members.size() > kMaxNodes) {
+                return PM_ERR_NETWORK;
+            }
+            quota_ = admitted.value().quota;
+            for (const SegMapMember& member : admitted.value().members) {
+                if (member.node != s_.self) {
+                    s_.members.push_back(Member{member.node,
+                                                Slot{static_cast<std::uint8_t>(s_.members.size())},
+                                                Endpoint{member.addr, member.port}});
+                }
+            }
+        }
+        pmd_thread_ = std::thread{[this] { watch_pmd(); }};
+        return PM_OK;
+    }
+
+    // The local-link thread: waits only on the socket to pmd. pmd may tell a launcher to end
+    // the job (Ctrl+C on pmrun); and a job whose pmd has gone ends, because nothing would then
+    // enforce its quota or record its work.
+    void watch_pmd() noexcept {
+        for (;;) {
+            const Result<Frame> frame = frame_read(pmd_fd_, *platform_.checksum);
+            if (!frame.ok()) {
+                if (!ending_ && !aborting_) {
+                    abort_job(Status::kPmdLost, s_.self, "the pmd of this node is gone");
+                }
+                return;
+            }
+            if (frame.value().header.opcode == Opcode::kLAbort) {
+                const Result<StatusTextPayload> why =
+                    wire_decode_spawn_decline(frame.value().payload);
+                abort_job(why.ok() ? why.value().status : Status::kUserAbort, s_.self,
+                          why.ok() ? why.value().message : std::string{"ended by pmd"});
+            }
+        }
+    }
 
     // Moves the start sequence on whenever something it waits for has happened.
     void advance_start() noexcept {
@@ -613,6 +756,15 @@ private:
             slot_node_.at(member.slot.value) = member.node;
             if (member.node == s_.self) {
                 my_slot_ = member.slot;
+            }
+            // A worker started by pmd hears of the other workers here, and connects to them.
+            const bool known =
+                std::any_of(s_.members.begin(), s_.members.end(),
+                            [&member](const Member& m) { return m.node == member.node; });
+            if (!known) {
+                const Endpoint at{member.addr, member.port};
+                s_.members.push_back(Member{member.node, member.slot, at});
+                static_cast<void>(net_->add_peer(member.node, at));
             }
         }
         for (std::size_t segment = 0; segment < homes_.size(); segment++) {
@@ -1023,6 +1175,9 @@ private:
     std::optional<Sync> sync_;
     std::optional<Tasks> tasks_;  // after what it uses, so it goes first
     std::thread thread_;
+    int pmd_fd_ = -1;          // the local socket to pmd, or -1 without pmd
+    std::thread pmd_thread_;   // watch_pmd()
+    std::uint32_t quota_ = 0;  // the thread quota pmd gave; 0 without pmd
     std::size_t segments_ = 0;
     RegionAllocator allocator_{0};
 
