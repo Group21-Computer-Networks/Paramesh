@@ -29,7 +29,7 @@ Evidence: the command, the log or result file, the trace, or "seen by <who>".
 | FR-3.2: `pm_parallel_for` | three processes on localhost | pass | `unit.lib_test`, "every index of a range is run exactly once across three processes": 76,800 indexes, each run once, every node ran some. M3-2 |
 | FR-3.3: the same binary on every node, checked by hash | a daemon and a peer | pass | `unit.pmd_test`, "a binary with a different hash is refused with "binary mismatch"": `SPAWN_DECLINE`, status `BINARY_MISMATCH`, no process started. M3-4 |
 | FR-9.1: at least two nodes run chunks of one job | three simulated nodes, through `pmrun` | pass | matrix multiply, n = 4096: `chunks by node: 1:28 2:11 3:10`; runs below |
-| FR-9.2 on one machine (not the gate's own measurement) | one, two and three simulated nodes, four threads each | pass for two nodes | n = 4096, median of three runs: one node 8.22 s, two nodes 6.82 s (1.21 times faster), three nodes 7.72 s (1.06 times); runs below |
+| FR-9.2 on one machine: two simulated nodes are faster than one (not the gate's own measurement) | one, two and three simulated nodes, four threads each | pass | n = 4096, median of three runs: one node 8.22 s, two nodes 6.82 s (1.21 times faster), three nodes 7.72 s (1.06 times); runs below |
 | FR-9.2: n = 4096 is faster on two cabled laptops than on one | two cabled laptops | pending | not run; commands under "Hardware runs" |
 
 ## Hardware runs
