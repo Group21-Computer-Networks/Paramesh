@@ -52,6 +52,29 @@ bool to_u16(std::string_view text, std::uint16_t lowest, std::uint16_t& out) {
     return true;
 }
 
+// "4096", "512M", "2G": bytes, with an optional K, M or G (powers of 1024). At least a page.
+bool to_bytes(std::string_view text, std::uint64_t& out) {
+    std::uint64_t value = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    const std::string_view unit{end, static_cast<std::size_t>(text.data() + text.size() - end)};
+    unsigned shift = 0;
+    if (unit == "K") {
+        shift = 10;
+    } else if (unit == "M") {
+        shift = 20;
+    } else if (unit == "G") {
+        shift = 30;
+    } else if (!unit.empty()) {
+        return false;
+    }
+    if (error != std::errc{} || value > (~std::uint64_t{0} >> shift) ||
+        (value << shift) < kPageSize) {
+        return false;
+    }
+    out = value << shift;
+    return true;
+}
+
 // "10.0.0.2", "10.0.0.2:47005" or "10.0.0.2:47005:47004": the address, its control port and
 // its discovery port.
 bool to_peer(std::string_view text, Endpoint& out, std::uint16_t& discovery) {
@@ -84,13 +107,16 @@ std::string dotted(std::uint32_t ipv4) {
 }  // namespace
 
 std::string_view pmd_usage() noexcept {
-    return "usage: pmd [--node-id N] [--cap-cores N] [--peers address[:port[:port]],...]\n"
+    return "usage: pmd [--node-id N] [--cap-cores N] [--cap-ram BYTES]\n"
+           "           [--peers address[:port[:port]],...]\n"
            "           [--state-dir DIRECTORY] [--iface NAME] [--no-multicast]\n"
            "           [--control-port N] [--discovery-port N] [--http-port N]\n"
            "  --node-id       this node's ID, 1 to 65534 (default: a random ID, made on the first\n"
            "                  run and kept in the state directory)\n"
            "  --cap-cores     the most worker threads a job may run here (default: all "
            "processors)\n"
+           "  --cap-ram       the most RAM a job may hold shared pages in here, as bytes or with\n"
+           "                  K, M or G (default: all of this machine's RAM)\n"
            "  --peers         seeds: daemons to send beacons to and ask for workers; the ports\n"
            "                  default to 47001 (control) and 47000 (discovery)\n"
            "  --state-dir     where pmd.sock and node_id are kept (default "
@@ -161,6 +187,12 @@ Result<PmdConfig> pmd_parse_args(std::span<const std::string_view> args) {
             if (!to_u16(value, 1, config.node.value) || config.node == kAllNodes) {
                 return bad_flag("--node-id must be 1 to 65534");
             }
+        } else if (flag == "--cap-ram") {
+            if (!to_bytes(value, config.cap_ram)) {
+                return bad_flag(
+                    "--cap-ram must be a number of bytes, at least 4096, with an "
+                    "optional K, M or G");
+            }
         } else if (flag == "--iface") {
             config.iface = value;
         } else if (flag == "--state-dir") {
@@ -182,6 +214,10 @@ Result<PmdConfig> pmd_parse_args(std::span<const std::string_view> args) {
     if (config.cap_cores == 0) {
         config.cap_cores = static_cast<std::uint16_t>(
             std::clamp<unsigned>(std::thread::hardware_concurrency(), 1, 65535));
+    }
+    if (config.cap_ram == 0) {  // as with the cores: all of it
+        config.cap_ram = static_cast<std::uint64_t>(::sysconf(_SC_PHYS_PAGES)) *
+                         static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
     }
     return config;
 }
@@ -474,7 +510,7 @@ void Pmd::on_spawn_req(Connection& connection, const FrameHeader& header,
 }
 
 // L_REGISTER: a job process is up. If this daemon started it, the peer that asked is told;
-// either way the process is told its quota, which in M3 is --cap-cores for every job.
+// either way the process is told its quota: --cap-cores and --cap-ram, the same for every job.
 void Pmd::on_register(Connection& connection, const FrameHeader& header,
                       std::span<const std::byte> payload) {
     const Result<LRegisterPayload> decoded = wire_decode_l_register(payload);
@@ -502,7 +538,7 @@ void Pmd::on_register(Connection& connection, const FrameHeader& header,
             1, SegMapMember{config_.node, Slot{0}, kMemberLauncher, 0, process.data_port, 0});
     }
     reply(connection.id, Opcode::kLQuota, header.job, kNoNode, kNoReq,
-          LQuotaPayload{config_.cap_cores});
+          LQuotaPayload{config_.cap_cores, config_.cap_ram});
     platform_.logger->log(LogLevel::kInfo, "register",
                           JsonObject{{"job", JsonValue{std::int64_t{header.job.value}}},
                                      {"pid", JsonValue{std::int64_t{process.pid}}},
@@ -604,7 +640,11 @@ void Pmd::beacon(Nanos now) {
     hello.instance = instance_;
     hello.control_port = config_.control_port;
     hello.cap_cores = config_.cap_cores;
-    hello.free_cores = config_.cap_cores;  // ponytail: no slots are counted before M4-2
+    hello.cap_ram = config_.cap_ram;
+    // ponytail: every job is given the whole of both caps, so nothing is counted as taken;
+    // admission (M4-4) commits RAM to each job and the slot allocation (M5-3) divides cores.
+    hello.free_cores = config_.cap_cores;
+    hello.free_ram = config_.cap_ram;
     hello.jobs = static_cast<std::uint16_t>(std::min<std::size_t>(runs_.size(), 65535));
     std::array<std::byte, 300> bytes{};
     if (const Result<std::size_t> size = wire_encode(hello, bytes); size.ok()) {

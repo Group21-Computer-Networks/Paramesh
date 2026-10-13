@@ -230,10 +230,10 @@ int job_process(const std::string& report, const std::string& last_argument) {
         return 15;
     }
     std::ofstream out{report};
-    out << "quota=" << quota.value().threads << "\njob=" << frame.value().header.job.value
-        << "\nrole=" << env("PARAMESH_ROLE") << "\njob_id=" << env("PARAMESH_JOB_ID")
-        << "\nnode_id=" << env("PARAMESH_NODE_ID") << "\nlauncher=" << env("PARAMESH_LAUNCHER")
-        << "\nlisten=" << env("PARAMESH_LISTEN")
+    out << "quota=" << quota.value().threads << "\nram=" << quota.value().ram_bytes
+        << "\njob=" << frame.value().header.job.value << "\nrole=" << env("PARAMESH_ROLE")
+        << "\njob_id=" << env("PARAMESH_JOB_ID") << "\nnode_id=" << env("PARAMESH_NODE_ID")
+        << "\nlauncher=" << env("PARAMESH_LAUNCHER") << "\nlisten=" << env("PARAMESH_LISTEN")
         << "\ncwd=" << std::filesystem::current_path().string()
         << "\nlast_argument=" << last_argument << "\n";
     return out.good() ? 0 : 16;
@@ -455,12 +455,17 @@ std::string field(const std::string& report, const std::string& key) {
 // Three daemons on this machine, nodes 1 to 3. Node 1 knows a peer that is not there, then
 // the other two; and a directory for the stand-in processes' reports.
 struct ThreeNodes {
-    Daemon two{2};
-    Daemon three{3};
-    Daemon one{1, {paramesh::Endpoint{(127U << 24U) | 1U, 1}, two.endpoint(), three.endpoint()}};
+    Daemon two;
+    Daemon three;
+    Daemon one;
     std::string reports = one.state_dir + "/reports";
 
-    ThreeNodes() {
+    explicit ThreeNodes(const Daemon::Adjust& adjust = nullptr)
+        : two{2, {}, adjust},
+          three{3, {}, adjust},
+          one{1,
+              {paramesh::Endpoint{(127U << 24U) | 1U, 1}, two.endpoint(), three.endpoint()},
+              adjust} {
         std::filesystem::create_directory(reports);
         const std::array<std::byte, 32> hash = own_hash(one.platform);
         std::ofstream{reports + "/hash", std::ios::binary}.write(
@@ -479,7 +484,8 @@ struct ThreeNodes {
 
 // ---- this executable as a real ParaMesh program, started by pmrun and by daemons --------------
 
-constexpr std::uint64_t kSquares = 64ULL * 512;  // 64 pages of numbers
+constexpr std::uint64_t kSquares = 64ULL * 512;        // 64 pages of numbers
+constexpr std::uint64_t kManySquares = 2048ULL * 512;  // 2,048 pages: 8 MB
 
 struct SquareArgs {
     std::uint64_t* squares;
@@ -501,6 +507,37 @@ int processes_naming(const std::string& marker) {
         found += line.find(marker) != std::string::npos ? 1 : 0;
     }
     return found;
+}
+
+// The most kilobytes of the shared region that any process naming `marker` has in RAM now:
+// the pages its local cache holds. Each process is stopped while it is read: the kernel walks
+// the region from low addresses to high, and a running process can give up a low page and
+// install a higher one during the walk, which would count one page twice.
+std::uint64_t most_region_kb(const std::string& marker) {
+    std::uint64_t most = 0;
+    for (const auto& entry : std::filesystem::directory_iterator{"/proc"}) {
+        if (contents(entry.path().string() + "/cmdline").find(marker) == std::string::npos) {
+            continue;
+        }
+        const pid_t pid = static_cast<pid_t>(std::stol(entry.path().filename().string()));
+        ::kill(pid, SIGSTOP);
+        for (int tries = 0; tries < 100 && contents(entry.path().string() + "/stat").find(") T ") ==
+                                               std::string::npos;
+             tries++) {
+            ::usleep(1000);  // until it has stopped
+        }
+        std::ifstream smaps{entry.path().string() + "/smaps"};
+        bool in_region = false;
+        for (std::string line; std::getline(smaps, line);) {
+            if (line.find('-') == 12 && line.find(' ') == 25) {  // a mapping's first line
+                in_region = line.starts_with("600000000000-");
+            } else if (in_region && line.starts_with("Rss:")) {
+                most = std::max<std::uint64_t>(most, std::stoull(line.substr(4)));
+            }
+        }
+        ::kill(pid, SIGCONT);
+    }
+    return most;
 }
 
 }  // namespace
@@ -527,13 +564,16 @@ namespace {
 
 // The launcher's side; a worker does not return from pm_init(). Writes its report, or the
 // number of the step that failed.
-int program(const std::string& report, bool slow) {
-    const pm_config config{.region_bytes = 4ULL << 20U, .threads_per_node = 0};
+int program(const std::string& report, std::string_view mode) {
+    const bool slow = mode == "slow";
+    const bool big = mode == "big";  // squares over many more pages than a node may cache
+    const std::uint64_t count = big ? kManySquares : kSquares;
+    const pm_config config{.region_bytes = (big ? 12ULL : 4ULL) << 20U, .threads_per_node = 0};
     if (pm_init(nullptr, nullptr, &config) != PM_OK) {
         return 30;
     }
     SquareArgs args{};
-    args.squares = static_cast<std::uint64_t*>(pm_malloc(kSquares * sizeof(std::uint64_t)));
+    args.squares = static_cast<std::uint64_t*>(pm_malloc(count * sizeof(std::uint64_t)));
     args.by_node = static_cast<std::uint64_t*>(pm_malloc(8 * sizeof(std::uint64_t)));
     args.by_thread = static_cast<std::uint64_t*>(pm_malloc(64 * sizeof(std::uint64_t)));
     args.started = static_cast<std::uint64_t*>(pm_malloc(8 * sizeof(std::uint64_t)));
@@ -543,13 +583,13 @@ int program(const std::string& report, bool slow) {
         return 31;
     }
     write_report(report + ".up", "pid=" + std::to_string(::getpid()) + "\n");
-    if (pm_parallel_for_data("pmd_test_square", 0, kSquares, 512, &args, sizeof args, args.squares,
+    if (pm_parallel_for_data("pmd_test_square", 0, count, 512, &args, sizeof args, args.squares,
                              sizeof(std::uint64_t)) != PM_OK ||
         pm_wait_all() != PM_OK) {
         return 32;
     }
     std::uint64_t wrong = 0;
-    for (std::uint64_t i = 0; i < kSquares; i++) {
+    for (std::uint64_t i = 0; i < count; i++) {
         wrong += args.squares[i] != i * i ? 1U : 0U;
     }
     std::uint64_t over_quota = 0;  // chunks run by a thread the quota of 3 does not allow
@@ -568,7 +608,7 @@ int program(const std::string& report, bool slow) {
 
 extern "C" int paramesh_test_helper(int argc, char** argv) {
     if (argc == 4 && std::string_view{argv[1]} == "--as-program") {
-        return program(argv[2], std::string_view{argv[3]} == "slow");
+        return program(argv[2], argv[3]);
     }
     if (argc == 4 && std::string_view{argv[1]} == "--as-job-process") {
         return job_process(argv[2], argv[3]);
@@ -588,6 +628,10 @@ TEST_CASE("the command line: defaults, every flag, and what is refused") {
     REQUIRE(all.ok());
     CHECK(all.value().node == NodeId{7});
     CHECK(all.value().cap_cores == 4);
+    CHECK(parse({"--cap-ram", "512M"}).value().cap_ram == 512ULL << 20U);
+    CHECK(parse({"--cap-ram", "2G"}).value().cap_ram == 2ULL << 30U);
+    CHECK(parse({"--cap-ram", "8K"}).value().cap_ram == 8192);
+    CHECK(parse({"--cap-ram", "4096"}).value().cap_ram == 4096);
     CHECK(all.value().control_port == 47002);
     CHECK(all.value().state_dir == "/tmp/somewhere");
     REQUIRE(all.value().peers.size() == 2);
@@ -614,7 +658,8 @@ TEST_CASE("the command line: defaults, every flag, and what is refused") {
     CHECK(least.value().discovery_port == 47000);
     CHECK(least.value().http_port == 47002);
     CHECK(least.value().multicast);
-    CHECK(least.value().cap_cores >= 1);  // this machine's processors
+    CHECK(least.value().cap_cores >= 1);                  // this machine's processors
+    CHECK(least.value().cap_ram >= paramesh::kPageSize);  // this machine's RAM
     CHECK(least.value().state_dir.ends_with("/.local/state/paramesh"));
     CHECK(least.value().peers.empty());
 
@@ -638,12 +683,19 @@ TEST_CASE("the command line: defaults, every flag, and what is refused") {
     CHECK(refused({"--node-id", "1", "--peers", "10.0.0.2:47001:0"}) == bad_peers);
     CHECK(refused({"--http-port", "70000"}) == "--http-port must be 0 to 65535");
     CHECK(refused({"--discovery-port", "x"}) == "--discovery-port must be 0 to 65535");
+    const std::string bad_ram =
+        "--cap-ram must be a number of bytes, at least 4096, with an optional K, M or G";
+    CHECK(refused({"--cap-ram", "4095"}) == bad_ram);  // less than a page
+    CHECK(refused({"--cap-ram", "1K"}) == bad_ram);
+    CHECK(refused({"--cap-ram", "12X"}) == bad_ram);
+    CHECK(refused({"--cap-ram", "G"}) == bad_ram);
+    CHECK(refused({"--cap-ram", "99999999999999G"}) == bad_ram);  // more than 64 bits
     CHECK(refused({"--node-id", "1", "--speed", "9"}) == "a flag pmd does not know");
     CHECK(refused({"--node-id"}) == "the last flag has no value");
 }
 
 TEST_CASE("a job process started by pmd receives its quota, and the peer that asked is told") {
-    const Daemon daemon;
+    const Daemon daemon{5, {}, [](paramesh::PmdConfig& c) { c.cap_ram = 64ULL << 20U; }};
     const std::string report = daemon.state_dir + "/report";
     REQUIRE(send(daemon.control, daemon.platform, Opcode::kSpawnReq, 31, daemon.request(report)));
 
@@ -664,7 +716,7 @@ TEST_CASE("a job process started by pmd receives its quota, and the peer that as
         ::usleep(100000);
     }
     CHECK(contents(report) ==
-          "quota=3\njob=77\nrole=worker\njob_id=77\nnode_id=5\n"
+          "quota=3\nram=67108864\njob=77\nrole=worker\njob_id=77\nnode_id=5\n"
           "launcher=10.1.2.3:5000\nlisten=(unset)\ncwd=" +
               daemon.state_dir + "\nlast_argument=an argument with spaces\n");
 }
@@ -801,6 +853,39 @@ TEST_CASE("a ParaMesh program started by pmrun runs its tasks on three nodes, wi
         ::usleep(100000);  // the workers end on JOB_END
     }
     CHECK(processes_naming(report) == 0);
+}
+
+TEST_CASE("with --cap-ram, no process maps more of the region than its cache's share" *
+          doctest::skip(!region_can_be_mapped())) {
+    // 16 MB per node: 4 MB, 1,024 pages, for the local cache and 12 MB for the home store,
+    // which holds the 12 MB region whatever the placement. Each node writes about 680 of the
+    // 2,048 pages of squares and the launcher reads all of them, so pages are given up and
+    // modified ones written back. The memory is sampled every 100 ms.
+    const ThreeNodes nodes{[](paramesh::PmdConfig& c) { c.cap_ram = 16ULL << 20U; }};
+    const std::string report = nodes.reports + "/program";
+    const pid_t pmrun = start_pmrun(
+        {"-n", "3", "--state-dir", nodes.one.state_dir, own_path(), "--as-program", report, "big"});
+    std::uint64_t most_kb = 0;
+    int status = -1;
+    for (int tenths = 0; tenths < 1800 && status < 0; tenths++) {
+        most_kb = std::max(most_kb, most_region_kb(report));
+        int raw = 0;
+        if (::waitpid(pmrun, &raw, WNOHANG) == pmrun) {
+            status = WIFEXITED(raw) ? WEXITSTATUS(raw) : 128 + WTERMSIG(raw);
+        }
+        ::usleep(100000);
+    }
+    if (status < 0) {
+        ::kill(pmrun, SIGKILL);
+        ::waitpid(pmrun, nullptr, 0);
+    }
+    REQUIRE(status == 0);
+    const std::string said = contents(report);
+    CHECK(field(said, "wrong") == "0");
+    CHECK(field(said, "over_quota") == "0");  // and the threads stay within --cap-cores
+    MESSAGE("most of the region one process held: " << most_kb << " KB");
+    CHECK(most_kb > 0);
+    CHECK(most_kb <= 4096);
 }
 
 TEST_CASE("Ctrl+C on pmrun ends a running ParaMesh job on every node" *

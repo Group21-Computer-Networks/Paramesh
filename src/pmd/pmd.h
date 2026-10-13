@@ -52,6 +52,7 @@ struct PmdConfig {
     std::string iface;            // --iface: the one interface for multicast; else every one
     std::string state_dir;        // --state-dir; pmd.sock and node_id are kept in it
     std::uint16_t cap_cores = 0;  // --cap-cores: the thread quota of every job
+    std::uint64_t cap_ram = 0;    // --cap-ram, bytes: the page data each job may hold here
     // --peers address[:control_port[:discovery_port]],...: the seed list. A daemon sends its
     // HELLO to each seed too, and asks them for workers (M3-5).
     std::vector<Endpoint> peers;
