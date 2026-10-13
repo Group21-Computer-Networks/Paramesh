@@ -174,6 +174,14 @@ struct SpawnDeclinePayload {
     std::string message;
 };
 
+// L_ADMIT_REFUSED: what the job needs, what the chosen nodes can give, and a text to print.
+struct LAdmitRefusedPayload {
+    std::uint64_t needed = 0;
+    std::uint64_t available = 0;
+    Status status = Status::kNoCapacity;
+    std::string message;
+};
+
 // L_RUN_REFUSED and L_ABORT have the layout of SPAWN_DECLINE: a status and a text.
 using StatusTextPayload = SpawnDeclinePayload;
 
@@ -263,6 +271,8 @@ Result<HelloPayload> wire_decode_hello(std::span<const std::byte> in);
 Result<ByePayload> wire_decode_bye(std::span<const std::byte> in);
 Result<SpawnOkPayload> wire_decode_spawn_ok(std::span<const std::byte> in);
 Result<SpawnDeclinePayload> wire_decode_spawn_decline(std::span<const std::byte> in);
+Result<std::size_t> wire_encode(const LAdmitRefusedPayload& payload, std::span<std::byte> out);
+Result<LAdmitRefusedPayload> wire_decode_l_admit_refused(std::span<const std::byte> in);
 Result<LRegisterPayload> wire_decode_l_register(std::span<const std::byte> in);
 Result<LQuotaPayload> wire_decode_l_quota(std::span<const std::byte> in);
 Result<LRunReqPayload> wire_decode_l_run_req(std::span<const std::byte> in);

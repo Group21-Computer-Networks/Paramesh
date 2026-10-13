@@ -420,6 +420,17 @@ TEST_CASE("the daemon payloads: SPAWN_REQ, SPAWN_OK, SPAWN_DECLINE, L_REGISTER a
             .error()
             .code == Errc::kInvalidArgument);
 
+    const paramesh::LAdmitRefusedPayload refused{0x100, 0x80, paramesh::Status::kNoCapacity, "no"};
+    CHECK(encoded(refused) ==
+          hex("00 00 00 00 00 00 01 00 00 00 00 00 00 00 00 80 00 0B 00 02 6E 6F"));
+    const auto no_room = paramesh::wire_decode_l_admit_refused(encoded(refused));
+    REQUIRE(no_room.ok());
+    CHECK(no_room.value().needed == 0x100);
+    CHECK(no_room.value().available == 0x80);
+    CHECK(no_room.value().status == paramesh::Status::kNoCapacity);
+    CHECK(no_room.value().message == "no");
+    CHECK(paramesh::wire_decode_l_admit_refused(hex("00 00")).error().code == Errc::kProtocol);
+
     paramesh::LRegisterPayload process;
     process.pid = 0x01020304;
     process.role = 2;

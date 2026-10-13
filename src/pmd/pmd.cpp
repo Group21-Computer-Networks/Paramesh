@@ -241,6 +241,13 @@ Pmd::~Pmd() {
 }
 
 Result<void> Pmd::open() {
+    // spill.budget: the RAM cap unless set, as in the job processes started here.
+    if (config_.spill_budget == 0) {
+        const char* budget =
+            std::getenv("PARAMESH_CFG_SPILL_BUDGET");  // NOLINT(concurrency-mt-unsafe)
+        config_.spill_budget =
+            budget != nullptr ? std::strtoull(budget, nullptr, 10) : config_.cap_ram;
+    }
     std::error_code failed;
     std::filesystem::create_directories(config_.state_dir, failed);
     // The node ID: the flag's, or the one made on the first run and kept here.
@@ -528,7 +535,8 @@ void Pmd::on_register(Connection& connection, const FrameHeader& header,
             ::kill(spawn->pid, SIGKILL);
         } else {
             reply(spawn->asked_on, Opcode::kSpawnOk, spawn->job, spawn->asker, spawn->req,
-                  SpawnOkPayload{config_.node, process.data_port, config_.cap_cores, 0, 0});
+                  SpawnOkPayload{config_.node, process.data_port, config_.cap_cores,
+                                 config_.cap_ram, config_.spill_budget});
         }
         spawns_.erase(spawn);
     }
@@ -645,6 +653,8 @@ void Pmd::beacon(Nanos now) {
     // admission (M4-4) commits RAM to each job and the slot allocation (M5-3) divides cores.
     hello.free_cores = config_.cap_cores;
     hello.free_ram = config_.cap_ram;
+    hello.spill_budget = config_.spill_budget;
+    hello.free_spill = config_.spill_budget;
     hello.jobs = static_cast<std::uint16_t>(std::min<std::size_t>(runs_.size(), 65535));
     std::array<std::byte, 300> bytes{};
     if (const Result<std::size_t> size = wire_encode(hello, bytes); size.ok()) {
@@ -808,8 +818,38 @@ void Pmd::on_run_req(Connection& connection, const FrameHeader& /*header*/,
     runs_.push_back(std::move(run));
 }
 
-// L_ADMIT_REQ from the launcher: ask peers for the other N-1 members.
-// ponytail: no capacity check and no L_ADMIT_REFUSED; admission by capacity is M4-4.
+namespace {
+
+// docs/PLAN.md: admission headroom 90%.
+std::uint64_t admissible(std::uint64_t capacity) {
+    return capacity / 10 * 9;
+}
+
+}  // namespace
+
+// L_ADMIT_REFUSED: the region does not fit the nodes chosen.
+void Pmd::refuse(Run& run, std::uint64_t available, std::size_t nodes) {
+    const auto mb = [](std::uint64_t bytes) { return std::to_string(bytes >> 20U) + " MB"; };
+    const std::uint64_t needed = run.wants.region_bytes;
+    run.admitting = false;
+    const std::string message = "the region needs " + mb(needed) + " and the " +
+                                std::to_string(nodes) +
+                                (nodes == 1 ? " node chosen gives " : " nodes chosen give ") +
+                                mb(available) + " (90% of their RAM caps and spill budgets)";
+    reply(run.launcher, Opcode::kLAdmitRefused, run.job, kNoNode, kNoReq,
+          LAdmitRefusedPayload{needed, available, Status::kNoCapacity, message});
+    platform_.logger->log(
+        LogLevel::kWarn, "refused",
+        JsonObject{{"job", JsonValue{std::int64_t{run.job.value}}},
+                   {"needed", JsonValue{static_cast<std::int64_t>(needed)}},
+                   {"available", JsonValue{static_cast<std::int64_t>(available)}}});
+}
+
+// L_ADMIT_REQ from the launcher (docs/PROTOCOL.md, 8.1). The peers to ask are those heard
+// through discovery, the one with most free capacity first, then the seeds of --peers not
+// heard yet. If the peers that would be chosen are all known and the region does not fit
+// 90% of their RAM and spill with this node's, the job is refused before any worker starts.
+// A node with no RAM cap (--cap-ram 0, in tests) takes any region.
 void Pmd::on_admit_req(Connection& connection, const FrameHeader& header,
                        std::span<const std::byte> payload) {
     Run* run = run_of(header.job);
@@ -819,6 +859,40 @@ void Pmd::on_admit_req(Connection& connection, const FrameHeader& header,
     }
     run->wants = wants.value();
     run->admitting = true;
+    run->unlimited = config_.cap_ram == 0;
+    run->committed = config_.cap_ram + config_.spill_budget;
+
+    std::vector<Peer> heard;
+    {
+        const std::scoped_lock hold{peers_mu_};
+        heard = table_->peers();
+    }
+    std::erase_if(heard, [](const Peer& p) { return (p.hello.flags & kHelloLeaving) != 0; });
+    const auto free_of = [](const Peer& p) { return p.hello.free_ram + p.hello.free_spill; };
+    std::stable_sort(heard.begin(), heard.end(),
+                     [&](const Peer& a, const Peer& b) { return free_of(a) > free_of(b); });
+    const std::size_t others = run->request.nodes - 1U;
+    std::uint64_t known = run->committed;
+    bool limited = !run->unlimited;
+    for (std::size_t i = 0; i < heard.size(); i++) {
+        run->candidates.push_back(Endpoint{heard[i].address, heard[i].hello.control_port});
+        if (i < others) {
+            known += free_of(heard[i]);
+            limited = limited && heard[i].hello.cap_ram != 0;
+        }
+    }
+    for (const Endpoint& seed : config_.peers) {
+        if (std::none_of(run->candidates.begin(), run->candidates.end(), [&](const Endpoint& c) {
+                return c.ipv4 == seed.ipv4 && c.port == seed.port;
+            })) {
+            run->candidates.push_back(seed);
+        }
+    }
+    const bool all_known = heard.size() >= std::min(others, run->candidates.size());
+    if (limited && all_known && run->wants.region_bytes > admissible(known)) {
+        refuse(*run, admissible(known), 1 + std::min(others, heard.size()));
+        return;
+    }
     ask_peers(*run);
     finish_admission(*run);
 }
@@ -826,15 +900,15 @@ void Pmd::on_admit_req(Connection& connection, const FrameHeader& header,
 // Asks peers until the job has, or has asked for, all the members it wants, or no peer is left.
 void Pmd::ask_peers(Run& run) {
     while (run.members.size() + run.asked < run.request.nodes &&
-           run.next_peer < config_.peers.size()) {
+           run.next_peer < run.candidates.size()) {
         ask_next_peer(run);
     }
 }
 
-// Sends SPAWN_REQ to the next peer of --peers this job has not asked. A peer that cannot be
+// Sends SPAWN_REQ to the next candidate this job has not asked. A peer that cannot be
 // reached counts as one that declined: the caller's loop goes on to the one after.
 void Pmd::ask_next_peer(Run& run) {
-    const Endpoint peer = config_.peers[run.next_peer++];
+    const Endpoint peer = run.candidates[run.next_peer++];
     sockaddr_in to{};
     to.sin_family = AF_INET;
     to.sin_addr.s_addr = htonl(peer.ipv4);
@@ -893,6 +967,8 @@ void Pmd::on_spawn_answer(const FrameHeader& header, std::span<const std::byte> 
     if (header.opcode == Opcode::kSpawnOk && ok.ok()) {
         run->members.push_back(SegMapMember{ok.value().node, Slot{0}, 0, ask.peer.ipv4,
                                             ok.value().data_port, ok.value().ram_commit});
+        run->committed += ok.value().ram_commit + ok.value().spill_commit;
+        run->unlimited = run->unlimited || ok.value().ram_commit == 0;
     } else {
         const Result<StatusTextPayload> why = wire_decode_spawn_decline(payload);
         platform_.logger->log(
@@ -909,6 +985,13 @@ void Pmd::on_spawn_answer(const FrameHeader& header, std::span<const std::byte> 
 // accepted when the peers ran out (docs/PROTOCOL.md, [GATE P8]).
 void Pmd::finish_admission(Run& run) {
     if (!run.admitting || run.asked != 0) {
+        return;
+    }
+    // The members' own commitments decide ([GATE P8]): fewer may have accepted than were
+    // counted on, or a seed not heard before may give less than the job needs. The launcher
+    // then ends, and the workers already started end with it.
+    if (!run.unlimited && run.wants.region_bytes > admissible(run.committed)) {
+        refuse(run, admissible(run.committed), run.members.size());
         return;
     }
     run.admitting = false;
