@@ -506,3 +506,47 @@ TEST_CASE("the launch payloads: L_RUN_REQ, L_RUN_OK, L_ADMIT_REQ and L_ADMIT_OK"
     CHECK(paramesh::wire_encode(paramesh::LAdmitOkPayload{}, room).error().code ==
           Errc::kInvalidArgument);  // no members
 }
+
+TEST_CASE("the discovery payloads: HELLO and BYE") {
+    paramesh::HelloPayload hello;
+    hello.instance = 0x01020304;
+    hello.control_port = 47001;
+    hello.flags = paramesh::kHelloLeaving;
+    hello.cap_ram = 8;
+    hello.free_ram = 7;
+    hello.spill_budget = 6;
+    hello.free_spill = 5;
+    hello.cap_cores = 4;
+    hello.free_cores = 3;
+    hello.jobs = 2;
+    Bytes expected =
+        hex("01 02 03 04 B7 99 00 01 00 00 00 00 00 00 00 08 00 00 00 00 00 00 00 07 "
+            "00 00 00 00 00 00 00 06 00 00 00 00 00 00 00 05 00 04 00 03 00 02 00 00");
+    CHECK(encoded(hello) == expected);
+    auto back = paramesh::wire_decode_hello(expected);
+    REQUIRE(back.ok());
+    CHECK(back.value().instance == 0x01020304);
+    CHECK(back.value().control_port == 47001);
+    CHECK(back.value().flags == paramesh::kHelloLeaving);
+    CHECK(back.value().free_spill == 5);
+    CHECK(back.value().jobs == 2);
+    CHECK(back.value().totals.empty());
+
+    hello.totals.push_back({paramesh::NodeId{9}, 1, 2, 3, 4});
+    const Bytes with_total = encoded(hello);
+    CHECK(with_total.size() == 48 + 36);
+    back = paramesh::wire_decode_hello(with_total);
+    REQUIRE(back.ok());
+    REQUIRE(back.value().totals.size() == 1);
+    CHECK(back.value().totals[0].peer == paramesh::NodeId{9});
+    CHECK(back.value().totals[0].segsec_by_peer == 4);
+    Bytes cut = with_total;
+    cut.pop_back();
+    CHECK(paramesh::wire_decode_hello(cut).error().code == Errc::kProtocol);
+    expected[47] = std::byte{1};  // says one total, carries none
+    CHECK(paramesh::wire_decode_hello(expected).error().code == Errc::kProtocol);
+
+    CHECK(encoded(paramesh::ByePayload{0x0A0B0C0D}) == hex("0A 0B 0C 0D"));
+    CHECK(paramesh::wire_decode_bye(hex("0A 0B 0C 0D")).value().instance == 0x0A0B0C0D);
+    CHECK(paramesh::wire_decode_bye(hex("0A 0B 0C")).error().code == Errc::kProtocol);
+}
