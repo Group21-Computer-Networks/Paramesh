@@ -805,4 +805,79 @@ Result<LAdmitOkPayload> wire_decode_l_admit_ok(std::span<const std::byte> in) {
     return payload;
 }
 
+Result<std::size_t> wire_encode(const HelloPayload& payload, std::span<std::byte> out) {
+    if (payload.totals.size() > kMaxMembers - 1) {
+        return kUnsendable;
+    }
+    Writer w{out};
+    w.put(payload.instance, 4);
+    w.put(payload.control_port, 2);
+    w.put(payload.flags, 2);
+    w.put(payload.cap_ram, 8);
+    w.put(payload.free_ram, 8);
+    w.put(payload.spill_budget, 8);
+    w.put(payload.free_spill, 8);
+    w.put(payload.cap_cores, 2);
+    w.put(payload.free_cores, 2);
+    w.put(payload.jobs, 2);
+    w.put(payload.totals.size(), 2);
+    for (const LedgerTotal& total : payload.totals) {
+        w.put(total.peer.value, 2);
+        w.put(0, 2);  // reserved
+        w.put(total.chunks_for_peer, 8);
+        w.put(total.chunks_by_peer, 8);
+        w.put(total.segsec_for_peer, 8);
+        w.put(total.segsec_by_peer, 8);
+    }
+    return w.done();
+}
+
+Result<HelloPayload> wire_decode_hello(std::span<const std::byte> in) {
+    Reader r{in};
+    HelloPayload payload;
+    payload.instance = static_cast<std::uint32_t>(r.get(4));
+    payload.control_port = static_cast<std::uint16_t>(r.get(2));
+    payload.flags = static_cast<std::uint16_t>(r.get(2));
+    payload.cap_ram = r.get(8);
+    payload.free_ram = r.get(8);
+    payload.spill_budget = r.get(8);
+    payload.free_spill = r.get(8);
+    payload.cap_cores = static_cast<std::uint16_t>(r.get(2));
+    payload.free_cores = static_cast<std::uint16_t>(r.get(2));
+    payload.jobs = static_cast<std::uint16_t>(r.get(2));
+    const std::size_t count = r.get(2);
+    if (count > kMaxMembers - 1 || in.size() != 48 + 36 * count) {
+        return kMalformed;
+    }
+    for (std::size_t i = 0; i < count; i++) {
+        LedgerTotal total;
+        total.peer = NodeId{static_cast<std::uint16_t>(r.get(2))};
+        r.take(2);
+        total.chunks_for_peer = r.get(8);
+        total.chunks_by_peer = r.get(8);
+        total.segsec_for_peer = r.get(8);
+        total.segsec_by_peer = r.get(8);
+        payload.totals.push_back(total);
+    }
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const ByePayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    w.put(payload.instance, 4);
+    return w.done();
+}
+
+Result<ByePayload> wire_decode_bye(std::span<const std::byte> in) {
+    Reader r{in};
+    const ByePayload payload{static_cast<std::uint32_t>(r.get(4))};
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
 }  // namespace paramesh
