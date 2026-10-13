@@ -851,8 +851,9 @@ next task boundary.
 | --- | --- | --- | --- |
 | 0 | 2 | `threads` | The most worker threads that may run chunks. |
 | 2 | 2 | reserved | |
+| 4 | 8 | `ram_bytes` | The most RAM the process may hold page data in: its home store and its local cache together, split by `mem.cache_share`. 0 for no cap. Added by M4-2, with the person's approval. |
 
-Fixed size: 4 bytes.
+Fixed size: 12 bytes.
 
 ### `L_LEAVE` — 0x91
 

@@ -20,6 +20,7 @@
 #include "rt/sync.h"
 #include "rt/tasks.h"
 #include "store/home_store.h"
+#include "store/local_cache.h"
 #include "store/placement.h"
 #include "wire/payloads.h"
 
@@ -76,6 +77,7 @@ struct Settings {
     std::string pmd_socket;  // PARAMESH_PMD_SOCKET; empty when the job runs without pmd
     LogLevel log_level = LogLevel::kWarn;  // log.level
     bool affinity = true;                  // PARAMESH_CFG_TASK_AFFINITY=0 turns M3-3 off
+    std::uint64_t cache_share = 25;        // mem.cache_share: percent of the RAM cap
     // The hold window against thrashing (AT-1), with the plan's proposed defaults.
     // PARAMESH_CFG_THRASH_THRESHOLD sets the count; 0 turns the window off.
     HomeConfig thrash{8, std::chrono::milliseconds{100}, std::chrono::milliseconds{1},
@@ -144,6 +146,9 @@ bool read_settings(Settings& s) {
         if (s.thrash.thrash_transfers == 0) {
             s.thrash.thrash_period = Nanos{};  // off
         }
+    }
+    if (const char* share = env("PARAMESH_CFG_MEM_CACHE_SHARE")) {
+        s.cache_share = std::min<std::uint64_t>(std::strtoul(share, nullptr, 10), 100);
     }
     if (const char* affinity = env("PARAMESH_CFG_TASK_AFFINITY")) {
         s.affinity = std::string_view{affinity} != "0";
@@ -230,13 +235,11 @@ public:
 
         auto mem = mem_open(RegionConfig{kRegionMaxBytes}, *this);
         auto dir = home_open(s_.thrash);
-        auto store = store_open({}, *this);
-        if (!mem.ok() || !dir.ok() || !store.ok()) {
+        if (!mem.ok() || !dir.ok()) {
             return PM_ERR_PLATFORM;
         }
         mem_ = std::move(mem).value();
         dir_ = std::move(dir).value();
-        store_ = std::move(store).value();
 
         TransportConfig config;
         config.job = s_.job;
@@ -259,6 +262,16 @@ public:
                 return joined;
             }
         }
+        // The RAM cap from pmd, split between the local cache and the home store
+        // (mem.cache_share). Without pmd there is no cap.
+        const std::uint64_t cache_bytes = ram_ * s_.cache_share / 100;
+        auto store = store_open(StoreConfig{ram_ - cache_bytes, 0, s_.job}, *this);
+        auto cache = cache_open(cache_bytes);
+        if (!store.ok() || !cache.ok()) {
+            return PM_ERR_PLATFORM;
+        }
+        store_ = std::move(store).value();
+        cache_ = std::move(cache).value();
         for (const Member& member : s_.members) {
             if (member.node != s_.self && !net_->add_peer(member.node, member.at).ok()) {
                 return PM_ERR_CONFIG;
@@ -679,6 +692,7 @@ private:
             return PM_ERR_NETWORK;
         }
         quota_ = quota.value().threads;
+        ram_ = quota.value().ram_bytes;
 
         if (is_launcher()) {
             const auto bound = static_cast<std::uint16_t>(std::min<std::uint32_t>(threads, 65535));
@@ -860,6 +874,7 @@ private:
             case Opcode::kInvAck:
             // ... and to the node machine.
             case Opcode::kUpgradeGrant:
+            case Opcode::kWritebackAck:
             case Opcode::kInv:
             case Opcode::kFetch:
             case Opcode::kFetchInv: {
@@ -884,6 +899,9 @@ private:
                         break;
                     case Opcode::kUpgradeGrant:
                         node_event(NodeEventKind::kUpgradeGrant, page, header.req, {}, false);
+                        break;
+                    case Opcode::kWritebackAck:
+                        node_event(NodeEventKind::kWritebackAck, page, header.req, {}, false);
                         break;
                     case Opcode::kInv:
                         node_event(NodeEventKind::kInv, page, header.req, {}, false);
@@ -929,13 +947,16 @@ private:
                     locks->on_frame(header, payload);
                 }
                 return;
-            case Opcode::kFetchData: {
+            case Opcode::kFetchData:
+            case Opcode::kWriteback: {
                 const Result<PagePayload> page = wire_decode_page(payload, header.flags);
                 if (!page.ok() || page.value().data.size() != kPageSize) {
                     bad();
                     return;
                 }
-                home_event(HomeEventKind::kFetchData, header, page.value().page, page.value().data);
+                home_event(header.opcode == Opcode::kFetchData ? HomeEventKind::kFetchData
+                                                               : HomeEventKind::kWriteback,
+                           header, page.value().page, page.value().data);
                 return;
             }
             case Opcode::kReadData:
@@ -1028,14 +1049,53 @@ private:
             }
             return;
         }
+        // An event for a page that has one held back waits behind it, so that the node machine
+        // sees a page's events in the order they came.
+        const bool behind = std::any_of(held_.begin(), held_.end(),
+                                        [page](const Held& h) { return h.page == page; });
+        if (behind || !node_step(kind, page, req, data, zero)) {
+            held_.push_back(Held{kind, page, req, {data.begin(), data.end()}, zero});
+        }
+        if (depth_ == 0) {
+            release_held();
+        }
+    }
+
+    // The events held back, oldest first, for as long as the first can still not go ahead.
+    void release_held() noexcept {
+        while (!held_.empty() && !aborting_) {
+            Held next = std::move(held_.front());
+            held_.pop_front();
+            if (!node_step(next.kind, next.page, next.req, next.data, next.zero)) {
+                held_.push_front(std::move(next));
+                return;
+            }
+        }
+    }
+
+    // One event through the node machine. False if it would install a page and the local
+    // cache has no room until a page given up is discarded: nothing has been done then.
+    bool node_step(NodeEventKind kind, PageId page, ReqId req, std::span<const std::byte> data,
+                   bool zero) noexcept {
         NodeEvent event;
         event.kind = kind;
         event.page = page;
         event.req = req;
         event.fresh = fresh();
         const auto found = current_.find(page.value);
+        const PageState before = states_[page.value];
         const NodeStep step =
-            coh_step(states_[page.value], found == current_.end() ? kNoReq : found->second, event);
+            coh_step(before, found == current_.end() ? kNoReq : found->second, event);
+        const bool installs =
+            (before == PageState::kReadPending || before == PageState::kWritePending) &&
+            std::any_of(step.actions.begin(), step.actions.begin() + step.action_count,
+                        [](const NodeAction& a) {
+                            return a.kind == NodeActionKind::kInstallReadOnly ||
+                                   a.kind == NodeActionKind::kInstallWritable;
+                        });
+        if (installs && !make_room(page)) {
+            return false;
+        }
         states_[page.value] = step.state;
         if (step.current == kNoReq) {
             current_.erase(page.value);
@@ -1047,9 +1107,7 @@ private:
         for (std::size_t i = 0; i < step.action_count && ok; i++) {
             const NodeAction& a = step.actions.at(i);
             switch (a.kind) {
-                case NodeActionKind::kSend:
-                    post_page_id(home_of(page), a.opcode, page, a.req, ReplyTimer::kTimed);
-                    break;
+                case NodeActionKind::kSend:  // a request; WRITEBACK carries the page
                 case NodeActionKind::kReply: {
                     std::array<std::byte, 8 + kPageSize> buffer{};
                     put_u64(buffer, 0, page.value);
@@ -1058,7 +1116,8 @@ private:
                     }
                     post(home_of(page), a.opcode,
                          std::span{buffer}.first(a.with_page ? buffer.size() : 8), a.req,
-                         a.read_only ? kFlagReadOnly : std::uint16_t{0});
+                         a.read_only ? kFlagReadOnly : std::uint16_t{0},
+                         a.kind == NodeActionKind::kSend ? ReplyTimer::kTimed : ReplyTimer::kNone);
                     break;
                 }
                 case NodeActionKind::kInstallReadOnly:
@@ -1072,6 +1131,7 @@ private:
                                            ? PageProtection::kWritable
                                            : PageProtection::kReadOnly)
                              .ok();
+                    cache_->note_installed(page);
                     break;
                 }
                 case NodeActionKind::kWriteProtect:
@@ -1082,6 +1142,7 @@ private:
                     break;
                 case NodeActionKind::kDiscard:
                     ok = mem_->zap(page).ok();
+                    cache_->note_discarded(page);
                     break;
                 case NodeActionKind::kWake:
                     ok = mem_->wake(page).ok();
@@ -1094,6 +1155,41 @@ private:
             abort_job(Status::kInternal, s_.self,
                       "the node machine could not handle page " + std::to_string(page.value));
         }
+        return true;
+    }
+
+    // Makes room in the local cache for `page`, about to be installed, by giving up the
+    // oldest pages while the cache would pass its share of the RAM cap (M4-2). EVICT discards
+    // a shared copy and writes a modified one back, to be discarded on WRITEBACK_ACK; a page
+    // waiting for an upgrade is kept and queued again. False, with the page not counted, if
+    // the room is still taken by pages written back and not yet acknowledged.
+    bool make_room(PageId page) noexcept {
+        cache_->note_installed(page);
+        std::vector<PageId> kept;
+        depth_++;
+        while (!aborting_ && cache_->over_budget()) {
+            const std::optional<PageId> victim = cache_->next_victim();
+            if (!victim) {
+                break;
+            }
+            if (*victim == page) {
+                kept.push_back(page);
+                continue;
+            }
+            node_event(NodeEventKind::kEvict, *victim, kNoReq, {}, false);
+            if (states_[victim->value] == PageState::kUpgradePending) {
+                kept.push_back(*victim);
+            }
+        }
+        depth_--;
+        for (const PageId kept_page : kept) {
+            cache_->note_installed(kept_page);
+        }
+        if (cache_->full()) {
+            cache_->note_discarded(page);
+            return false;
+        }
+        return true;
     }
 
     // ---- the home machine
@@ -1211,6 +1307,7 @@ private:
     std::unique_ptr<MemoryEngine> mem_;
     HomeDirectoryPtr dir_;
     std::unique_ptr<HomeStore> store_;
+    std::unique_ptr<LocalCache> cache_;
     std::unique_ptr<Transport> net_;
     std::optional<Sync> sync_;
     std::optional<Tasks> tasks_;  // after what it uses, so it goes first
@@ -1218,6 +1315,7 @@ private:
     int pmd_fd_ = -1;          // the local socket to pmd, or -1 without pmd
     std::thread pmd_thread_;   // watch_pmd()
     std::uint32_t quota_ = 0;  // the thread quota pmd gave; 0 without pmd
+    std::uint64_t ram_ = 0;    // the RAM cap pmd gave; 0 without pmd
     std::size_t segments_ = 0;
     RegionAllocator allocator_{0};
 
@@ -1235,6 +1333,16 @@ private:
     std::unordered_map<std::uint64_t, ReqId> current_;
     std::deque<Local> local_;
     std::uint64_t pages_in_ = 0;
+    // Events held back until the local cache has room (M4-2), in the order they came.
+    struct Held {
+        NodeEventKind kind;
+        PageId page;
+        ReqId req;
+        std::vector<std::byte> data;
+        bool zero;
+    };
+    std::deque<Held> held_;
+    int depth_ = 0;  // make_room() calls running: held events wait until they end
     std::unordered_map<std::uint64_t, PageId> hold_timers_;  // by timer: the page it is for
     std::vector<HomeAction> actions_;
 
