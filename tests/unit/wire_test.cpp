@@ -436,9 +436,12 @@ TEST_CASE("the daemon payloads: SPAWN_REQ, SPAWN_OK, SPAWN_DECLINE, L_REGISTER a
     registered[4] = std::byte{3};  // neither launcher nor worker
     CHECK(paramesh::wire_decode_l_register(registered).error().code == Errc::kProtocol);
 
-    CHECK(encoded(paramesh::LQuotaPayload{3}) == hex("00 03 00 00"));
-    CHECK(paramesh::wire_decode_l_quota(hex("00 03 00 00")).value().threads == 3);
-    CHECK(paramesh::wire_decode_l_quota(hex("00 03")).error().code == Errc::kProtocol);
+    CHECK(encoded(paramesh::LQuotaPayload{3, 0x40000000}) ==
+          hex("00 03 00 00 00 00 00 00 40 00 00 00"));
+    const auto quota = paramesh::wire_decode_l_quota(hex("00 03 00 00 00 00 00 00 40 00 00 00"));
+    CHECK(quota.value().threads == 3);
+    CHECK(quota.value().ram_bytes == 0x40000000);
+    CHECK(paramesh::wire_decode_l_quota(hex("00 03 00 00")).error().code == Errc::kProtocol);
 }
 
 TEST_CASE("the launch payloads: L_RUN_REQ, L_RUN_OK, L_ADMIT_REQ and L_ADMIT_OK") {

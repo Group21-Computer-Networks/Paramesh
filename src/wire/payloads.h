@@ -213,9 +213,10 @@ struct LRegisterPayload {
     std::array<std::byte, 32> binary_hash{};
 };
 
-// L_QUOTA: the most worker threads that may run chunks.
+// L_QUOTA: the most worker threads that may run chunks, and the RAM the process may use.
 struct LQuotaPayload {
     std::uint16_t threads = 0;
+    std::uint64_t ram_bytes = 0;  // home store and local cache together; 0 for no cap
 };
 
 Result<std::size_t> wire_encode(const PageIdPayload& payload, std::span<std::byte> out);
