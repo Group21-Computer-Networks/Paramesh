@@ -719,7 +719,8 @@ public:
     virtual Result<StoreLookup> get(PageId page, PageBuffer out) = 0;
 
     // Keeps a copy of the bytes, replacing any earlier copy. Errc::kNoSpace when the RAM cap
-    // and the spill budget are both used up.
+    // and the spill budget are both used up. Errc::kState while a page is being written to
+    // the spill file to make room: put again after StoreEvents::on_spilled (added by M4-3).
     virtual Result<void> put(PageId page, PageView data) = 0;
 
     // Starts reading a spilled page back. StoreEvents::on_loaded follows.
@@ -736,6 +737,7 @@ struct StoreConfig {
     std::uint64_t ram_cap_bytes = 0;       // most page data to hold in RAM
     std::uint64_t spill_budget_bytes = 0;  // most to hold in the spill file; 0 for none
     JobId job;                             // names the spill file
+    std::string spill_dir;                 // where it is made; "/var/tmp" if empty (M4-3)
 };
 
 // `events` must outlive the store.

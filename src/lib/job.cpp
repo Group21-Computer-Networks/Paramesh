@@ -75,9 +75,10 @@ struct Settings {
     std::vector<Member> members;  // launcher first; slots in this order
     Nanos start_timeout = std::chrono::seconds{10};
     std::string pmd_socket;  // PARAMESH_PMD_SOCKET; empty when the job runs without pmd
-    LogLevel log_level = LogLevel::kWarn;  // log.level
-    bool affinity = true;                  // PARAMESH_CFG_TASK_AFFINITY=0 turns M3-3 off
-    std::uint64_t cache_share = 25;        // mem.cache_share: percent of the RAM cap
+    LogLevel log_level = LogLevel::kWarn;       // log.level
+    bool affinity = true;                       // PARAMESH_CFG_TASK_AFFINITY=0 turns M3-3 off
+    std::uint64_t cache_share = 25;             // mem.cache_share: percent of the RAM cap
+    std::optional<std::uint64_t> spill_budget;  // spill.budget, bytes; else the RAM cap
     // The hold window against thrashing (AT-1), with the plan's proposed defaults.
     // PARAMESH_CFG_THRASH_THRESHOLD sets the count; 0 turns the window off.
     HomeConfig thrash{8, std::chrono::milliseconds{100}, std::chrono::milliseconds{1},
@@ -149,6 +150,9 @@ bool read_settings(Settings& s) {
     }
     if (const char* share = env("PARAMESH_CFG_MEM_CACHE_SHARE")) {
         s.cache_share = std::min<std::uint64_t>(std::strtoul(share, nullptr, 10), 100);
+    }
+    if (const char* budget = env("PARAMESH_CFG_SPILL_BUDGET")) {
+        s.spill_budget = std::strtoull(budget, nullptr, 10);
     }
     if (const char* affinity = env("PARAMESH_CFG_TASK_AFFINITY")) {
         s.affinity = std::string_view{affinity} != "0";
@@ -265,7 +269,16 @@ public:
         // The RAM cap from pmd, split between the local cache and the home store
         // (mem.cache_share). Without pmd there is no cap.
         const std::uint64_t cache_bytes = ram_ * s_.cache_share / 100;
-        auto store = store_open(StoreConfig{ram_ - cache_bytes, 0, s_.job}, *this);
+        // The spill file (M4-3): spill.budget is the RAM cap unless set, so no cap, no file.
+        // It is made beside pmd's socket, in the daemon's state directory.
+        StoreConfig home;
+        home.ram_cap_bytes = ram_ - cache_bytes;
+        home.spill_budget_bytes = ram_ == 0 ? 0 : s_.spill_budget.value_or(ram_);
+        home.job = s_.job;
+        const char* tmp = env("TMPDIR");
+        home.spill_dir = !s_.pmd_socket.empty() ? s_.pmd_socket.substr(0, s_.pmd_socket.rfind('/'))
+                                                : std::string{tmp != nullptr ? tmp : ""};
+        auto store = store_open(home, *this);
         auto cache = cache_open(cache_bytes);
         if (!store.ok() || !cache.ok()) {
             return PM_ERR_PLATFORM;
@@ -490,9 +503,17 @@ public:
         run_on_network_thread();
     }
 
-    // ---- StoreEvents: nothing spills in M1 ----------------------------------------------------
-    void on_loaded(PageId /*page*/) noexcept override {}
-    void on_spilled(PageId /*page*/) noexcept override {}
+    // ---- StoreEvents: the store's I/O thread, or the network thread ----------------------------
+    void on_loaded(PageId page) noexcept override { store_told(page, true); }
+    void on_spilled(PageId page) noexcept override { store_told(page, false); }
+
+    void store_told(PageId page, bool loaded) noexcept {
+        {
+            const std::lock_guard<std::mutex> lock{mutex_};
+            store_notes_.push_back(StoreNote{page, loaded});
+        }
+        run_on_network_thread();
+    }
 
     // ---- NetHandler: network thread ------------------------------------------------------------
     void on_peer_joined(const JoinInfo& peer) noexcept override {
@@ -547,10 +568,24 @@ public:
         }
         std::deque<FaultEvent> faults;
         std::deque<Add> adds;
+        std::deque<StoreNote> notes;
         {
             const std::lock_guard<std::mutex> lock{mutex_};
             faults.swap(faults_);
             adds.swap(adds_);
+            notes.swap(store_notes_);
+        }
+        // What the store did on its own: the directory records where each page is, and
+        // whatever waited for the store goes on.
+        for (const StoreNote& note : notes) {
+            if (note.loaded) {
+                home_event(HomeEventKind::kLoaded, FrameHeader{}, note.page, {});
+            } else if (home_entry(*dir_, note.page).where == HomeWhere::kRam) {
+                home_set_where(*dir_, note.page, HomeWhere::kSpill);
+            }
+        }
+        if (!notes.empty()) {
+            resume_home();
         }
         for (const Add& add : adds) {
             std::array<std::byte, 24> payload{};
@@ -572,6 +607,10 @@ private:
         std::vector<std::byte> payload;
     };
     // One pm_atomic_add on its way from an application thread to the network thread.
+    struct StoreNote {
+        PageId page;
+        bool loaded;  // else spilled
+    };
     struct Add {
         ReqId req;
         AtomicOpPayload op;
@@ -1198,6 +1237,23 @@ private:
     void home_event(HomeEventKind kind, const FrameHeader& header, PageId page,
                     std::span<const std::byte> data, std::uint16_t offset_in_page = 0,
                     std::uint64_t operand = 0) noexcept {
+        // While the store keeps an action waiting, every later event waits behind it.
+        if (stalled_) {
+            home_parked_.push_back(HomeParked{
+                kind, header, page, {data.begin(), data.end()}, offset_in_page, operand});
+            return;
+        }
+        // The store says a page is in RAM. Only an entry waiting for that takes it as an event:
+        // otherwise this node asked on its own (see home_copy()), or the page was there already.
+        if (kind == HomeEventKind::kLoaded) {
+            const HomeEntryView entry = home_entry(*dir_, page);
+            if (entry.wait != HomeWait::kLoad) {
+                if (entry.where == HomeWhere::kSpill) {
+                    home_set_where(*dir_, page, HomeWhere::kRam);
+                }
+                return;
+            }
+        }
         HomeEvent event;
         event.kind = kind;
         event.page = page;
@@ -1209,78 +1265,145 @@ private:
         event.now = net_->now();
         actions_.clear();
         home_step(*dir_, event, actions_);
-        for (const HomeAction& a : actions_) {
+        run_home_actions(actions_, data, event.now);
+    }
+
+    // What became of one home action.
+    enum class Done : std::uint8_t {
+        kYes,
+        kWait,    // the store cannot yet: the action and the rest wait for its next word
+        kFailed,  // the job is ending
+    };
+
+    // The home copy of a page, from the store. A page in the spill file is asked for and
+    // the caller waits.
+    Done home_copy(PageId page, PageBuffer out) noexcept {
+        const Result<StoreLookup> got = store_->get(page, out);
+        if (got.ok() && got.value() == StoreLookup::kCopied) {
+            return Done::kYes;
+        }
+        if (got.ok() && got.value() == StoreLookup::kSpilled && store_->load(page).ok()) {
+            return Done::kWait;
+        }
+        abort_job(Status::kInternal, s_.self,
+                  "the home has no copy of page " + std::to_string(page.value));
+        return Done::kFailed;
+    }
+
+    // Keeps a page as the home copy. The store may be writing a page out to make room.
+    Done home_keep(PageId page, std::span<const std::byte> bytes) noexcept {
+        const Result<void> put = bytes.size() == kPageSize
+                                     ? store_->put(page, bytes.first<kPageSize>())
+                                     : Result<void>{Error{Errc::kInvalidArgument}};
+        if (put.ok()) {
+            return Done::kYes;
+        }
+        if (put.error().code == Errc::kState) {
+            return Done::kWait;
+        }
+        abort_job(Status::kInternal, s_.self, "the home store is full");
+        return Done::kFailed;
+    }
+
+    Done home_reply(const HomeAction& a, std::span<const std::byte> data) noexcept {
+        std::array<std::byte, 8 + kPageSize> buffer{};
+        put_u64(buffer, 0, a.page.value);
+        std::uint16_t flags = a.read_only ? kFlagReadOnly : std::uint16_t{0};
+        std::size_t size = buffer.size();
+        if (a.source == PageSource::kNone) {
+            size = 8;  // UPGRADE_GRANT: the page ID alone
+        } else if (a.source == PageSource::kZero) {
+            flags |= kFlagZeroPage;
+            size = 8;
+        } else if (a.source == PageSource::kReceived && data.size() == kPageSize) {
+            std::copy(data.begin(), data.end(), buffer.begin() + 8);
+        } else if (const Done copied = home_copy(a.page, std::span{buffer}.last<kPageSize>());
+                   copied != Done::kYes) {
+            return copied;
+        }
+        post(a.to, a.opcode, std::span{buffer}.first(size), a.req, flags);
+        return Done::kYes;
+    }
+
+    // Nothing is sent before the store has taken the sum, so the action can run again whole.
+    Done home_atomic(const HomeAction& a) noexcept {
+        // The number is in the program's own byte order, as its threads read it.
+        std::array<std::byte, kPageSize> copy{};  // zeros for a page never written
+        std::uint64_t number = 0;
+        std::byte* const at = copy.data() + a.offset_in_page;
+        if (a.offset_in_page > kPageSize - sizeof number) {
+            abort_job(Status::kInternal, s_.self,
+                      "the home has no copy of page " + std::to_string(a.page.value));
+            return Done::kFailed;
+        }
+        if (a.source != PageSource::kZero) {
+            if (const Done copied = home_copy(a.page, copy); copied != Done::kYes) {
+                return copied;
+            }
+        }
+        std::memcpy(&number, at, sizeof number);
+        const std::uint64_t sum = number + a.operand;  // modulo 2^64
+        std::memcpy(at, &sum, sizeof sum);
+        if (const Done kept = home_keep(a.page, copy); kept != Done::kYes) {
+            return kept;
+        }
+        std::array<std::byte, 16> result{};
+        static_cast<void>(wire_encode(
+            AtomicResultPayload{a.page.value * kPageSize + a.offset_in_page, number}, result));
+        post(a.to, Opcode::kAtomicResult, result, a.req);
+        return Done::kYes;
+    }
+
+    // The store has spoken: the waiting actions are tried again, then the events that came
+    // meanwhile, in order.
+    void resume_home() noexcept {
+        if (stalled_) {
+            const Stalled waiting = std::move(*stalled_);
+            stalled_.reset();
+            run_home_actions(waiting.actions, waiting.data, waiting.now);
+        }
+        while (!stalled_ && !aborting_ && !home_parked_.empty()) {
+            const HomeParked next = std::move(home_parked_.front());
+            home_parked_.pop_front();
+            home_event(next.kind, next.header, next.page, next.data, next.offset_in_page,
+                       next.operand);
+        }
+    }
+
+    // `data`: the page that came with the event; `now`: when the event came. An action the
+    // store cannot carry out yet waits, with those after it, for the store's next word (M4-3).
+    // ponytail: one waiting page holds back every home event of this node for one disk
+    // operation; a queue for each page if that shows in a measurement.
+    void run_home_actions(const std::vector<HomeAction>& actions, std::span<const std::byte> data,
+                          Nanos now) noexcept {
+        for (std::size_t i = 0; i < actions.size(); i++) {
+            const HomeAction& a = actions.at(i);
+            Done done = Done::kYes;
             switch (a.kind) {
                 case HomeActionKind::kSend:
                     post_page_id(a.to, a.opcode, a.page, fresh(), ReplyTimer::kTimed);
                     break;
-                case HomeActionKind::kReply: {
-                    std::array<std::byte, 8 + kPageSize> buffer{};
-                    put_u64(buffer, 0, a.page.value);
-                    std::uint16_t flags = a.read_only ? kFlagReadOnly : std::uint16_t{0};
-                    std::size_t size = buffer.size();
-                    if (a.source == PageSource::kNone) {
-                        size = 8;  // UPGRADE_GRANT: the page ID alone
-                    } else if (a.source == PageSource::kZero) {
-                        flags |= kFlagZeroPage;
-                        size = 8;
-                    } else if (a.source == PageSource::kReceived && data.size() == kPageSize) {
-                        std::copy(data.begin(), data.end(), buffer.begin() + 8);
-                    } else {
-                        const Result<StoreLookup> got =
-                            store_->get(a.page, std::span{buffer}.last<kPageSize>());
-                        if (!got.ok() || got.value() != StoreLookup::kCopied) {
-                            abort_job(
-                                Status::kInternal, s_.self,
-                                "the home has no copy of page " + std::to_string(a.page.value));
-                            return;
-                        }
-                    }
-                    post(a.to, a.opcode, std::span{buffer}.first(size), a.req, flags);
+                case HomeActionKind::kReply:
+                    done = home_reply(a, data);
                     break;
-                }
                 case HomeActionKind::kStore:
-                    if (data.size() != kPageSize ||
-                        !store_->put(a.page, data.first<kPageSize>()).ok()) {
-                        abort_job(Status::kInternal, s_.self, "the home store is full");
-                        return;
+                    done = home_keep(a.page, data);
+                    break;
+                case HomeActionKind::kLoad:
+                    if (!store_->load(a.page).ok()) {
+                        abort_job(Status::kInternal, s_.self,
+                                  "the home has no copy of page " + std::to_string(a.page.value));
+                        done = Done::kFailed;
                     }
                     break;
                 case HomeActionKind::kDropCopy:
                     store_->drop(a.page);
                     break;
-                case HomeActionKind::kApplyAtomic: {
-                    // The number is in the program's own byte order, as its threads read it.
-                    std::array<std::byte, kPageSize> copy{};  // zeros for a page never written
-                    std::uint64_t number = 0;
-                    std::byte* const at = copy.data() + a.offset_in_page;
-                    bool have = a.offset_in_page <= kPageSize - sizeof number;
-                    if (have && a.source != PageSource::kZero) {
-                        const Result<StoreLookup> got = store_->get(a.page, copy);
-                        have = got.ok() && got.value() == StoreLookup::kCopied;
-                    }
-                    if (!have) {
-                        abort_job(Status::kInternal, s_.self,
-                                  "the home has no copy of page " + std::to_string(a.page.value));
-                        return;
-                    }
-                    std::memcpy(&number, at, sizeof number);
-                    const std::uint64_t sum = number + a.operand;  // modulo 2^64
-                    std::memcpy(at, &sum, sizeof sum);
-                    if (!store_->put(a.page, copy).ok()) {
-                        abort_job(Status::kInternal, s_.self, "the home store is full");
-                        return;
-                    }
-                    std::array<std::byte, 16> result{};
-                    static_cast<void>(wire_encode(
-                        AtomicResultPayload{a.page.value * kPageSize + a.offset_in_page, number},
-                        result));
-                    post(a.to, Opcode::kAtomicResult, result, a.req);
+                case HomeActionKind::kApplyAtomic:
+                    done = home_atomic(a);
                     break;
-                }
                 case HomeActionKind::kArmHoldTimer:
-                    hold_timers_[net_->start_timer(std::max(a.at - event.now, Nanos{})).value] =
-                        a.page;
+                    hold_timers_[net_->start_timer(std::max(a.at - now, Nanos{})).value] = a.page;
                     break;
                 case HomeActionKind::kReportThrash:
                     platform_.logger->log(
@@ -1292,11 +1415,24 @@ private:
                 case HomeActionKind::kAbort:
                     abort_job(Status::kInternal, s_.self,
                               "the home machine met an impossible event");
-                    return;
-                default:  // load: M4
+                    done = Done::kFailed;
+                    break;
+                default:
                     abort_job(Status::kUnsupported, s_.self,
                               "a home action this build does not carry out yet");
-                    return;
+                    done = Done::kFailed;
+                    break;
+            }
+            if (done == Done::kWait) {
+                Stalled waiting;
+                waiting.actions.assign(actions.begin() + static_cast<std::ptrdiff_t>(i),
+                                       actions.end());
+                waiting.data.assign(data.begin(), data.end());
+                waiting.now = now;
+                stalled_ = std::move(waiting);
+            }
+            if (done != Done::kYes) {
+                return;
             }
         }
     }
@@ -1342,6 +1478,23 @@ private:
         bool zero;
     };
     std::deque<Held> held_;
+    // The same for the home side and its store (M4-3): the actions waiting for the store, and
+    // the events that came meanwhile.
+    struct Stalled {
+        std::vector<HomeAction> actions;
+        std::vector<std::byte> data;
+        Nanos now{};
+    };
+    struct HomeParked {
+        HomeEventKind kind;
+        FrameHeader header;
+        PageId page;
+        std::vector<std::byte> data;
+        std::uint16_t offset_in_page;
+        std::uint64_t operand;
+    };
+    std::optional<Stalled> stalled_;
+    std::deque<HomeParked> home_parked_;
     int depth_ = 0;  // make_room() calls running: held events wait until they end
     std::unordered_map<std::uint64_t, PageId> hold_timers_;  // by timer: the page it is for
     std::vector<HomeAction> actions_;
@@ -1357,6 +1510,7 @@ private:
     std::condition_variable changed_;
     std::deque<FaultEvent> faults_;
     std::deque<Add> adds_;
+    std::deque<StoreNote> store_notes_;
     std::set<std::pair<std::uint16_t, std::uint64_t>> task_seen_;  // (node, task) logged
     std::unordered_map<std::uint64_t, std::optional<std::uint64_t>> add_results_;
     std::string abort_message_;

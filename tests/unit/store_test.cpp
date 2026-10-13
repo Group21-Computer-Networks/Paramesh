@@ -8,7 +8,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <mutex>
 #include <vector>
 
 namespace {
@@ -25,6 +28,61 @@ public:
     void on_loaded(PageId /*page*/) noexcept override {}
     void on_spilled(PageId /*page*/) noexcept override {}
 };
+
+// Records what the store says it did, and waits for it.
+class Told final : public paramesh::StoreEvents {
+public:
+    void on_loaded(PageId page) noexcept override { add(loaded_, page); }
+    void on_spilled(PageId page) noexcept override { add(spilled_, page); }
+
+    // The pages spilled, or loaded, so far; waits until there are at least `count`.
+    std::vector<PageId> spilled(std::size_t count) { return wait(spilled_, count); }
+    std::vector<PageId> loaded(std::size_t count) { return wait(loaded_, count); }
+
+private:
+    void add(std::vector<PageId>& list, PageId page) noexcept {
+        {
+            const std::lock_guard<std::mutex> lock{mu_};
+            list.push_back(page);
+        }
+        changed_.notify_all();
+    }
+    std::vector<PageId> wait(const std::vector<PageId>& list, std::size_t count) {
+        std::unique_lock<std::mutex> lock{mu_};
+        changed_.wait_for(lock, std::chrono::seconds{10}, [&] { return list.size() >= count; });
+        return list;
+    }
+
+    std::mutex mu_;
+    std::condition_variable changed_;
+    std::vector<PageId> spilled_;
+    std::vector<PageId> loaded_;
+};
+
+// A store that may hold `ram_pages` in RAM and `spill_pages` in a spill file under /tmp.
+std::unique_ptr<paramesh::HomeStore> spilling_store(std::uint64_t ram_pages,
+                                                    std::uint64_t spill_pages, Told& told) {
+    paramesh::StoreConfig config;
+    config.ram_cap_bytes = ram_pages * paramesh::kPageSize;
+    config.spill_budget_bytes = spill_pages * paramesh::kPageSize;
+    config.job = paramesh::JobId{7};
+    config.spill_dir = "/tmp";
+    auto opened = paramesh::store_open(config, told);
+    REQUIRE(opened.ok());
+    return std::move(opened).value();
+}
+
+PageArray& out_of_use() {
+    static PageArray page{};
+    return page;
+}
+
+// A page whose every byte tells which page it is.
+PageArray filled(std::uint64_t n) {
+    PageArray page{};
+    page.fill(static_cast<std::byte>(n * 7 + 1));
+    return page;
+}
 
 constexpr std::size_t kSegments = 2048;  // a full 4 GiB region
 
@@ -74,6 +132,92 @@ TEST_CASE("the RAM store returns what was put, replaces, drops and honours its c
     CHECK(store.put(PageId{6}, ones).ok());
     CHECK(store.get(PageId{5}, out).value() == paramesh::StoreLookup::kAbsent);
     CHECK(store.load(PageId{4}).error().code == Errc::kUnsupported);
+}
+
+TEST_CASE("a full store spills the cold page, says so, and reads it back on load") {
+    Told told;
+    const auto store = spilling_store(2, 4, told);
+    PageArray out{};
+
+    REQUIRE(store->put(PageId{1}, filled(1)).ok());
+    REQUIRE(store->put(PageId{2}, filled(2)).ok());  // RAM is full: one page is spilled ahead
+    CHECK(told.spilled(1) == std::vector<PageId>{PageId{1}});  // CLOCK: the one put first
+    CHECK(store->ram_bytes() == paramesh::kPageSize);
+    CHECK(store->get(PageId{1}, out).value() == paramesh::StoreLookup::kSpilled);
+    CHECK(store->get(PageId{2}, out).value() == paramesh::StoreLookup::kCopied);
+    CHECK(out == filled(2));
+
+    REQUIRE(store->load(PageId{1}).ok());  // there is room: it comes back beside page 2
+    CHECK(told.loaded(1) == std::vector<PageId>{PageId{1}});
+    CHECK(store->get(PageId{1}, out).value() == paramesh::StoreLookup::kCopied);
+    CHECK(out == filled(1));
+    CHECK(store->ram_bytes() == 2 * paramesh::kPageSize);
+
+    // RAM is full and nothing is on its way out: a new page is told to wait, and is taken
+    // once a page has been spilled. The store never holds a third page in RAM.
+    CHECK(store->put(PageId{3}, filled(3)).error().code == Errc::kState);
+    CHECK(store->ram_bytes() == 2 * paramesh::kPageSize);
+    REQUIRE(told.spilled(2).size() == 2);
+    REQUIRE(store->put(PageId{3}, filled(3)).ok());
+    CHECK(store->ram_bytes() <= 2 * paramesh::kPageSize);
+
+    REQUIRE(store->load(PageId{2}).ok());  // already in RAM, or read back: either way it is told
+    REQUIRE(store->load(PageId{2}).ok());
+    CHECK_FALSE(told.loaded(2).empty());
+    CHECK(store->load(PageId{9}).error().code == Errc::kNotFound);
+}
+
+TEST_CASE("the store refuses a page only when RAM and the spill budget are both used up") {
+    Told told;
+    const auto store = spilling_store(1, 1, told);
+    REQUIRE(store->put(PageId{1}, filled(1)).ok());
+    REQUIRE(told.spilled(1).size() == 1);  // RAM empty, the file full
+    REQUIRE(store->put(PageId{2}, filled(2)).ok());
+    CHECK(store->put(PageId{3}, filled(3)).error().code == Errc::kNoSpace);
+    REQUIRE(store->put(PageId{2}, filled(4)).ok());  // replacing a page in RAM needs no room
+
+    store->drop(PageId{1});  // its place in the file is free again
+    CHECK(store->get(PageId{1}, out_of_use()).value() == paramesh::StoreLookup::kAbsent);
+    CHECK(store->put(PageId{3}, filled(3)).error().code == Errc::kState);
+    REQUIRE(told.spilled(2).size() == 2);
+    REQUIRE(store->put(PageId{3}, filled(3)).ok());
+}
+
+TEST_CASE("forty pages through four places in RAM: every page comes back as it was put") {
+    Told told;
+    constexpr std::uint64_t kPages = 40;
+    constexpr std::uint64_t kRam = 4;
+    const auto store = spilling_store(kRam, kPages, told);
+    std::size_t spills = 0;
+    for (std::uint64_t n = 0; n < kPages; n++) {
+        paramesh::Result<void> put = store->put(PageId{n}, filled(n));
+        while (!put.ok()) {
+            REQUIRE(put.error().code == Errc::kState);
+            spills++;  // wait for one more
+            REQUIRE(told.spilled(spills).size() >= spills);
+            put = store->put(PageId{n}, filled(n));
+        }
+        spills = told.spilled(0).size();
+        CHECK(store->ram_bytes() <= kRam * paramesh::kPageSize);
+    }
+    PageArray out{};
+    std::size_t loads = 0;
+    for (std::uint64_t round = 0; round < 2; round++) {
+        for (std::uint64_t n = 0; n < kPages; n++) {
+            const PageId page{round == 0 ? n : kPages - 1 - n};
+            paramesh::StoreLookup got = store->get(page, out).value();
+            if (got == paramesh::StoreLookup::kSpilled) {
+                loads = told.loaded(0).size();
+                REQUIRE(store->load(page).ok());  // RAM is full: a cold page takes its place
+                REQUIRE(told.loaded(loads + 1).size() > loads);
+                got = store->get(page, out).value();
+            }
+            REQUIRE(got == paramesh::StoreLookup::kCopied);
+            CHECK(out == filled(page.value));
+            CHECK(store->ram_bytes() <= kRam * paramesh::kPageSize);
+        }
+    }
+    CHECK(told.spilled(0).size() > kPages - kRam);  // loading spilled others
 }
 
 TEST_CASE("placement is the same on every node: it does not depend on the order of the members") {
