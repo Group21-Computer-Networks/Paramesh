@@ -1346,3 +1346,90 @@ TEST_CASE("one node alone refuses a region past 90% of its own RAM cap and spill
     CHECK(contents(said).find("the region needs 4 MB and the 1 node chosen gives 3 MB") !=
           std::string::npos);
 }
+
+// ---- the abort path (M4-6)
+// -----------------------------------------------------------------------
+
+namespace {
+
+// A job of three nodes whose chunks are running (each sleeps for ten minutes), started by
+// pmrun with its stderr kept, and one of its two workers.
+struct RunningJob {
+    ThreeNodes nodes;
+    std::string report = nodes.reports + "/program";
+    std::string said = nodes.reports + "/stderr";
+    pid_t pmrun = start_pmrun(
+        {"-n", "3", "--state-dir", nodes.one.state_dir, own_path(), "--as-program", report, "slow"},
+        said);
+    pid_t worker = 0;
+    std::string worker_node;  // its PARAMESH_NODE_ID
+
+    RunningJob() {
+        for (int tenths = 0; tenths < 1800 && contents(report + ".up").empty(); tenths++) {
+            ::usleep(100000);
+        }
+        REQUIRE_FALSE(contents(report + ".up").empty());
+        ::usleep(500000);  // the chunks are running
+        for (const auto& entry : std::filesystem::directory_iterator{"/proc"}) {
+            const std::string environment = contents(entry.path().string() + "/environ");
+            const auto id = environment.find("PARAMESH_NODE_ID=");
+            if (contents(entry.path().string() + "/cmdline").find(report) != std::string::npos &&
+                environment.find("PARAMESH_ROLE=worker") != std::string::npos &&
+                id != std::string::npos) {
+                worker = static_cast<pid_t>(std::stol(entry.path().filename().string()));
+                worker_node = environment.c_str() + id + 17;  // up to the entry's NUL
+            }
+        }
+        REQUIRE(worker > 0);
+    }
+
+    // Seconds until pmrun has ended, and its exit status.
+    [[nodiscard]] std::pair<double, int> ended() const {
+        const auto from = std::chrono::steady_clock::now();
+        const int status = exit_status(pmrun, 30);
+        return {std::chrono::duration<double>(std::chrono::steady_clock::now() - from).count(),
+                status};
+    }
+    [[nodiscard]] bool said_lost() const {
+        return contents(said).find(" aborted: node " + worker_node + " lost\n") !=
+               std::string::npos;
+    }
+    // True once no process of the job is left, within ten seconds.
+    [[nodiscard]] bool all_gone() const {
+        for (int tenths = 0; tenths < 100 && processes_naming(report) != 0; tenths++) {
+            ::usleep(100000);
+        }
+        return processes_naming(report) == 0;
+    }
+};
+
+}  // namespace
+
+TEST_CASE("killing a node mid-run ends the job everywhere within 3 s, naming the node" *
+          doctest::skip(!region_can_be_mapped())) {
+    const RunningJob job;
+    REQUIRE(::kill(job.worker, SIGKILL) == 0);
+    const auto [seconds, status] = job.ended();
+    MESSAGE("the job ended " << seconds << " s after node " << job.worker_node << " was killed");
+    CHECK(status == 1);
+    CHECK(seconds < 3.0);
+    CHECK(job.said_lost());  // "job N aborted: node K lost"
+    CHECK(job.all_gone());   // the other worker too: nothing hangs
+    CHECK(contents(job.report).empty());
+}
+
+TEST_CASE("a node that goes silent ends the job after 3 s without a heartbeat" *
+          doctest::skip(!region_can_be_mapped())) {
+    const RunningJob job;
+    REQUIRE(::kill(job.worker, SIGSTOP) == 0);  // alive, connected, and saying nothing
+    const auto [seconds, status] = job.ended();
+    MESSAGE("the job ended " << seconds << " s after node " << job.worker_node << " went silent");
+    CHECK(status == 1);
+    // The 3 s run from the node's last frame, which may be a heartbeat sent up to 1 s before
+    // it was stopped: so about 2 s at the least, and never at once as for a closed connection.
+    CHECK(seconds >= 1.9);
+    CHECK(seconds < 5.0);
+    CHECK(job.said_lost());
+    REQUIRE(::kill(job.worker, SIGKILL) == 0);  // the silent one itself cannot be told
+    CHECK(job.all_gone());
+}
