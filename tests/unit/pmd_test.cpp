@@ -486,6 +486,8 @@ struct ThreeNodes {
 
 constexpr std::uint64_t kSquares = 64ULL * 512;        // 64 pages of numbers
 constexpr std::uint64_t kManySquares = 2048ULL * 512;  // 2,048 pages: 8 MB
+constexpr std::uint64_t kHugeRegion = 48ULL << 20U;    // twice three RAM caps of 8 MB
+constexpr std::uint64_t kHugeSquares = (kHugeRegion - (64ULL << 10U)) / 8;  // nearly all of it
 
 struct SquareArgs {
     std::uint64_t* squares;
@@ -507,6 +509,26 @@ int processes_naming(const std::string& marker) {
         found += line.find(marker) != std::string::npos ? 1 : 0;
     }
     return found;
+}
+
+// The size of the largest spill file that a process naming `marker` has open now. The file
+// has no name any more, but the process's descriptor still leads to it.
+std::uint64_t spill_file_bytes(const std::string& marker) {
+    std::uint64_t most = 0;
+    std::error_code ignored;
+    for (const auto& entry : std::filesystem::directory_iterator{"/proc"}) {
+        if (contents(entry.path().string() + "/cmdline").find(marker) == std::string::npos) {
+            continue;
+        }
+        for (const auto& fd : std::filesystem::directory_iterator{entry.path() / "fd", ignored}) {
+            const std::string target = std::filesystem::read_symlink(fd.path(), ignored).string();
+            if (target.find("/paramesh-spill-") != std::string::npos) {
+                most =
+                    std::max<std::uint64_t>(most, std::filesystem::file_size(fd.path(), ignored));
+            }
+        }
+    }
+    return most;
 }
 
 // The most kilobytes of the shared region that any process naming `marker` has in RAM now:
@@ -566,9 +588,14 @@ namespace {
 // number of the step that failed.
 int program(const std::string& report, std::string_view mode) {
     const bool slow = mode == "slow";
-    const bool big = mode == "big";  // squares over many more pages than a node may cache
-    const std::uint64_t count = big ? kManySquares : kSquares;
-    const pm_config config{.region_bytes = (big ? 12ULL : 4ULL) << 20U, .threads_per_node = 0};
+    const bool big = mode == "big";    // squares over many more pages than a node may cache
+    const bool huge = mode == "huge";  // and over more than the nodes' home stores hold in RAM
+    std::uint64_t count = kSquares;
+    if (big || huge) {
+        count = huge ? kHugeSquares : kManySquares;
+    }
+    const pm_config config{.region_bytes = huge ? kHugeRegion : (big ? 12ULL : 4ULL) << 20U,
+                           .threads_per_node = 0};
     if (pm_init(nullptr, nullptr, &config) != PM_OK) {
         return 30;
     }
@@ -583,8 +610,8 @@ int program(const std::string& report, std::string_view mode) {
         return 31;
     }
     write_report(report + ".up", "pid=" + std::to_string(::getpid()) + "\n");
-    if (pm_parallel_for_data("pmd_test_square", 0, count, 512, &args, sizeof args, args.squares,
-                             sizeof(std::uint64_t)) != PM_OK ||
+    if (pm_parallel_for_data("pmd_test_square", 0, count, huge ? 4096 : 512, &args, sizeof args,
+                             args.squares, sizeof(std::uint64_t)) != PM_OK ||
         pm_wait_all() != PM_OK) {
         return 32;
     }
@@ -886,6 +913,46 @@ TEST_CASE("with --cap-ram, no process maps more of the region than its cache's s
     MESSAGE("most of the region one process held: " << most_kb << " KB");
     CHECK(most_kb > 0);
     CHECK(most_kb <= 4096);
+}
+
+TEST_CASE("a job whose region is twice the RAM caps completes with the right answer" *
+          doctest::skip(!region_can_be_mapped())) {
+    // Three nodes of 8 MB each and a region of 48 MB, nearly all of it written from the three
+    // nodes and read back by the launcher. A node's home store holds 6 MB in RAM; the rest of
+    // what it is home for goes to its spill file, which spill.budget lets reach 16 MB here
+    // (the default, equal to --cap-ram, cannot hold a region of twice the caps).
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): no other thread of this process is running
+    ::setenv("PARAMESH_CFG_SPILL_BUDGET", "16777216", 1);
+    std::uint64_t most_spilled = 0;
+    int status = -1;
+    std::string said;
+    {
+        const ThreeNodes nodes{[](paramesh::PmdConfig& c) { c.cap_ram = 8ULL << 20U; }};
+        const std::string report = nodes.reports + "/program";
+        const pid_t pmrun = start_pmrun({"-n", "3", "--state-dir", nodes.one.state_dir, own_path(),
+                                         "--as-program", report, "huge"});
+        for (int tenths = 0; tenths < 3000 && status < 0; tenths++) {
+            most_spilled = std::max(most_spilled, spill_file_bytes(report));
+            int raw = 0;
+            if (::waitpid(pmrun, &raw, WNOHANG) == pmrun) {
+                status = WIFEXITED(raw) ? WEXITSTATUS(raw) : 128 + WTERMSIG(raw);
+            }
+            ::usleep(100000);
+        }
+        if (status < 0) {
+            ::kill(pmrun, SIGKILL);
+            ::waitpid(pmrun, nullptr, 0);
+        }
+        said = contents(report);
+    }
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): as above
+    ::unsetenv("PARAMESH_CFG_SPILL_BUDGET");
+    REQUIRE(status == 0);
+    CHECK(field(said, "wrong") == "0");
+    CHECK(field(said, "indexes") == std::to_string(kHugeSquares));
+    MESSAGE("the largest spill file seen: " << most_spilled / 1024 << " KB");
+    CHECK(most_spilled > 0);              // pages did go to disk
+    CHECK(most_spilled <= 16ULL << 20U);  // and no file passed its budget
 }
 
 TEST_CASE("Ctrl+C on pmrun ends a running ParaMesh job on every node" *
