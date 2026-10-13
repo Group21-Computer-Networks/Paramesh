@@ -759,8 +759,13 @@ public:
     virtual void note_installed(PageId page) = 0;
     virtual void note_discarded(PageId page) = 0;
 
-    // True while more pages are mapped than the budget allows.
+    // True while more pages are mapped than the budget allows, not counting the pages offered
+    // as victims that are still mapped (a modified page waits for WRITEBACK_ACK).
     [[nodiscard]] virtual bool over_budget() const noexcept = 0;
+
+    // True while more pages are mapped than the budget allows, counting those as well: a page
+    // about to be installed then waits until one of them is discarded (added by M4-2).
+    [[nodiscard]] virtual bool full() const noexcept = 0;
 
     // The page mapped longest that has not been offered since it was last installed, or none.
     // The caller raises EVICT for it; if the node machine does not free it (a page in flight),

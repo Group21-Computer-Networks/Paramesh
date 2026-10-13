@@ -1,6 +1,7 @@
 // src/store/: the RAM home store against its contract, and home placement.
 
 #include "store/home_store.h"
+#include "store/local_cache.h"
 #include "store/placement.h"
 
 #include <doctest/doctest.h>
@@ -113,4 +114,56 @@ TEST_CASE(
     std::vector<Slot> none(4);
     const std::vector<PlacementMember> no_ram = {{NodeId{3}, Slot{0}, 0}};
     CHECK(paramesh::store_place_segments(no_ram, none).error().code == Errc::kInvalidArgument);
+}
+
+TEST_CASE(
+    "the local cache gives up pages oldest first, skips discarded ones, and re-queues kept ones") {
+    auto opened = paramesh::cache_open(2 * paramesh::kPageSize);
+    REQUIRE(opened.ok());
+    paramesh::LocalCache& cache = *opened.value();
+    const auto page = [](std::uint64_t n) { return paramesh::PageId{n}; };
+
+    cache.note_installed(page(1));
+    cache.note_installed(page(2));
+    CHECK_FALSE(cache.over_budget());
+    cache.note_installed(page(3));
+    CHECK(cache.over_budget());
+    CHECK(cache.full());
+    CHECK(cache.next_victim() == page(1));  // the oldest
+    CHECK_FALSE(cache.over_budget());       // an offered page no longer counts here ...
+    CHECK(cache.full());                    // ... but does here, until it is discarded
+
+    cache.note_discarded(page(2));  // gone some other way (an INV)
+    cache.note_installed(page(4));
+    cache.note_installed(page(5));
+    CHECK(cache.over_budget());
+    CHECK(cache.next_victim() == page(3));  // 2 is skipped
+    cache.note_installed(page(3));          // the node machine kept 3: it goes to the back
+    CHECK(cache.over_budget());
+    CHECK(cache.next_victim() == page(4));
+    CHECK(cache.next_victim() == page(5));
+    CHECK(cache.next_victim() == page(3));
+    CHECK(cache.next_victim() == std::nullopt);
+
+    CHECK(cache.full());
+    cache.note_discarded(page(1));  // 1's WRITEBACK_ACK came
+    CHECK(cache.full());            // 3, 4 and 5 are still mapped
+    cache.note_discarded(page(3));
+    cache.note_discarded(page(4));
+    cache.note_discarded(page(5));
+    cache.note_installed(page(1));
+    CHECK(cache.next_victim() == page(1));  // installed again: offered again
+
+    auto unlimited = paramesh::cache_open(0);  // no cap
+    for (std::uint64_t n = 0; n < 1000; n++) {
+        unlimited.value()->note_installed(page(n));
+    }
+    CHECK_FALSE(unlimited.value()->over_budget());
+    CHECK_FALSE(unlimited.value()->full());
+
+    auto tiny = paramesh::cache_open(1024);  // less than a page: one page, not "no cap"
+    tiny.value()->note_installed(page(1));
+    CHECK_FALSE(tiny.value()->full());
+    tiny.value()->note_installed(page(2));
+    CHECK(tiny.value()->full());
 }

@@ -142,6 +142,7 @@ public:
     [[nodiscard]] bool over_budget() const noexcept override {
         return order_.size() > budget_pages_;
     }
+    [[nodiscard]] bool full() const noexcept override { return order_.size() > budget_pages_; }
     std::optional<PageId> next_victim() override {
         if (order_.empty()) {
             return std::nullopt;
