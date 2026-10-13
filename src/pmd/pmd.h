@@ -7,6 +7,8 @@
 // the next peer for each that declines, and answers with the members (L_ADMIT_OK). If pmrun
 // goes away while the job runs, the launcher is told to end it (L_ABORT).
 // Every job process that registers on the local socket is told its thread quota.
+// Discovery (M4-1): a HELLO every second on UDP multicast, and to every seed in --peers; the
+// peers heard are kept in a PeerTable and served as JSON at GET /v1/peers on 127.0.0.1.
 //
 // One thread runs everything (run()). Exceptions are allowed here and are caught where the
 // thread starts, in main.cpp.
@@ -17,6 +19,7 @@
 #include "platform/factory.h"
 #include "platform/ids.h"
 #include "platform/result.h"
+#include "pmd/peers.h"
 #include "wire/frame.h"
 #include "wire/payloads.h"
 
@@ -25,6 +28,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -33,14 +38,24 @@
 
 namespace paramesh {
 
+inline constexpr std::uint16_t kDiscoveryPort = 47000;
 inline constexpr std::uint16_t kControlPort = 47001;
+inline constexpr std::uint16_t kHttpPort = 47002;
+inline constexpr std::uint32_t kDiscoveryGroup = 0xEF4D4D4D;  // 239.77.77.77
 
 struct PmdConfig {
-    NodeId node;                                // --node-id, 1 to 65534; required until M4-1
-    std::uint16_t control_port = kControlPort;  // --control-port; 0 lets the system choose
-    std::string state_dir;                      // --state-dir; pmd.sock is made in it
-    std::uint16_t cap_cores = 0;                // --cap-cores: the thread quota of every job
-    std::vector<Endpoint> peers;                // --peers address[:port],...
+    NodeId node;  // --node-id, 1 to 65534; without it, the ID saved in the state directory
+    std::uint16_t control_port = kControlPort;      // --control-port; 0 lets the system choose
+    std::uint16_t discovery_port = kDiscoveryPort;  // --discovery-port; the same on every node
+    std::uint16_t http_port = kHttpPort;            // --http-port; 0 lets the system choose
+    bool multicast = true;                          // --no-multicast: seeds only
+    std::string iface;            // --iface: the one interface for multicast; else every one
+    std::string state_dir;        // --state-dir; pmd.sock and node_id are kept in it
+    std::uint16_t cap_cores = 0;  // --cap-cores: the thread quota of every job
+    // --peers address[:control_port[:discovery_port]],...: the seed list. A daemon sends its
+    // HELLO to each seed too, and asks them for workers (M3-5).
+    std::vector<Endpoint> peers;
+    std::vector<std::uint16_t> peer_discovery_ports;  // one for each of peers
 };
 
 // Reads the command line, without the program name. Missing settings get their defaults:
@@ -63,6 +78,9 @@ public:
     // Makes the state directory and the local socket and starts listening on both channels.
     Result<void> open();
     [[nodiscard]] std::uint16_t control_port() const noexcept { return config_.control_port; }
+    [[nodiscard]] std::uint16_t discovery_port() const noexcept { return config_.discovery_port; }
+    [[nodiscard]] std::uint16_t http_port() const noexcept { return config_.http_port; }
+    [[nodiscard]] NodeId node() const noexcept { return config_.node; }
     [[nodiscard]] const std::string& socket_path() const noexcept { return socket_path_; }
 
     // Serves until stop(). stop() may be called from any thread and from a signal handler.
@@ -117,6 +135,15 @@ private:
     std::uint32_t next_job_number();
     Run* run_of(JobId job);
 
+    Result<void> open_discovery();
+    void beacon(Nanos now);
+    void hear();
+    void say_bye();
+    void announce(Opcode opcode, std::span<const std::byte> payload);
+    void send_datagram(Opcode opcode, std::span<const std::byte> payload, std::uint32_t ipv4,
+                       std::uint16_t port);
+    std::string peers_json();
+
     void accept_on(int listener, bool local);
     bool read_from(Connection& connection);
     void handle(Connection& connection, const FrameHeader& header,
@@ -144,6 +171,14 @@ private:
     std::vector<Run> runs_;
     std::unordered_map<std::uint64_t, Ask> asks_;  // by the SPAWN_REQ's request number
     std::uint64_t next_req_ = 1;
+    // Discovery.
+    int discovery_ = -1;                     // the UDP socket
+    std::vector<std::uint32_t> interfaces_;  // IPv4 of each interface multicast goes out on
+    std::uint32_t instance_ = 0;
+    Nanos last_beacon_{};
+    std::mutex peers_mu_;               // the table is read by the HTTP thread too
+    std::vector<Peer> clashes_;         // beacons that claimed a node ID another daemon has
+    std::unique_ptr<PeerTable> table_;  // made by open(), once the node ID is known
 };
 
 }  // namespace paramesh

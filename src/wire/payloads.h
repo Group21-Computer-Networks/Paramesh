@@ -113,6 +113,37 @@ struct TaskDonePayload {
     std::uint16_t thread = 0;
 };
 
+// One raw ledger total in HELLO: the sender's own counts with one peer (M5 fills them).
+struct LedgerTotal {
+    NodeId peer;
+    std::uint64_t chunks_for_peer = 0;
+    std::uint64_t chunks_by_peer = 0;
+    std::uint64_t segsec_for_peer = 0;
+    std::uint64_t segsec_by_peer = 0;
+};
+
+inline constexpr std::uint16_t kHelloLeaving = 0x0001;
+
+// HELLO: a pmd's beacon, every second. Its address is the datagram's source address.
+struct HelloPayload {
+    std::uint32_t instance = 0;  // random, chosen at each start
+    std::uint16_t control_port = 0;
+    std::uint16_t flags = 0;
+    std::uint64_t cap_ram = 0;
+    std::uint64_t free_ram = 0;
+    std::uint64_t spill_budget = 0;
+    std::uint64_t free_spill = 0;
+    std::uint16_t cap_cores = 0;
+    std::uint16_t free_cores = 0;
+    std::uint16_t jobs = 0;
+    std::vector<LedgerTotal> totals;  // 0 to 7
+};
+
+// BYE: a pmd leaves the pool.
+struct ByePayload {
+    std::uint32_t instance = 0;
+};
+
 // SPAWN_REQ: a launcher's pmd asks a peer's pmd to start one worker process.
 struct SpawnReqPayload {
     NodeId launcher_node;
@@ -201,6 +232,8 @@ Result<std::size_t> wire_encode(const TaskAssignPayload& payload, std::span<std:
 Result<std::size_t> wire_encode(const NoTaskPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const TaskDonePayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const SpawnReqPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const HelloPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const ByePayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const SpawnOkPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const SpawnDeclinePayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const LRegisterPayload& payload, std::span<std::byte> out);
@@ -225,6 +258,8 @@ Result<TaskAssignPayload> wire_decode_task_assign(std::span<const std::byte> in)
 Result<NoTaskPayload> wire_decode_no_task(std::span<const std::byte> in);
 Result<TaskDonePayload> wire_decode_task_done(std::span<const std::byte> in);
 Result<SpawnReqPayload> wire_decode_spawn_req(std::span<const std::byte> in);
+Result<HelloPayload> wire_decode_hello(std::span<const std::byte> in);
+Result<ByePayload> wire_decode_bye(std::span<const std::byte> in);
 Result<SpawnOkPayload> wire_decode_spawn_ok(std::span<const std::byte> in);
 Result<SpawnDeclinePayload> wire_decode_spawn_decline(std::span<const std::byte> in);
 Result<LRegisterPayload> wire_decode_l_register(std::span<const std::byte> in);

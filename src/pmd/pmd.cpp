@@ -3,6 +3,8 @@
 #include "net/frame_io.h"
 
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/eventfd.h>
@@ -21,6 +23,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <random>
 #include <thread>
 
 // POSIX leaves the declaration to the program.
@@ -49,18 +52,25 @@ bool to_u16(std::string_view text, std::uint16_t lowest, std::uint16_t& out) {
     return true;
 }
 
-// "10.0.0.2" or "10.0.0.2:47002".
-bool to_peer(std::string_view text, Endpoint& out) {
+// "10.0.0.2", "10.0.0.2:47005" or "10.0.0.2:47005:47004": the address, its control port and
+// its discovery port.
+bool to_peer(std::string_view text, Endpoint& out, std::uint16_t& discovery) {
     const auto colon = text.find(':');
     const std::string address{text.substr(0, colon)};
     in_addr parsed{};
     out.port = kControlPort;
-    if (::inet_pton(AF_INET, address.c_str(), &parsed) != 1 ||
-        (colon != std::string_view::npos && !to_u16(text.substr(colon + 1), 1, out.port))) {
+    discovery = kDiscoveryPort;
+    if (::inet_pton(AF_INET, address.c_str(), &parsed) != 1) {
         return false;
     }
     out.ipv4 = ntohl(parsed.s_addr);
-    return true;
+    if (colon == std::string_view::npos) {
+        return true;
+    }
+    const std::string_view ports = text.substr(colon + 1);
+    const auto second = ports.find(':');
+    return to_u16(ports.substr(0, second), 1, out.port) &&
+           (second == std::string_view::npos || to_u16(ports.substr(second + 1), 1, discovery));
 }
 
 std::string dotted(std::uint32_t ipv4) {
@@ -74,54 +84,96 @@ std::string dotted(std::uint32_t ipv4) {
 }  // namespace
 
 std::string_view pmd_usage() noexcept {
-    return "usage: pmd --node-id N [--cap-cores N] [--peers address[:port],...]\n"
-           "           [--control-port N] [--state-dir DIRECTORY]\n"
-           "  --node-id       this node's ID, 1 to 65534\n"
+    return "usage: pmd [--node-id N] [--cap-cores N] [--peers address[:port[:port]],...]\n"
+           "           [--state-dir DIRECTORY] [--iface NAME] [--no-multicast]\n"
+           "           [--control-port N] [--discovery-port N] [--http-port N]\n"
+           "  --node-id       this node's ID, 1 to 65534 (default: a random ID, made on the first\n"
+           "                  run and kept in the state directory)\n"
            "  --cap-cores     the most worker threads a job may run here (default: all "
            "processors)\n"
-           "  --peers         the daemons of the other nodes; the port defaults to 47001\n"
+           "  --peers         seeds: daemons to send beacons to and ask for workers; the ports\n"
+           "                  default to 47001 (control) and 47000 (discovery)\n"
+           "  --state-dir     where pmd.sock and node_id are kept (default "
+           "~/.local/state/paramesh)\n"
+           "  --iface         the one interface for multicast (default: every one that can)\n"
+           "  --no-multicast  send beacons to the seeds only\n"
            "  --control-port  the TCP port for other daemons (default 47001)\n"
-           "  --state-dir     where pmd.sock is made (default ~/.local/state/paramesh)\n";
+           "  --discovery-port the UDP port for beacons, the same on every node (default 47000)\n"
+           "  --http-port     the status API on 127.0.0.1 (default 47002)\n";
 }
 
+namespace {
+
+// --peers: entries separated by commas.
+bool to_peers(std::string_view value, PmdConfig& config) {
+    for (std::string_view rest = value; !rest.empty();) {
+        const auto comma = rest.find(',');
+        Endpoint peer;
+        std::uint16_t discovery = 0;
+        if (!to_peer(rest.substr(0, comma), peer, discovery)) {
+            return false;
+        }
+        config.peers.push_back(peer);
+        config.peer_discovery_ports.push_back(discovery);
+        rest.remove_prefix(comma == std::string_view::npos ? rest.size() : comma + 1);
+    }
+    return true;
+}
+
+// The flags that take a 16-bit number: where it goes, its least value, and what to say.
+struct NumberFlag {
+    std::string_view name;
+    std::uint16_t PmdConfig::*field;
+    std::uint16_t lowest;
+    const char* wrong;
+};
+
+}  // namespace
+
 Result<PmdConfig> pmd_parse_args(std::span<const std::string_view> args) {
+    static constexpr std::array kNumbers{
+        NumberFlag{"--cap-cores", &PmdConfig::cap_cores, 1, "--cap-cores must be 1 to 65535"},
+        NumberFlag{"--control-port", &PmdConfig::control_port, 0,
+                   "--control-port must be 0 to 65535"},
+        NumberFlag{"--discovery-port", &PmdConfig::discovery_port, 0,
+                   "--discovery-port must be 0 to 65535"},
+        NumberFlag{"--http-port", &PmdConfig::http_port, 0, "--http-port must be 0 to 65535"},
+    };
     PmdConfig config;
     for (std::size_t i = 0; i < args.size(); i += 2) {
+        const std::string_view flag = args[i];
+        if (flag == "--no-multicast") {  // the one flag with no value
+            config.multicast = false;
+            i--;
+            continue;
+        }
         if (i + 1 == args.size()) {
             return bad_flag("the last flag has no value");
         }
-        const std::string_view flag = args[i];
         const std::string_view value = args[i + 1];
-        if (flag == "--node-id") {
+        const auto* number = std::find_if(kNumbers.begin(), kNumbers.end(),
+                                          [flag](const NumberFlag& n) { return n.name == flag; });
+        if (number != kNumbers.end()) {
+            if (!to_u16(value, number->lowest, config.*(number->field))) {
+                return bad_flag(number->wrong);
+            }
+        } else if (flag == "--node-id") {
             if (!to_u16(value, 1, config.node.value) || config.node == kAllNodes) {
                 return bad_flag("--node-id must be 1 to 65534");
             }
-        } else if (flag == "--cap-cores") {
-            if (!to_u16(value, 1, config.cap_cores)) {
-                return bad_flag("--cap-cores must be 1 to 65535");
-            }
-        } else if (flag == "--control-port") {
-            if (!to_u16(value, 0, config.control_port)) {
-                return bad_flag("--control-port must be 0 to 65535");
-            }
+        } else if (flag == "--iface") {
+            config.iface = value;
         } else if (flag == "--state-dir") {
             config.state_dir = value;
         } else if (flag == "--peers") {
-            for (std::string_view rest = value; !rest.empty();) {
-                const auto comma = rest.find(',');
-                Endpoint peer;
-                if (!to_peer(rest.substr(0, comma), peer)) {
-                    return bad_flag("--peers must be address[:port], separated by commas");
-                }
-                config.peers.push_back(peer);
-                rest.remove_prefix(comma == std::string_view::npos ? rest.size() : comma + 1);
+            if (!to_peers(value, config)) {
+                return bad_flag(
+                    "--peers must be address[:control port[:discovery port]], separated by "
+                    "commas");
             }
         } else {
             return bad_flag("a flag pmd does not know");
         }
-    }
-    if (config.node == kNoNode) {
-        return bad_flag("--node-id is required");
     }
     if (config.state_dir.empty()) {
         const char* home = std::getenv("HOME");  // NOLINT(concurrency-mt-unsafe): at start-up
@@ -141,7 +193,8 @@ Pmd::~Pmd() {
     for (const Connection& connection : connections_) {
         ::close(connection.fd);
     }
-    for (const int fd : {control_listener_, local_listener_, stop_fd_}) {
+    platform_.http->stop();
+    for (const int fd : {control_listener_, local_listener_, stop_fd_, discovery_}) {
         if (fd >= 0) {
             ::close(fd);
         }
@@ -154,6 +207,20 @@ Pmd::~Pmd() {
 Result<void> Pmd::open() {
     std::error_code failed;
     std::filesystem::create_directories(config_.state_dir, failed);
+    // The node ID: the flag's, or the one made on the first run and kept here.
+    std::random_device random;
+    if (!failed && config_.node == kNoNode) {
+        const std::string saved = config_.state_dir + "/node_id";
+        unsigned id = 0;
+        std::ifstream{saved} >> id;
+        if (id == 0 || id >= kAllNodes.value) {
+            id = std::uniform_int_distribution<unsigned>{1, kAllNodes.value - 1U}(random);
+            std::ofstream{saved, std::ios::trunc} << id << '\n';
+        }
+        config_.node = NodeId{static_cast<std::uint16_t>(id)};
+    }
+    instance_ = static_cast<std::uint32_t>(random());
+    table_ = std::make_unique<PeerTable>(config_.node, instance_);
     socket_path_ = config_.state_dir + "/pmd.sock";
     sockaddr_un local{};
     local.sun_family = AF_UNIX;
@@ -198,10 +265,24 @@ Result<void> Pmd::open() {
     if (stop_fd_ < 0) {
         return Error{Errc::kIo, errno, "create the stop eventfd"};
     }
+    if (const Result<void> discovery = open_discovery(); !discovery.ok()) {
+        return discovery;
+    }
+    platform_.http->get("/v1/peers", [this](std::string_view /*path*/) {
+        return HttpResponse{200, "application/json", peers_json()};
+    });
+    const Result<std::uint16_t> http = platform_.http->start("127.0.0.1", config_.http_port);
+    if (!http.ok()) {
+        return Error{Errc::kIo, http.error().os_error, "serve the status API on 127.0.0.1"};
+    }
+    config_.http_port = http.value();
     platform_.logger->log(
         LogLevel::kInfo, "pmd_start",
         JsonObject{{"control_port", JsonValue{std::int64_t{config_.control_port}}},
                    {"socket", JsonValue{socket_path_}},
+                   {"node", JsonValue{std::int64_t{config_.node.value}}},
+                   {"discovery_port", JsonValue{std::int64_t{config_.discovery_port}}},
+                   {"http_port", JsonValue{std::int64_t{config_.http_port}}},
                    {"cap_cores", JsonValue{std::int64_t{config_.cap_cores}}}});
     return {};
 }
@@ -214,8 +295,10 @@ void Pmd::stop() const noexcept {
 
 void Pmd::run() {
     for (;;) {
-        std::vector<pollfd> fds{
-            {stop_fd_, POLLIN, 0}, {control_listener_, POLLIN, 0}, {local_listener_, POLLIN, 0}};
+        std::vector<pollfd> fds{{stop_fd_, POLLIN, 0},
+                                {control_listener_, POLLIN, 0},
+                                {local_listener_, POLLIN, 0},
+                                {discovery_, POLLIN, 0}};
         for (const Connection& connection : connections_) {
             fds.push_back({connection.fd, POLLIN, 0});
         }
@@ -223,11 +306,18 @@ void Pmd::run() {
             return;
         }
         if (fds[0].revents != 0) {
+            say_bye();
             return;
         }
+        if ((fds[3].revents & POLLIN) != 0) {
+            hear();
+        }
+        if (const Nanos now = platform_.clock->now(); now - last_beacon_ >= kBeaconEvery) {
+            beacon(now);
+        }
         // The connections polled are the first ones of connections_; accepting only adds more.
-        for (std::size_t i = 3; i < fds.size(); i++) {
-            Connection& connection = connections_[i - 3];
+        for (std::size_t i = 4; i < fds.size(); i++) {
+            Connection& connection = connections_[i - 4];
             if (fds[i].revents != 0 && !read_from(connection)) {
                 ::close(connection.fd);
                 connection.fd = -1;
@@ -417,6 +507,220 @@ void Pmd::on_register(Connection& connection, const FrameHeader& header,
                           JsonObject{{"job", JsonValue{std::int64_t{header.job.value}}},
                                      {"pid", JsonValue{std::int64_t{process.pid}}},
                                      {"role", JsonValue{std::int64_t{process.role}}}});
+}
+
+// The UDP socket for beacons, and the interfaces multicast goes out on: every one that is up
+// and can, loopback aside, or only --iface (docs/PROTOCOL.md, [GATE P7]).
+Result<void> Pmd::open_discovery() {
+    discovery_ = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    sockaddr_in at{};
+    at.sin_family = AF_INET;
+    at.sin_addr.s_addr = htonl(INADDR_ANY);
+    at.sin_port = htons(config_.discovery_port);
+    socklen_t length = sizeof at;
+    const int on = 1;
+    // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API
+    if (discovery_ < 0 || ::setsockopt(discovery_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on) != 0 ||
+        ::bind(discovery_, reinterpret_cast<const sockaddr*>(&at), sizeof at) != 0 ||
+        ::getsockname(discovery_, reinterpret_cast<sockaddr*>(&at), &length) != 0) {
+        return Error{Errc::kIo, errno, "open the discovery port"};
+    }
+    // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
+    config_.discovery_port = ntohs(at.sin_port);
+    if (!config_.multicast) {
+        return {};
+    }
+    ifaddrs* all = nullptr;
+    if (::getifaddrs(&all) != 0) {
+        return Error{Errc::kIo, errno, "list the network interfaces"};
+    }
+    for (const ifaddrs* each = all; each != nullptr; each = each->ifa_next) {
+        const bool wanted = config_.iface.empty() ? (each->ifa_flags & IFF_MULTICAST) != 0 &&
+                                                        (each->ifa_flags & IFF_LOOPBACK) == 0
+                                                  : config_.iface == each->ifa_name;
+        if (each->ifa_addr == nullptr || each->ifa_addr->sa_family != AF_INET ||
+            (each->ifa_flags & IFF_UP) == 0 || !wanted) {
+            continue;
+        }
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API
+        const in_addr address = reinterpret_cast<const sockaddr_in*>(each->ifa_addr)->sin_addr;
+        ip_mreq join{};
+        join.imr_multiaddr.s_addr = htonl(kDiscoveryGroup);
+        join.imr_interface = address;
+        if (::setsockopt(discovery_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &join, sizeof join) == 0) {
+            interfaces_.push_back(ntohl(address.s_addr));
+        }
+    }
+    ::freeifaddrs(all);
+    if (interfaces_.empty() && !config_.iface.empty()) {
+        return Error{Errc::kInvalidArgument, 0, "use --iface: no such interface can multicast"};
+    }
+    const unsigned char ttl = 1;   // the local network only
+    const unsigned char loop = 1;  // daemons on this machine hear each other
+    ::setsockopt(discovery_, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof ttl);
+    ::setsockopt(discovery_, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof loop);
+    return {};
+}
+
+void Pmd::send_datagram(Opcode opcode, std::span<const std::byte> payload, std::uint32_t ipv4,
+                        std::uint16_t port) {
+    FrameHeader header;
+    header.opcode = opcode;
+    header.src = config_.node;
+    header.dst = kAllNodes;
+    header.payload_len = static_cast<std::uint32_t>(payload.size());
+    header.payload_crc = wire_payload_crc(*platform_.checksum, payload);
+    std::vector<std::byte> datagram(kFrameHeaderSize + payload.size());
+    wire_encode_header(header, std::span{datagram}.first<kFrameHeaderSize>());
+    std::copy(payload.begin(), payload.end(), datagram.begin() + kFrameHeaderSize);
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = htonl(ipv4);
+    to.sin_port = htons(port);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API
+    static_cast<void>(::sendto(discovery_, datagram.data(), datagram.size(), 0,
+                               reinterpret_cast<const sockaddr*>(&to), sizeof to));
+}
+
+// Sends one discovery frame on every multicast interface and to every seed.
+void Pmd::announce(Opcode opcode, std::span<const std::byte> payload) {
+    for (const std::uint32_t address : interfaces_) {
+        in_addr out{};
+        out.s_addr = htonl(address);
+        ::setsockopt(discovery_, IPPROTO_IP, IP_MULTICAST_IF, &out, sizeof out);
+        send_datagram(opcode, payload, kDiscoveryGroup, config_.discovery_port);
+    }
+    for (std::size_t i = 0; i < config_.peers.size(); i++) {
+        send_datagram(opcode, payload, config_.peers[i].ipv4,
+                      i < config_.peer_discovery_ports.size() ? config_.peer_discovery_ports[i]
+                                                              : kDiscoveryPort);
+    }
+}
+
+// Once a second: HELLO, and the peers silent too long leave the table.
+void Pmd::beacon(Nanos now) {
+    last_beacon_ = now;
+    HelloPayload hello;
+    hello.instance = instance_;
+    hello.control_port = config_.control_port;
+    hello.cap_cores = config_.cap_cores;
+    hello.free_cores = config_.cap_cores;  // ponytail: no slots are counted before M4-2
+    hello.jobs = static_cast<std::uint16_t>(std::min<std::size_t>(runs_.size(), 65535));
+    std::array<std::byte, 300> bytes{};
+    if (const Result<std::size_t> size = wire_encode(hello, bytes); size.ok()) {
+        announce(Opcode::kHello, std::span{bytes}.first(size.value()));
+    }
+    std::vector<Peer> gone;
+    {
+        const std::scoped_lock hold{peers_mu_};
+        gone = table_->expire(now);
+    }
+    for (const Peer& peer : gone) {
+        platform_.logger->log(LogLevel::kInfo, "peer_gone",
+                              JsonObject{{"peer", JsonValue{std::int64_t{peer.node.value}}}});
+    }
+}
+
+// BYE, when the daemon stops.
+void Pmd::say_bye() {
+    std::array<std::byte, 4> bytes{};
+    static_cast<void>(wire_encode(ByePayload{instance_}, bytes));
+    announce(Opcode::kBye, bytes);
+}
+
+// Every beacon that has arrived.
+void Pmd::hear() {
+    std::array<std::byte, 2048> datagram{};
+    for (;;) {
+        sockaddr_in from{};
+        socklen_t length = sizeof from;
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API
+        const ssize_t got = ::recvfrom(discovery_, datagram.data(), datagram.size(), 0,
+                                       reinterpret_cast<sockaddr*>(&from), &length);
+        if (got < 0) {
+            return;  // nothing more for now
+        }
+        if (static_cast<std::size_t>(got) < kFrameHeaderSize) {
+            continue;
+        }
+        const std::span<const std::byte> whole =
+            std::span{datagram}.first(static_cast<std::size_t>(got));
+        const Result<FrameHeader> header = wire_decode_header(whole.first<kFrameHeaderSize>());
+        const std::span<const std::byte> payload = whole.subspan(kFrameHeaderSize);
+        if (!header.ok() ||
+            !wire_check_payload(*platform_.checksum, header.value(), payload).ok()) {
+            continue;  // not a frame, or damaged: the next beacon comes in a second
+        }
+        const NodeId node = header.value().src;
+        const std::uint32_t address = ntohl(from.sin_addr.s_addr);
+        if (header.value().opcode == Opcode::kBye) {
+            if (const Result<ByePayload> bye = wire_decode_bye(payload); bye.ok()) {
+                const std::scoped_lock hold{peers_mu_};
+                table_->bye(node, bye.value().instance);
+            }
+            continue;
+        }
+        const Result<HelloPayload> hello = wire_decode_hello(payload);
+        if (header.value().opcode != Opcode::kHello || !hello.ok()) {
+            continue;
+        }
+        PeerTable::Heard heard = PeerTable::Heard::kOwn;
+        {
+            const std::scoped_lock hold{peers_mu_};
+            heard = table_->hello(node, address, hello.value(), platform_.clock->now());
+            const bool reported = std::any_of(clashes_.begin(), clashes_.end(), [&](const Peer& p) {
+                return p.node == node && p.hello.instance == hello.value().instance;
+            });
+            if (heard == PeerTable::Heard::kClash && reported) {
+                heard = PeerTable::Heard::kKnown;  // reported once already
+            } else if (heard == PeerTable::Heard::kClash) {
+                clashes_.push_back(Peer{node, address, hello.value(), platform_.clock->now()});
+            }
+        }
+        if (heard == PeerTable::Heard::kNew || heard == PeerTable::Heard::kClash) {
+            const bool fresh = heard == PeerTable::Heard::kNew;
+            platform_.logger->log(fresh ? LogLevel::kInfo : LogLevel::kWarn,
+                                  fresh ? "peer_new" : "node_id_clash",
+                                  JsonObject{{"peer", JsonValue{std::int64_t{node.value}}},
+                                             {"address", JsonValue{dotted(address)}}});
+        }
+    }
+}
+
+// GET /v1/peers: this node, the peers it hears, and any ID clash it has seen.
+std::string Pmd::peers_json() {
+    const Nanos now = platform_.clock->now();
+    const auto entry = [now](const Peer& peer) {
+        const auto silent = std::chrono::duration_cast<std::chrono::milliseconds>(now - peer.heard);
+        return JsonValue{JsonObject{
+            {"node", JsonValue{std::int64_t{peer.node.value}}},
+            {"address", JsonValue{dotted(peer.address)}},
+            {"control_port", JsonValue{std::int64_t{peer.hello.control_port}}},
+            {"state", JsonValue{std::string{PeerTable::suspect(peer, now) ? "suspect" : "alive"}}},
+            {"leaving", JsonValue{(peer.hello.flags & kHelloLeaving) != 0}},
+            {"cap_cores", JsonValue{std::int64_t{peer.hello.cap_cores}}},
+            {"free_cores", JsonValue{std::int64_t{peer.hello.free_cores}}},
+            {"cap_ram", JsonValue{static_cast<std::int64_t>(peer.hello.cap_ram)}},
+            {"free_ram", JsonValue{static_cast<std::int64_t>(peer.hello.free_ram)}},
+            {"jobs", JsonValue{std::int64_t{peer.hello.jobs}}},
+            {"silent_ms", JsonValue{static_cast<std::int64_t>(silent.count())}}}};
+    };
+    JsonArray peers;
+    JsonArray clashes;
+    {
+        const std::scoped_lock hold{peers_mu_};
+        for (const Peer& peer : table_->peers()) {
+            peers.push_back(entry(peer));
+        }
+        for (const Peer& clash : clashes_) {
+            clashes.push_back(entry(clash));
+        }
+    }
+    return platform_.json->encode(
+        JsonValue{JsonObject{{"node", JsonValue{std::int64_t{config_.node.value}}},
+                             {"cap_cores", JsonValue{std::int64_t{config_.cap_cores}}},
+                             {"peers", JsonValue{std::move(peers)}},
+                             {"clashes", JsonValue{std::move(clashes)}}}});
 }
 
 Pmd::Run* Pmd::run_of(JobId job) {

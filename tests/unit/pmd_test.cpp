@@ -8,6 +8,8 @@
 
 #include "net/frame_io.h"
 #include "platform/factory.h"
+#include "pmd/peers.h"
+#include "tools/pm.h"
 #include "wire/payloads.h"
 
 #include <doctest/doctest.h>
@@ -23,11 +25,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <sstream>
 #include <string>
@@ -97,14 +101,22 @@ struct Daemon {
     std::thread thread;
     int control = -1;
 
+    using Adjust = std::function<void(paramesh::PmdConfig&)>;
+
     static paramesh::PmdConfig config(const std::string& state_dir, std::uint16_t node,
-                                      std::vector<paramesh::Endpoint> peers) {
+                                      std::vector<paramesh::Endpoint> peers, const Adjust& adjust) {
         paramesh::PmdConfig c;
         c.node = NodeId{node};
         c.control_port = 0;
+        c.discovery_port = 0;  // ports the system chooses, and no multicast: daemons of other
+        c.http_port = 0;       // tests may be running on this machine at the same time
+        c.multicast = false;
         c.cap_cores = 3;
         c.state_dir = state_dir;
         c.peers = std::move(peers);
+        if (adjust) {
+            adjust(c);
+        }
         return c;
     }
     static std::string fresh_directory() {
@@ -113,8 +125,10 @@ struct Daemon {
         return name.data();
     }
 
-    explicit Daemon(std::uint16_t node = 5, std::vector<paramesh::Endpoint> peers = {})
-        : state_dir(fresh_directory()), pmd(config(state_dir, node, std::move(peers)), platform) {
+    explicit Daemon(std::uint16_t node = 5, std::vector<paramesh::Endpoint> peers = {},
+                    const Adjust& adjust = nullptr)
+        : state_dir(fresh_directory()),
+          pmd(config(state_dir, node, std::move(peers), adjust), platform) {
         const paramesh::Result<void> opened = pmd.open();
         REQUIRE_MESSAGE(opened.ok(), opened.error().what);
         thread = std::thread{[this] { pmd.run(); }};
@@ -577,13 +591,29 @@ TEST_CASE("the command line: defaults, every flag, and what is refused") {
     CHECK(all.value().control_port == 47002);
     CHECK(all.value().state_dir == "/tmp/somewhere");
     REQUIRE(all.value().peers.size() == 2);
+    CHECK(all.value().peer_discovery_ports == std::vector<std::uint16_t>{47000, 47000});
     CHECK(all.value().peers[0].ipv4 == ((10U << 24U) | 2U));
     CHECK(all.value().peers[0].port == paramesh::kControlPort);  // the port's default
     CHECK(all.value().peers[1].port == 47005);
 
+    const auto discovery = parse({"--discovery-port", "47100", "--http-port", "0", "--no-multicast",
+                                  "--iface", "lo", "--peers", "10.0.0.2:47005:47004"});
+    REQUIRE(discovery.ok());
+    CHECK(discovery.value().node == paramesh::kNoNode);
+    CHECK(discovery.value().discovery_port == 47100);
+    CHECK(discovery.value().http_port == 0);
+    CHECK_FALSE(discovery.value().multicast);
+    CHECK(discovery.value().iface == "lo");
+    REQUIRE(discovery.value().peer_discovery_ports.size() == 1);
+    CHECK(discovery.value().peers[0].port == 47005);
+    CHECK(discovery.value().peer_discovery_ports[0] == 47004);
+
     const auto least = parse({"--node-id", "1"});
     REQUIRE(least.ok());
     CHECK(least.value().control_port == 47001);
+    CHECK(least.value().discovery_port == 47000);
+    CHECK(least.value().http_port == 47002);
+    CHECK(least.value().multicast);
     CHECK(least.value().cap_cores >= 1);  // this machine's processors
     CHECK(least.value().state_dir.ends_with("/.local/state/paramesh"));
     CHECK(least.value().peers.empty());
@@ -594,18 +624,20 @@ TEST_CASE("the command line: defaults, every flag, and what is refused") {
                    ? std::string{parsed.error().what}
                    : std::string{"accepted"};
     };
-    CHECK(refused({}) == "--node-id is required");
-    CHECK(refused({"--cap-cores", "2"}) == "--node-id is required");
+    CHECK(refused({}) == "accepted");  // the node ID then comes from the state directory
     CHECK(refused({"--node-id", "0"}) == "--node-id must be 1 to 65534");
     CHECK(refused({"--node-id", "65535"}) == "--node-id must be 1 to 65534");
     CHECK(refused({"--node-id", "seven"}) == "--node-id must be 1 to 65534");
     CHECK(refused({"--node-id", "1", "--cap-cores", "0"}) == "--cap-cores must be 1 to 65535");
     CHECK(refused({"--node-id", "1", "--control-port", "70000"}) ==
           "--control-port must be 0 to 65535");
-    CHECK(refused({"--node-id", "1", "--peers", "not-an-address"}) ==
-          "--peers must be address[:port], separated by commas");
-    CHECK(refused({"--node-id", "1", "--peers", "10.0.0.2:0"}) ==
-          "--peers must be address[:port], separated by commas");
+    const std::string bad_peers =
+        "--peers must be address[:control port[:discovery port]], separated by commas";
+    CHECK(refused({"--node-id", "1", "--peers", "not-an-address"}) == bad_peers);
+    CHECK(refused({"--node-id", "1", "--peers", "10.0.0.2:0"}) == bad_peers);
+    CHECK(refused({"--node-id", "1", "--peers", "10.0.0.2:47001:0"}) == bad_peers);
+    CHECK(refused({"--http-port", "70000"}) == "--http-port must be 0 to 65535");
+    CHECK(refused({"--discovery-port", "x"}) == "--discovery-port must be 0 to 65535");
     CHECK(refused({"--node-id", "1", "--speed", "9"}) == "a flag pmd does not know");
     CHECK(refused({"--node-id"}) == "the last flag has no value");
 }
@@ -791,4 +823,284 @@ TEST_CASE("Ctrl+C on pmrun ends a running ParaMesh job on every node" *
     }
     CHECK(processes_naming(report) == 0);
     CHECK(contents(report).empty());  // the job did not finish: it was ended
+}
+
+// ---- discovery (M4-1) ---------------------------------------------------------------------------
+
+namespace {
+
+using namespace std::chrono_literals;
+
+constexpr std::uint32_t kLoopback = (127U << 24U) | 1U;
+
+paramesh::HelloPayload beacon(std::uint32_t instance) {
+    paramesh::HelloPayload hello;
+    hello.instance = instance;
+    hello.control_port = 47001;
+    hello.cap_cores = 2;
+    hello.free_cores = 2;
+    return hello;
+}
+
+// Free UDP ports, as many as asked for.
+std::vector<std::uint16_t> free_udp_ports(std::size_t count) {
+    std::vector<int> held;
+    std::vector<std::uint16_t> ports;
+    for (std::size_t i = 0; i < count; i++) {
+        std::uint16_t port = 0;
+        const int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        sockaddr_in at{};
+        at.sin_family = AF_INET;
+        at.sin_addr.s_addr = htonl(INADDR_ANY);
+        socklen_t length = sizeof at;
+        // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API
+        if (::bind(fd, reinterpret_cast<const sockaddr*>(&at), sizeof at) == 0 &&
+            ::getsockname(fd, reinterpret_cast<sockaddr*>(&at), &length) == 0) {
+            port = ntohs(at.sin_port);
+        }
+        // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
+        held.push_back(fd);
+        ports.push_back(port);
+    }
+    for (const int fd : held) {
+        ::close(fd);
+    }
+    return ports;
+}
+
+// Sends one discovery frame to a daemon's discovery port, from the given loopback address.
+template <typename Payload>
+void send_beacon(const paramesh::Platform& platform, Opcode opcode, std::uint16_t node,
+                 const Payload& payload, std::uint16_t to_port, std::uint32_t from = kLoopback) {
+    std::array<std::byte, 300> body{};
+    const auto size = paramesh::wire_encode(payload, body);
+    REQUIRE(size.ok());
+    const std::span<const std::byte> bytes = std::span{body}.first(size.value());
+    FrameHeader header;
+    header.opcode = opcode;
+    header.src = NodeId{node};
+    header.dst = paramesh::kAllNodes;
+    header.payload_len = static_cast<std::uint32_t>(bytes.size());
+    header.payload_crc = paramesh::wire_payload_crc(*platform.checksum, bytes);
+    std::vector<std::byte> datagram(paramesh::kFrameHeaderSize + bytes.size());
+    paramesh::wire_encode_header(header, std::span{datagram}.first<paramesh::kFrameHeaderSize>());
+    std::copy(bytes.begin(), bytes.end(), datagram.begin() + paramesh::kFrameHeaderSize);
+    const int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    sockaddr_in at{};
+    at.sin_family = AF_INET;
+    at.sin_addr.s_addr = htonl(from);
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = htonl(kLoopback);
+    to.sin_port = htons(to_port);
+    // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API
+    REQUIRE(::bind(fd, reinterpret_cast<const sockaddr*>(&at), sizeof at) == 0);
+    REQUIRE(::sendto(fd, datagram.data(), datagram.size(), 0,
+                     reinterpret_cast<const sockaddr*>(&to),
+                     sizeof to) == static_cast<ssize_t>(datagram.size()));
+    // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
+    ::close(fd);
+}
+
+// What GET /v1/peers says: "node:state" for each peer and "node@address" for each clash, in
+// node order.
+struct Heard {
+    std::vector<std::string> peers;
+    std::vector<std::string> clashes;
+};
+
+Heard heard_by(const Daemon& daemon) {
+    Heard heard;
+    const paramesh::Result<std::string> body =
+        paramesh::http_get(daemon.pmd.http_port(), "/v1/peers");
+    REQUIRE(body.ok());
+    const auto parsed = daemon.platform.json->decode(body.value());
+    REQUIRE(parsed.ok());
+    const auto& top = std::get<paramesh::JsonObject>(parsed.value().v);
+    for (const auto& [key, out] :
+         {std::pair{"peers", &heard.peers}, std::pair{"clashes", &heard.clashes}}) {
+        for (const paramesh::JsonValue& each : std::get<paramesh::JsonArray>(top.at(key).v)) {
+            const auto& peer = std::get<paramesh::JsonObject>(each.v);
+            const std::string node = std::to_string(std::get<std::int64_t>(peer.at("node").v));
+            out->push_back(std::string_view{key} == "peers"
+                               ? node + ":" + std::get<std::string>(peer.at("state").v)
+                               : node + "@" + std::get<std::string>(peer.at("address").v));
+        }
+    }
+    std::sort(heard.peers.begin(), heard.peers.end());
+    std::sort(heard.clashes.begin(), heard.clashes.end());
+    return heard;
+}
+
+// Waits up to `limit` for every daemon to list exactly `expected[i]`; returns how long it took,
+// or `limit` if it did not happen.
+std::chrono::milliseconds until_heard(const std::vector<const Daemon*>& daemons,
+                                      const std::vector<std::vector<std::string>>& expected,
+                                      std::chrono::milliseconds limit) {
+    const auto start = std::chrono::steady_clock::now();
+    for (;;) {
+        bool all = true;
+        for (std::size_t i = 0; i < daemons.size(); i++) {
+            all = all && heard_by(*daemons[i]).peers == expected[i];
+        }
+        const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        if (all || took >= limit) {
+            return all ? took : limit;
+        }
+        ::usleep(50000);
+    }
+}
+
+}  // namespace
+
+TEST_CASE("the peer table: new, refreshed, suspect after 3 missed beacons, gone after 5") {
+    paramesh::PeerTable table{NodeId{1}, 77};
+    using Heard = paramesh::PeerTable::Heard;
+    CHECK(table.hello(NodeId{1}, kLoopback, beacon(77), 0s) == Heard::kOwn);  // its own, back
+    CHECK(table.hello(NodeId{2}, kLoopback, beacon(5), 0s) == Heard::kNew);
+    CHECK(table.hello(NodeId{2}, kLoopback, beacon(5), 1s) == Heard::kKnown);
+    REQUIRE(table.peers().size() == 1);
+    CHECK_FALSE(paramesh::PeerTable::suspect(table.peers()[0], 4s));  // 3 s silent: not yet
+    CHECK(paramesh::PeerTable::suspect(table.peers()[0], 4s + 1ms));
+    CHECK(table.expire(6s).empty());  // 5 s silent: not yet
+    const auto gone = table.expire(6s + 1ms);
+    REQUIRE(gone.size() == 1);
+    CHECK(gone[0].node == NodeId{2});
+    CHECK(table.peers().empty());
+}
+
+TEST_CASE("the peer table: a restart, a BYE, and two daemons with one ID") {
+    paramesh::PeerTable table{NodeId{1}, 77};
+    using Heard = paramesh::PeerTable::Heard;
+    table.hello(NodeId{2}, kLoopback, beacon(5), 0s);
+    // Same address, new instance: the daemon restarted. It replaces the old entry.
+    CHECK(table.hello(NodeId{2}, kLoopback, beacon(6), 1s) == Heard::kKnown);
+    CHECK(table.peers()[0].hello.instance == 6);
+    // Another address, another instance, the same ID: a clash. The first one keeps the ID.
+    CHECK(table.hello(NodeId{2}, kLoopback + 1, beacon(9), 2s) == Heard::kClash);
+    CHECK(table.peers()[0].address == kLoopback);
+    // Someone else using this daemon's own ID.
+    CHECK(table.hello(NodeId{1}, kLoopback + 1, beacon(8), 2s) == Heard::kClash);
+    // A BYE of an instance that is not the one known changes nothing; the right one removes it.
+    table.bye(NodeId{2}, 5);
+    CHECK(table.peers().size() == 1);
+    table.bye(NodeId{2}, 6);
+    CHECK(table.peers().empty());
+}
+
+TEST_CASE("three daemons list each other within 2 s, by multicast") {
+    const std::uint16_t port = free_udp_ports(1).front();
+    const auto by_multicast = [port](paramesh::PmdConfig& c) {
+        c.multicast = true;
+        c.iface = "lo";  // multicast stays on this machine
+        c.discovery_port = port;
+    };
+    const Daemon one{1, {}, by_multicast};
+    const Daemon two{2, {}, by_multicast};
+    const Daemon three{3, {}, by_multicast};
+    const auto took = until_heard(
+        {&one, &two, &three},
+        {{"2:alive", "3:alive"}, {"1:alive", "3:alive"}, {"1:alive", "2:alive"}}, 3000ms);
+    MESSAGE("listed each other after " << took.count() << " ms");
+    CHECK(took < 2000ms);
+    CHECK(heard_by(one).clashes.empty());
+
+    // pm status says the same.
+    std::array<int, 2> out{};
+    REQUIRE(::pipe(out.data()) == 0);
+    const std::string pm = (std::filesystem::path{pmrun_path()}.parent_path() / "pm").string();
+    const std::string port_text = std::to_string(one.pmd.http_port());
+    const pid_t child = ::fork();
+    if (child == 0) {
+        ::dup2(out[1], STDOUT_FILENO);
+        ::execl(pm.c_str(), pm.c_str(), "status", "--http-port", port_text.c_str(), nullptr);
+        ::_exit(127);
+    }
+    ::close(out[1]);
+    CHECK(exit_status(child, 20) == 0);
+    std::string printed;
+    std::array<char, 1024> chunk{};
+    for (ssize_t got = 0; (got = ::read(out[0], chunk.data(), chunk.size())) > 0;) {
+        printed.append(chunk.data(), static_cast<std::size_t>(got));
+    }
+    ::close(out[0]);
+    CHECK(printed.starts_with("node 1 (this node), 3 cores\n"));
+    CHECK(printed.find("\n2      127.0.0.1") != std::string::npos);
+    CHECK(printed.find("\n3      127.0.0.1") != std::string::npos);
+}
+
+TEST_CASE("with multicast off, the seed list is enough") {
+    const std::vector<std::uint16_t> ports = free_udp_ports(3);
+    // Each daemon is given the other two as seeds, with their discovery ports.
+    const auto seeds_of = [&ports](std::size_t me) {
+        return [&ports, me](paramesh::PmdConfig& c) {
+            c.discovery_port = ports[me];
+            for (std::size_t other = 0; other < ports.size(); other++) {
+                if (other != me) {
+                    c.peers.push_back(paramesh::Endpoint{kLoopback, 1});
+                    c.peer_discovery_ports.push_back(ports[other]);
+                }
+            }
+        };
+    };
+    const Daemon one{1, {}, seeds_of(0)};
+    const Daemon two{2, {}, seeds_of(1)};
+    const Daemon three{3, {}, seeds_of(2)};
+    const auto took = until_heard(
+        {&one, &two, &three},
+        {{"2:alive", "3:alive"}, {"1:alive", "3:alive"}, {"1:alive", "2:alive"}}, 3000ms);
+    CHECK(took < 2000ms);
+}
+
+TEST_CASE("a silent node is suspect after 3 s and disappears after 5 s; BYE removes one at once") {
+    const Daemon daemon;
+    send_beacon(daemon.platform, Opcode::kHello, 9, beacon(41), daemon.pmd.discovery_port());
+    send_beacon(daemon.platform, Opcode::kHello, 8, beacon(42), daemon.pmd.discovery_port());
+    CHECK(until_heard({&daemon}, {{"8:alive", "9:alive"}}, 1000ms) < 1000ms);
+    send_beacon(daemon.platform, Opcode::kBye, 8, paramesh::ByePayload{42},
+                daemon.pmd.discovery_port());
+    CHECK(until_heard({&daemon}, {{"9:alive"}}, 1000ms) < 1000ms);  // gone at once
+
+    // Node 9 says nothing more.
+    CHECK(until_heard({&daemon}, {{"9:suspect"}}, 4000ms) < 4000ms);
+    CHECK(until_heard({&daemon}, {{}}, 3000ms) < 3000ms);
+}
+
+TEST_CASE("two daemons with one node ID are reported, and the first keeps it") {
+    const Daemon daemon;  // node 5
+    send_beacon(daemon.platform, Opcode::kHello, 9, beacon(41), daemon.pmd.discovery_port());
+    CHECK(until_heard({&daemon}, {{"9:alive"}}, 1000ms) < 1000ms);
+    // Node 9 again, another instance, from another address; and someone claiming node 5.
+    send_beacon(daemon.platform, Opcode::kHello, 9, beacon(43), daemon.pmd.discovery_port(),
+                kLoopback + 1);
+    send_beacon(daemon.platform, Opcode::kHello, 5, beacon(44), daemon.pmd.discovery_port(),
+                kLoopback + 2);
+    Heard heard;
+    for (int tries = 0; tries < 20 && heard.clashes.size() < 2; tries++) {
+        ::usleep(50000);
+        heard = heard_by(daemon);
+    }
+    CHECK(heard.clashes == std::vector<std::string>{"5@127.0.0.3", "9@127.0.0.2"});
+    CHECK(heard.peers == std::vector<std::string>{"9:alive"});
+}
+
+TEST_CASE("a node ID is made on the first run and kept in the state directory") {
+    const paramesh::Platform platform = quiet_platform();
+    const std::string state_dir = Daemon::fresh_directory();
+    NodeId first;
+    for (int run = 0; run < 2; run++) {
+        const paramesh::PmdConfig config =
+            Daemon::config(state_dir, 0, {}, nullptr);  // no --node-id
+        paramesh::Pmd pmd{config, platform};
+        REQUIRE(pmd.open().ok());
+        CHECK(pmd.node() != paramesh::kNoNode);
+        CHECK(pmd.node() != paramesh::kAllNodes);
+        if (run == 0) {
+            first = pmd.node();
+        }
+        CHECK(pmd.node() == first);  // the second run reads it back
+        CHECK(contents(state_dir + "/node_id") == std::to_string(first.value) + "\n");
+    }
+    std::filesystem::remove_all(state_dir);
 }
