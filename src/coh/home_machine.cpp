@@ -314,6 +314,69 @@ Result<void> home_add_segment(HomeDirectory& directory, SegmentId segment) {
     return {};
 }
 
+void home_remove_segment(HomeDirectory& directory, SegmentId segment) {
+    directory.segments.erase(segment.value);
+    std::erase_if(directory.entries, [segment](const auto& entry) {
+        return segment_of(PageId{entry.first}) == segment;
+    });
+}
+
+bool home_segment_busy(const HomeDirectory& directory, SegmentId segment) {
+    return std::any_of(directory.entries.begin(), directory.entries.end(),
+                       [segment](const auto& entry) {
+                           return segment_of(PageId{entry.first}) == segment &&
+                                  entry.second.wait != HomeWait::kIdle;
+                       });
+}
+
+// docs/STATE_MACHINES.md, section 3, SERVING to FROZEN: the requests waiting in every queue
+// are answered with REDIRECT (`other` is the new home). An operation in progress goes on:
+// its INV_ACK, FETCH_DATA or LOADED is still handled by home_step.
+void home_freeze_segment(HomeDirectory& directory, SegmentId segment, NodeId new_home,
+                         std::vector<HomeAction>& out) {
+    for (auto& [page, e] : directory.entries) {
+        if (segment_of(PageId{page}) != segment) {
+            continue;
+        }
+        for (const HomeEvent& request : e.waitq) {
+            HomeAction redirect = reply(request, Opcode::kRedirect, PageSource::kNone, false);
+            redirect.other = new_home;
+            out.push_back(redirect);
+        }
+        e.waitq.clear();
+    }
+}
+
+// An entry that arrived in SEG_MIGRATE. Its segment is added first (home_add_segment).
+Result<void> home_import_entry(HomeDirectory& directory, PageId page, const HomeEntryView& entry) {
+    const bool exclusive = entry.state == HomeState::kExclusive;
+    if (!directory.segments.contains(segment_of(page).value) ||
+        exclusive != (entry.where == HomeWhere::kNone) || exclusive != (entry.owner != kNoNode) ||
+        entry.wait != HomeWait::kIdle || entry.queued != 0) {
+        return Error{Errc::kInvalidArgument, 0, "import a directory entry"};
+    }
+    Entry& e = directory.entries[page.value];
+    e = Entry{};
+    e.state = entry.state;
+    e.where = entry.where;
+    e.owner = entry.owner;
+    e.copyset = entry.copyset;
+    e.version = entry.version;
+    return {};
+}
+
+// Section 3, "new map drops a member". An entry the member owns cannot exist: a leaver
+// writes its pages back first.
+void home_drop_member(HomeDirectory& directory, Slot slot) {
+    for (auto& [page, e] : directory.entries) {
+        e.copyset &= ~bit(slot);
+        if (e.state == HomeState::kShared && e.copyset == 0) {
+            e.state = HomeState::kUncached;
+        }
+    }
+    directory.nodes.at(slot.value) = kNoNode;
+}
+
 HomeEntryView home_entry(const HomeDirectory& directory, PageId page) {
     HomeEntryView view;
     const auto found = directory.entries.find(page.value);

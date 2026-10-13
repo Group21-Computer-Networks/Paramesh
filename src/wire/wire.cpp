@@ -672,6 +672,179 @@ Result<LAdmitRefusedPayload> wire_decode_l_admit_refused(std::span<const std::by
     return payload;
 }
 
+// ---- leave (docs/PROTOCOL.md, sections 6, 7.2, 7.5 and 9) ------------------------------------
+
+Result<std::size_t> wire_encode(const RedirectPayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    w.put(payload.page.value, 8);
+    w.put(payload.epoch.value, 4);
+    w.put(payload.home.value, 2);
+    w.put(0, 2);  // reserved
+    return w.done();
+}
+
+Result<RedirectPayload> wire_decode_redirect(std::span<const std::byte> in) {
+    Reader r{in};
+    RedirectPayload payload;
+    payload.page = PageId{r.get(8)};
+    payload.epoch = Epoch{static_cast<std::uint32_t>(r.get(4))};
+    payload.home = NodeId{static_cast<std::uint16_t>(r.get(2))};
+    r.take(2);
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const LeaveIntentPayload& payload, std::span<std::byte> out) {
+    if (payload.reason != kLeaveAsked && payload.reason != kLeaveInterrupt) {
+        return kUnsendable;
+    }
+    Writer w{out};
+    w.put(payload.node.value, 2);
+    w.put(payload.reason, 1);
+    w.put(0, 1);  // reserved
+    return w.done();
+}
+
+Result<LeaveIntentPayload> wire_decode_leave_intent(std::span<const std::byte> in) {
+    Reader r{in};
+    LeaveIntentPayload payload;
+    payload.node = NodeId{static_cast<std::uint16_t>(r.get(2))};
+    payload.reason = static_cast<std::uint8_t>(r.get(1));
+    r.take(1);
+    if (!r.exact() || (payload.reason != kLeaveAsked && payload.reason != kLeaveInterrupt)) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const LLeavePayload& payload, std::span<std::byte> out) {
+    if (payload.reason != kLeaveAsked && payload.reason != kLeaveInterrupt) {
+        return kUnsendable;
+    }
+    Writer w{out};
+    w.put(payload.reason, 1);
+    w.put(0, 3);  // reserved
+    return w.done();
+}
+
+Result<LLeavePayload> wire_decode_l_leave(std::span<const std::byte> in) {
+    Reader r{in};
+    const LLeavePayload payload{static_cast<std::uint8_t>(r.get(1))};
+    r.take(3);
+    if (!r.exact() || (payload.reason != kLeaveAsked && payload.reason != kLeaveInterrupt)) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const SegMigratePayload& payload, std::span<std::byte> out) {
+    if (payload.entries.size() > kMaxMigrateEntries) {
+        return kUnsendable;
+    }
+    Writer w{out};
+    w.put(payload.segment.value, 4);
+    w.put(payload.last ? 1 : 0, 2);
+    w.put(payload.entries.size(), 2);
+    for (const SegMigrateEntry& entry : payload.entries) {
+        if (entry.page >= kPagesPerSegment || entry.state > 2 || entry.where > 2 ||
+            entry.data.size() != (entry.where == 1 ? kPageSize : 0)) {
+            return kUnsendable;
+        }
+        w.put(entry.page, 2);
+        w.put(entry.state, 1);
+        w.put(entry.where, 1);
+        w.put(entry.owner.value, 2);
+        w.put(0, 2);  // reserved
+        w.put(entry.version, 4);
+        w.put(0, 4);  // reserved
+        w.put(entry.copyset, 8);
+        w.bytes(entry.data);
+    }
+    return w.done();
+}
+
+Result<SegMigratePayload> wire_decode_seg_migrate(std::span<const std::byte> in) {
+    Reader r{in};
+    SegMigratePayload payload;
+    payload.segment = SegmentId{static_cast<std::uint32_t>(r.get(4))};
+    const std::uint64_t flags = r.get(2);
+    const std::uint64_t count = r.get(2);
+    if (flags > 1 || count > kMaxMigrateEntries) {
+        return kMalformed;
+    }
+    payload.last = flags == 1;
+    payload.entries.reserve(count);
+    for (std::uint64_t i = 0; i < count; i++) {
+        SegMigrateEntry entry;
+        entry.page = static_cast<std::uint16_t>(r.get(2));
+        entry.state = static_cast<std::uint8_t>(r.get(1));
+        entry.where = static_cast<std::uint8_t>(r.get(1));
+        entry.owner = NodeId{static_cast<std::uint16_t>(r.get(2))};
+        r.take(2);
+        entry.version = static_cast<std::uint32_t>(r.get(4));
+        r.take(4);
+        entry.copyset = r.get(8);
+        if (entry.page >= kPagesPerSegment || entry.state > 2 || entry.where > 2) {
+            return kMalformed;
+        }
+        entry.data = r.take(entry.where == 1 ? kPageSize : 0);
+        payload.entries.push_back(entry);
+    }
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const SegMigrateDonePayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    w.put(payload.segment.value, 4);
+    return w.done();
+}
+
+Result<SegMigrateDonePayload> wire_decode_seg_migrate_done(std::span<const std::byte> in) {
+    Reader r{in};
+    const SegMigrateDonePayload payload{SegmentId{static_cast<std::uint32_t>(r.get(4))}};
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const LeaveDonePayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    w.put(payload.segments, 4);
+    return w.done();
+}
+
+Result<LeaveDonePayload> wire_decode_leave_done(std::span<const std::byte> in) {
+    Reader r{in};
+    const LeaveDonePayload payload{static_cast<std::uint32_t>(r.get(4))};
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const LLeaveReqPayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    w.put(payload.force ? 1 : 0, 1);
+    w.put(0, 3);  // reserved
+    return w.done();
+}
+
+Result<LLeaveReqPayload> wire_decode_l_leave_req(std::span<const std::byte> in) {
+    Reader r{in};
+    const std::uint64_t force = r.get(1);
+    r.take(3);
+    if (!r.exact() || force > 1) {
+        return kMalformed;
+    }
+    return LLeaveReqPayload{force == 1};
+}
+
 Result<std::size_t> wire_encode(const LRegisterPayload& payload, std::span<std::byte> out) {
     if (payload.role != 1 && payload.role != 2) {
         return kUnsendable;

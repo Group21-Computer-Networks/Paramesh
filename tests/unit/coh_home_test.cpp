@@ -659,3 +659,107 @@ TEST_CASE("hold window: the same node writing again and again is no transfer") {
     }
     CHECK(home.does(kWrite, 3) == "FETCH_INV>2");  // and nothing is held
 }
+
+// ---- section 3: segments on the move (M4-5)
+// ------------------------------------------------------
+
+TEST_CASE("freezing a segment redirects every waiting request and lets the one in progress end") {
+    Home home;
+    home.send(kWrite, 2);                     // node 2 owns the page
+    CHECK(home.does(kRead, 3) == "FETCH>2");  // in progress: waiting for FETCH_DATA
+    home.send(kRead, 4);                      // these two wait in the queue
+    home.send(kWrite, 5);
+    CHECK(home.entry().queued == 2);
+    CHECK(paramesh::home_segment_busy(*home.directory, paramesh::SegmentId{0}));
+
+    std::vector<HomeAction> out;
+    paramesh::home_freeze_segment(*home.directory, paramesh::SegmentId{0}, NodeId{7}, out);
+    REQUIRE(out.size() == 2);
+    for (std::size_t i = 0; i < 2; i++) {
+        CHECK(out[i].kind == HomeActionKind::kReply);
+        CHECK(out[i].opcode == Opcode::kRedirect);
+        CHECK(out[i].to == NodeId{static_cast<std::uint16_t>(4 + i)});  // in the order they came
+        CHECK(out[i].other == NodeId{7});                               // the new home
+        CHECK(out[i].req == paramesh::ReqId{102 + i});                  // each its own request
+        CHECK(out[i].source == PageSource::kNone);
+    }
+    CHECK(home.entry().queued == 0);
+    CHECK(paramesh::home_segment_busy(*home.directory, paramesh::SegmentId{0}));  // node 3's read
+
+    CHECK(home.does(kFetchData, 2) == "store READ_DATA>3:received");  // it ends as usual
+    CHECK_FALSE(paramesh::home_segment_busy(*home.directory, paramesh::SegmentId{0}));
+    CHECK(home.entry().state == HomeState::kShared);
+
+    // A segment with nothing waiting freezes without a word, and one never touched is not busy.
+    out.clear();
+    paramesh::home_freeze_segment(*home.directory, paramesh::SegmentId{0}, NodeId{7}, out);
+    CHECK(out.empty());
+    CHECK_FALSE(paramesh::home_segment_busy(*home.directory, paramesh::SegmentId{5}));
+}
+
+TEST_CASE("a segment's entries leave one directory and serve from another as they were") {
+    Home old_home;
+    const PageId shared_page{9};
+    const PageId owned_page{10};
+    old_home.send(kRead, 2, shared_page);
+    old_home.send(kRead, 3, shared_page);
+    old_home.send(kWrite, 4, owned_page);
+    const paramesh::HomeEntryView shared_entry =
+        paramesh::home_entry(*old_home.directory, shared_page);
+    const paramesh::HomeEntryView owned_entry =
+        paramesh::home_entry(*old_home.directory, owned_page);
+    CHECK(shared_entry.state == HomeState::kShared);
+    CHECK(shared_entry.copyset == 0b1100);
+    CHECK(owned_entry.state == HomeState::kExclusive);
+    CHECK(owned_entry.owner == NodeId{4});
+    CHECK(owned_entry.where == HomeWhere::kNone);
+    CHECK(owned_entry.version == 1);
+
+    Home new_home;  // home for segment 0 as well, with nothing in it
+    REQUIRE(paramesh::home_import_entry(*new_home.directory, shared_page, shared_entry).ok());
+    REQUIRE(paramesh::home_import_entry(*new_home.directory, owned_page, owned_entry).ok());
+    CHECK(paramesh::home_entry(*new_home.directory, owned_page).version == 1);
+    // A reader of the owned page is served by fetching from the owner the entry names.
+    CHECK(text(new_home.send(kRead, 5, owned_page)) == "FETCH>4");
+    // A third reader of the shared page gets the copy the new home was sent (never written
+    // here: zeros).
+    CHECK(text(new_home.send(kRead, 5, shared_page)) == "READ_DATA>5:zero");
+    CHECK(paramesh::home_entry(*new_home.directory, shared_page).copyset == 0b101100);
+
+    // What cannot be an entry is refused: an owner without exclusive state, a busy entry, a
+    // page of a segment this directory is not home for.
+    paramesh::HomeEntryView bad = shared_entry;
+    bad.owner = NodeId{2};
+    CHECK(paramesh::home_import_entry(*new_home.directory, shared_page, bad).error().code ==
+          paramesh::Errc::kInvalidArgument);
+    bad = owned_entry;
+    bad.wait = HomeWait::kFetch;
+    CHECK(paramesh::home_import_entry(*new_home.directory, owned_page, bad).error().code ==
+          paramesh::Errc::kInvalidArgument);
+    CHECK(
+        paramesh::home_import_entry(*new_home.directory, PageId{512}, shared_entry).error().code ==
+        paramesh::Errc::kInvalidArgument);
+
+    // The old home forgets the segment: a request there is no longer its to answer.
+    paramesh::home_remove_segment(*old_home.directory, paramesh::SegmentId{0});
+    CHECK(paramesh::home_entry(*old_home.directory, shared_page).state == HomeState::kUncached);
+    CHECK(text(old_home.send(kRead, 2, shared_page)) == "abort");
+}
+
+TEST_CASE("a member that left is in no copyset, and a page only it read is uncached again") {
+    Home home;
+    const PageId both{9};
+    const PageId only_three{10};
+    home.send(kRead, 2, both);
+    home.send(kRead, 3, both);
+    home.send(kRead, 3, only_three);
+    paramesh::home_drop_member(*home.directory, paramesh::Slot{3});
+    CHECK(paramesh::home_entry(*home.directory, both).copyset == 0b100);
+    CHECK(paramesh::home_entry(*home.directory, both).state == HomeState::kShared);
+    CHECK(paramesh::home_entry(*home.directory, only_three).copyset == 0);
+    CHECK(paramesh::home_entry(*home.directory, only_three).state == HomeState::kUncached);
+    // A writer now has only node 2 to wait for.
+    home.now = std::chrono::milliseconds{1};
+    CHECK(text(home.send(kWrite, 4, both)) == "INV>2");
+    CHECK(text(home.send(kWrite, 4, only_three)) == "WRITE_GRANT>4:zero");
+}
