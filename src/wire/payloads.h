@@ -213,6 +213,52 @@ struct LAdmitOkPayload {
     std::vector<SegMapMember> members;  // 1 to 8
 };
 
+// REDIRECT: the receiver of a request is not the page's home under its own, newer epoch.
+struct RedirectPayload {
+    PageId page;
+    Epoch epoch;  // the sender's
+    NodeId home;  // the page's home at that epoch
+};
+
+// LEAVE_INTENT and L_LEAVE_INTENT: a member is leaving. L_LEAVE carries the reason alone.
+inline constexpr std::uint8_t kLeaveAsked = 1;      // pm leave
+inline constexpr std::uint8_t kLeaveInterrupt = 2;  // Ctrl+C on pmd
+struct LeaveIntentPayload {
+    NodeId node;
+    std::uint8_t reason = kLeaveAsked;
+};
+struct LLeavePayload {
+    std::uint8_t reason = kLeaveAsked;
+};
+
+// SEG_MIGRATE: part of one segment's directory and pages, from a leaving home to the new one.
+struct SegMigrateEntry {
+    std::uint16_t page = 0;  // index within the segment, 0 to 511
+    std::uint8_t state = 0;  // 0 uncached, 1 shared, 2 exclusive
+    std::uint8_t where = 0;  // 0 never written; 1 data follows; 2 the owner has the only copy
+    NodeId owner;            // when exclusive
+    std::uint32_t version = 0;
+    std::uint64_t copyset = 0;
+    std::span<const std::byte> data;  // kPageSize bytes when `where` is 1, else none
+};
+inline constexpr std::size_t kMaxMigrateEntries = 254;
+struct SegMigratePayload {
+    SegmentId segment;
+    bool last = false;  // the final frame for this segment
+    std::vector<SegMigrateEntry> entries;
+};
+struct SegMigrateDonePayload {
+    SegmentId segment;
+};
+// LEAVE_DONE: how many segments the leaver migrated, for the log.
+struct LeaveDonePayload {
+    std::uint32_t segments = 0;
+};
+// L_LEAVE_REQ, from `pm leave`. L_LEAVE_REPLY has the layout of SPAWN_DECLINE.
+struct LLeaveReqPayload {
+    bool force = false;
+};
+
 // L_REGISTER: the first frame a job process sends its pmd.
 struct LRegisterPayload {
     std::uint32_t pid = 0;
@@ -272,6 +318,21 @@ Result<ByePayload> wire_decode_bye(std::span<const std::byte> in);
 Result<SpawnOkPayload> wire_decode_spawn_ok(std::span<const std::byte> in);
 Result<SpawnDeclinePayload> wire_decode_spawn_decline(std::span<const std::byte> in);
 Result<std::size_t> wire_encode(const LAdmitRefusedPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const RedirectPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const LeaveIntentPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const LLeavePayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const SegMigratePayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const SegMigrateDonePayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const LeaveDonePayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const LLeaveReqPayload& payload, std::span<std::byte> out);
+Result<RedirectPayload> wire_decode_redirect(std::span<const std::byte> in);
+Result<LeaveIntentPayload> wire_decode_leave_intent(std::span<const std::byte> in);
+Result<LLeavePayload> wire_decode_l_leave(std::span<const std::byte> in);
+// The entries' data are views of `in`.
+Result<SegMigratePayload> wire_decode_seg_migrate(std::span<const std::byte> in);
+Result<SegMigrateDonePayload> wire_decode_seg_migrate_done(std::span<const std::byte> in);
+Result<LeaveDonePayload> wire_decode_leave_done(std::span<const std::byte> in);
+Result<LLeaveReqPayload> wire_decode_l_leave_req(std::span<const std::byte> in);
 Result<LAdmitRefusedPayload> wire_decode_l_admit_refused(std::span<const std::byte> in);
 Result<LRegisterPayload> wire_decode_l_register(std::span<const std::byte> in);
 Result<LQuotaPayload> wire_decode_l_quota(std::span<const std::byte> in);

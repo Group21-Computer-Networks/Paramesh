@@ -564,3 +564,81 @@ TEST_CASE("the discovery payloads: HELLO and BYE") {
     CHECK(paramesh::wire_decode_bye(hex("0A 0B 0C 0D")).value().instance == 0x0A0B0C0D);
     CHECK(paramesh::wire_decode_bye(hex("0A 0B 0C")).error().code == Errc::kProtocol);
 }
+
+TEST_CASE("the leave payloads: REDIRECT, LEAVE_INTENT, L_LEAVE, SEG_MIGRATE and the rest") {
+    const paramesh::RedirectPayload redirect{paramesh::PageId{0x0102}, paramesh::Epoch{3},
+                                             paramesh::NodeId{7}};
+    CHECK(encoded(redirect) == hex("00 00 00 00 00 00 01 02 00 00 00 03 00 07 00 00"));
+    const auto there = paramesh::wire_decode_redirect(encoded(redirect));
+    REQUIRE(there.ok());
+    CHECK(there.value().page == paramesh::PageId{0x0102});
+    CHECK(there.value().epoch == paramesh::Epoch{3});
+    CHECK(there.value().home == paramesh::NodeId{7});
+    CHECK(paramesh::wire_decode_redirect(hex("00 01")).error().code == Errc::kProtocol);
+
+    const paramesh::LeaveIntentPayload intent{paramesh::NodeId{9}, paramesh::kLeaveInterrupt};
+    CHECK(encoded(intent) == hex("00 09 02 00"));
+    CHECK(paramesh::wire_decode_leave_intent(hex("00 09 02 00")).value().node ==
+          paramesh::NodeId{9});
+    CHECK(paramesh::wire_decode_leave_intent(hex("00 09 02 00")).value().reason == 2);
+    CHECK(paramesh::wire_decode_leave_intent(hex("00 09 03 00")).error().code == Errc::kProtocol);
+
+    CHECK(encoded(paramesh::LLeavePayload{paramesh::kLeaveAsked}) == hex("01 00 00 00"));
+    CHECK(paramesh::wire_decode_l_leave(hex("01 00 00 00")).value().reason == 1);
+    CHECK(paramesh::wire_decode_l_leave(hex("00 00 00 00")).error().code == Errc::kProtocol);
+
+    CHECK(encoded(paramesh::SegMigrateDonePayload{paramesh::SegmentId{5}}) == hex("00 00 00 05"));
+    CHECK(paramesh::wire_decode_seg_migrate_done(hex("00 00 00 05")).value().segment ==
+          paramesh::SegmentId{5});
+    CHECK(encoded(paramesh::LeaveDonePayload{12}) == hex("00 00 00 0C"));
+    CHECK(paramesh::wire_decode_leave_done(hex("00 00 00 0C")).value().segments == 12);
+    CHECK(encoded(paramesh::LLeaveReqPayload{true}) == hex("01 00 00 00"));
+    CHECK(paramesh::wire_decode_l_leave_req(hex("01 00 00 00")).value().force);
+    CHECK_FALSE(paramesh::wire_decode_l_leave_req(hex("00 00 00 00")).value().force);
+    CHECK(paramesh::wire_decode_l_leave_req(hex("02 00 00 00")).error().code == Errc::kProtocol);
+
+    // SEG_MIGRATE: one entry with no data (exclusive, the owner has it) and one with a page.
+    Bytes page(paramesh::kPageSize, std::byte{0xAB});
+    paramesh::SegMigratePayload migrate;
+    migrate.segment = paramesh::SegmentId{3};
+    migrate.last = true;
+    migrate.entries.push_back({7, 2, 2, paramesh::NodeId{4}, 9, 0x10, {}});
+    migrate.entries.push_back({511, 1, 1, paramesh::kNoNode, 2, 0x06, page});
+    std::vector<std::byte> room(paramesh::kMaxPayload);
+    const auto size = paramesh::wire_encode(migrate, room);
+    REQUIRE(size.ok());
+    CHECK(size.value() == 8 + 24 + 24 + paramesh::kPageSize);
+    const Bytes head{room.begin(), room.begin() + 32};
+    CHECK(head == hex("00 00 00 03 00 01 00 02 "
+                      "00 07 02 02 00 04 00 00 00 00 00 09 00 00 00 00 00 00 00 00 00 00 00 10"));
+    const auto back = paramesh::wire_decode_seg_migrate(std::span{room}.first(size.value()));
+    REQUIRE(back.ok());
+    CHECK(back.value().segment == paramesh::SegmentId{3});
+    CHECK(back.value().last);
+    REQUIRE(back.value().entries.size() == 2);
+    CHECK(back.value().entries[0].owner == paramesh::NodeId{4});
+    CHECK(back.value().entries[0].version == 9);
+    CHECK(back.value().entries[0].data.empty());
+    CHECK(back.value().entries[1].page == 511);
+    CHECK(back.value().entries[1].copyset == 0x06);
+    CHECK(std::equal(page.begin(), page.end(), back.value().entries[1].data.begin(),
+                     back.value().entries[1].data.end()));
+
+    // A frame cut short, an entry that says data follows and has none, a page index past the
+    // segment: each refused. So is sending more entries than a frame may carry.
+    CHECK(paramesh::wire_decode_seg_migrate(std::span{room}.first(size.value() - 1)).error().code ==
+          Errc::kProtocol);
+    CHECK(paramesh::wire_decode_seg_migrate(std::span{room}.first(8 + 24 + 24)).error().code ==
+          Errc::kProtocol);
+    migrate.entries[0].page = 512;
+    CHECK(paramesh::wire_encode(migrate, room).error().code == Errc::kInvalidArgument);
+    migrate.entries.assign(paramesh::kMaxMigrateEntries + 1,
+                           {1, 0, 0, paramesh::kNoNode, 0, 0, {}});
+    CHECK(paramesh::wire_encode(migrate, room).error().code == Errc::kInvalidArgument);
+    migrate.entries.pop_back();  // 254 entries of a full page each still fit one frame
+    for (auto& entry : migrate.entries) {
+        entry.where = 1;
+        entry.data = page;
+    }
+    CHECK(paramesh::wire_encode(migrate, room).value() == 8 + 254 * (24 + paramesh::kPageSize));
+}
