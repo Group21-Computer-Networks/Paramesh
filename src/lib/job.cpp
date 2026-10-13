@@ -740,6 +740,10 @@ private:
             }
             const Result<Frame> answer = frame_read(pmd_fd_, *platform_.checksum);
             if (answer.ok() && answer.value().header.opcode == Opcode::kLAdmitRefused) {
+                const Result<LAdmitRefusedPayload> why =
+                    wire_decode_l_admit_refused(answer.value().payload);
+                static_cast<void>(std::fprintf(stderr, "job %u refused: %s\n", s_.job.value,
+                                               why.ok() ? why.value().message.c_str() : "?"));
                 return PM_ERR_REFUSED;
             }
             const Result<LAdmitOkPayload> admitted =

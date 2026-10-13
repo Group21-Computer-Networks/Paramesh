@@ -49,10 +49,11 @@ struct PmdConfig {
     std::uint16_t discovery_port = kDiscoveryPort;  // --discovery-port; the same on every node
     std::uint16_t http_port = kHttpPort;            // --http-port; 0 lets the system choose
     bool multicast = true;                          // --no-multicast: seeds only
-    std::string iface;            // --iface: the one interface for multicast; else every one
-    std::string state_dir;        // --state-dir; pmd.sock and node_id are kept in it
-    std::uint16_t cap_cores = 0;  // --cap-cores: the thread quota of every job
-    std::uint64_t cap_ram = 0;    // --cap-ram, bytes: the page data each job may hold here
+    std::string iface;               // --iface: the one interface for multicast; else every one
+    std::string state_dir;           // --state-dir; pmd.sock and node_id are kept in it
+    std::uint16_t cap_cores = 0;     // --cap-cores: the thread quota of every job
+    std::uint64_t cap_ram = 0;       // --cap-ram, bytes: the page data each job may hold here
+    std::uint64_t spill_budget = 0;  // spill.budget, bytes: what a job may spill here
     // --peers address[:control_port[:discovery_port]],...: the seed list. A daemon sends its
     // HELLO to each seed too, and asks them for workers (M3-5).
     std::vector<Endpoint> peers;
@@ -113,7 +114,10 @@ private:
         std::uint64_t launcher = 0;
         LAdmitReqPayload wants;             // from L_ADMIT_REQ
         std::vector<SegMapMember> members;  // the launcher first
-        std::size_t next_peer = 0;          // index in --peers of the next peer to ask
+        std::vector<Endpoint> candidates;   // the peers to ask, in order
+        std::size_t next_peer = 0;          // index in candidates of the next peer to ask
+        std::uint64_t committed = 0;        // RAM and spill the members commit, this node's too
+        bool unlimited = false;             // a member has no RAM cap
         std::size_t asked = 0;              // SPAWN_REQs not yet answered
         bool admitting = false;
     };
@@ -133,6 +137,7 @@ private:
     void ask_peers(Run& run);
     void ask_next_peer(Run& run);
     void finish_admission(Run& run);
+    void refuse(Run& run, std::uint64_t available, std::size_t nodes);
     std::uint32_t next_job_number();
     Run* run_of(JobId job);
 

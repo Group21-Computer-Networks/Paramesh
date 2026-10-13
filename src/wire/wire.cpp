@@ -645,6 +645,33 @@ Result<SpawnDeclinePayload> wire_decode_spawn_decline(std::span<const std::byte>
     return payload;
 }
 
+Result<std::size_t> wire_encode(const LAdmitRefusedPayload& payload, std::span<std::byte> out) {
+    if (payload.message.size() > kMaxMessage) {
+        return kUnsendable;
+    }
+    Writer w{out};
+    w.put(payload.needed, 8);
+    w.put(payload.available, 8);
+    w.put(static_cast<std::uint16_t>(payload.status), 2);
+    put_str16(w, payload.message);
+    return w.done();
+}
+
+Result<LAdmitRefusedPayload> wire_decode_l_admit_refused(std::span<const std::byte> in) {
+    Reader r{in};
+    LAdmitRefusedPayload payload;
+    payload.needed = r.get(8);
+    payload.available = r.get(8);
+    const std::uint64_t status = r.get(2);
+    payload.message = get_str16(r);
+    if (!r.exact() || payload.message.size() > kMaxMessage ||
+        status > static_cast<std::uint64_t>(Status::kStartTimeout)) {
+        return kMalformed;
+    }
+    payload.status = static_cast<Status>(status);
+    return payload;
+}
+
 Result<std::size_t> wire_encode(const LRegisterPayload& payload, std::span<std::byte> out) {
     if (payload.role != 1 && payload.role != 2) {
         return kUnsendable;

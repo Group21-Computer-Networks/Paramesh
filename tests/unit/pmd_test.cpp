@@ -409,7 +409,8 @@ std::string pmrun_path() {
         .string();
 }
 
-pid_t start_pmrun(const std::vector<std::string>& arguments) {
+pid_t start_pmrun(const std::vector<std::string>& arguments,
+                  const std::string& stderr_to = "/dev/null") {
     std::vector<std::string> all{pmrun_path()};
     all.insert(all.end(), arguments.begin(), arguments.end());
     std::vector<char*> argv;
@@ -420,7 +421,7 @@ pid_t start_pmrun(const std::vector<std::string>& arguments) {
     argv.push_back(nullptr);
     const pid_t pid = ::fork();
     if (pid == 0) {
-        const int null = ::open("/dev/null", O_WRONLY);
+        const int null = ::open(stderr_to.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
         ::dup2(null, STDERR_FILENO);
         ::execv(argv[0], argv.data());
         ::_exit(127);
@@ -594,10 +595,16 @@ int program(const std::string& report, std::string_view mode) {
     if (big || huge) {
         count = huge ? kHugeSquares : kManySquares;
     }
-    const pm_config config{.region_bytes = huge ? kHugeRegion : (big ? 12ULL : 4ULL) << 20U,
-                           .threads_per_node = 0};
-    if (pm_init(nullptr, nullptr, &config) != PM_OK) {
-        return 30;
+    pm_config config{.region_bytes = huge ? kHugeRegion : (big ? 12ULL : 4ULL) << 20U,
+                     .threads_per_node = 0};
+    if (mode == "too-big") {
+        config.region_bytes = 64ULL << 20U;  // more than three nodes of 8 MB and 8 MB of spill
+    }
+    // Every process of the job leaves a mark as it starts, the workers too.
+    write_report(report + ".started." + std::to_string(::getpid()), "");
+    const int started = pm_init(nullptr, nullptr, &config);
+    if (started != PM_OK) {
+        return started == PM_ERR_REFUSED ? 34 : 30;
     }
     SquareArgs args{};
     args.squares = static_cast<std::uint64_t*>(pm_malloc(count * sizeof(std::uint64_t)));
@@ -1255,4 +1262,87 @@ TEST_CASE("a node ID is made on the first run and kept in the state directory") 
         CHECK(contents(state_dir + "/node_id") == std::to_string(first.value) + "\n");
     }
     std::filesystem::remove_all(state_dir);
+}
+
+// ---- admission (M4-4)
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// Three daemons of 8 MB of RAM and 8 MB of spill each that find each other by multicast on
+// this machine and have no seed list: a peer is known only through its beacons.
+struct ThreeHeard {
+    std::uint16_t port = free_udp_ports(1).front();
+    Daemon::Adjust adjust = [this](paramesh::PmdConfig& c) {
+        c.multicast = true;
+        c.iface = "lo";
+        c.discovery_port = port;
+        c.cap_ram = 8ULL << 20U;
+        c.spill_budget = 8ULL << 20U;
+    };
+    Daemon one{1, {}, adjust};
+    Daemon two{2, {}, adjust};
+    Daemon three{3, {}, adjust};
+    std::string report = one.state_dir + "/program";
+
+    ThreeHeard() {
+        REQUIRE(
+            until_heard({&one, &two, &three},
+                        {{"2:alive", "3:alive"}, {"1:alive", "3:alive"}, {"1:alive", "2:alive"}},
+                        5000ms) < 5000ms);
+    }
+    // The processes of the job that left their mark.
+    [[nodiscard]] int started() const {
+        int marks = 0;
+        for (const auto& entry : std::filesystem::directory_iterator{one.state_dir}) {
+            marks += entry.path().filename().string().starts_with("program.started.") ? 1 : 0;
+        }
+        return marks;
+    }
+};
+
+}  // namespace
+
+TEST_CASE(
+    "an oversized job is refused before any worker starts, with what it needs and what there is" *
+    doctest::skip(!region_can_be_mapped())) {
+    const ThreeHeard nodes;
+    const std::string said = nodes.one.state_dir + "/stderr";
+    // 64 MB against 90% of three times 16 MB: 43.2 MB.
+    CHECK(exit_status(start_pmrun({"-n", "3", "--state-dir", nodes.one.state_dir, own_path(),
+                                   "--as-program", nodes.report, "too-big"},
+                                  said),
+                      60) == 34);  // pm_init() returned PM_ERR_REFUSED
+    const std::string text = contents(said);
+    CHECK(text.find("refused: the region needs 64 MB and the 3 nodes chosen give 43 MB (90% of "
+                    "their RAM caps and spill budgets)") != std::string::npos);
+    ::usleep(300000);             // time for a worker to have started, had one been asked for
+    CHECK(nodes.started() == 1);  // the launcher alone
+}
+
+TEST_CASE("a job that fits is admitted and runs on the peers found by discovery" *
+          doctest::skip(!region_can_be_mapped())) {
+    const ThreeHeard nodes;  // no --peers: the workers can only be on discovered nodes
+    CHECK(exit_status(start_pmrun({"-n", "3", "--state-dir", nodes.one.state_dir, own_path(),
+                                   "--as-program", nodes.report, "quick"}),
+                      180) == 0);
+    const std::string said = contents(nodes.report);
+    CHECK(field(said, "wrong") == "0");
+    CHECK(field(said, "every_node") == "yes");
+    CHECK(nodes.started() == 3);
+}
+
+TEST_CASE("one node alone refuses a region past 90% of its own RAM cap and spill budget" *
+          doctest::skip(!region_can_be_mapped())) {
+    const Daemon alone{1, {}, [](paramesh::PmdConfig& c) {
+                           c.cap_ram = 2ULL << 20U;  // with 2 MB of spill: 3.6 MB admissible
+                       }};
+    const std::string report = alone.state_dir + "/program";
+    const std::string said = alone.state_dir + "/stderr";
+    CHECK(exit_status(start_pmrun({"-n", "1", "--state-dir", alone.state_dir, own_path(),
+                                   "--as-program", report, "quick"},  // a 4 MB region
+                                  said),
+                      60) == 34);
+    CHECK(contents(said).find("the region needs 4 MB and the 1 node chosen gives 3 MB") !=
+          std::string::npos);
 }
