@@ -41,6 +41,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <mutex>
 #include <optional>
@@ -60,6 +61,10 @@ constexpr std::uint8_t kWorker = 2;
 constexpr Nanos kLinger =
     std::chrono::milliseconds{150};  // lets a JOB_END leave before the process exits
 constexpr Nanos kFinalizeWait = std::chrono::seconds{2};
+constexpr Nanos kLeaveGrace = std::chrono::seconds{10};  // fixed by the design (docs/PLAN.md)
+constexpr Nanos kLeavePoll = std::chrono::milliseconds{20};
+constexpr std::size_t kMigrateBatch = 32;                     // pages with data in one SEG_MIGRATE
+constexpr std::uint64_t kAddRetry = std::uint64_t{1} << 62U;  // retries_ keys of atomic adds
 
 struct Member {
     NodeId node;
@@ -79,6 +84,12 @@ struct Settings {
     bool affinity = true;                       // PARAMESH_CFG_TASK_AFFINITY=0 turns M3-3 off
     std::uint64_t cache_share = 25;             // mem.cache_share: percent of the RAM cap
     std::optional<std::uint64_t> spill_budget;  // spill.budget, bytes; else the RAM cap
+    // coh.busy_retry_backoff: PARAMESH_CFG_COH_BUSY_RETRY_BACKOFF sets the first wait, in ms.
+    Nanos busy_initial = std::chrono::milliseconds{5};
+    Nanos busy_max = std::chrono::milliseconds{100};
+    // Tests only (PARAMESH_TEST_MOVE_DELAY_MS): a frozen segment is sent this much later, so
+    // that requests are sure to meet a segment on the move.
+    Nanos move_delay{};
     // The hold window against thrashing (AT-1), with the plan's proposed defaults.
     // PARAMESH_CFG_THRASH_THRESHOLD sets the count; 0 turns the window off.
     HomeConfig thrash{8, std::chrono::milliseconds{100}, std::chrono::milliseconds{1},
@@ -150,6 +161,12 @@ bool read_settings(Settings& s) {
     }
     if (const char* share = env("PARAMESH_CFG_MEM_CACHE_SHARE")) {
         s.cache_share = std::min<std::uint64_t>(std::strtoul(share, nullptr, 10), 100);
+    }
+    if (const char* backoff = env("PARAMESH_CFG_COH_BUSY_RETRY_BACKOFF")) {
+        s.busy_initial = std::chrono::milliseconds{std::max(1L, std::strtol(backoff, nullptr, 10))};
+    }
+    if (const char* delay = env("PARAMESH_TEST_MOVE_DELAY_MS")) {
+        s.move_delay = std::chrono::milliseconds{std::strtol(delay, nullptr, 10)};
     }
     if (const char* budget = env("PARAMESH_CFG_SPILL_BUDGET")) {
         s.spill_budget = std::strtoull(budget, nullptr, 10);
@@ -387,6 +404,14 @@ public:
         return value;
     }
 
+    // What pmd's L_LEAVE and L_LEAVE_INTENT do, for a test without a daemon.
+    void test_leave() noexcept {
+        on_network_thread([this] { begin_leave(); });
+    }
+    void test_member_leaving(NodeId node) noexcept {
+        on_network_thread([this, node] { member_leaving(node); });
+    }
+
     // Locks and barriers, and tasks. Null before pm_init() has built the job.
     [[nodiscard]] Sync* sync() noexcept { return sync_.has_value() ? &*sync_ : nullptr; }
     [[nodiscard]] Tasks* tasks() noexcept { return tasks_.has_value() ? &*tasks_ : nullptr; }
@@ -464,7 +489,9 @@ public:
     // ---- RuntimeHost: what src/rt/ asks of the job ----------------------------------------------
     [[nodiscard]] NodeId self() const noexcept override { return s_.self; }
     [[nodiscard]] NodeId launcher() const noexcept override { return s_.members.front().node; }
+    // Any thread: the launcher's main() asks while it queues chunks, and the map can change.
     [[nodiscard]] NodeId home_of(PageId page) const noexcept override {
+        const std::lock_guard<std::mutex> lock{mutex_};
         return slot_node_.at(homes_.at(segment_of(page).value).value);
     }
     [[noreturn]] void abort_job(Status status, std::string_view message) noexcept override {
@@ -538,6 +565,9 @@ public:
             changed_.notify_all();
             return;
         }
+        if (left_.contains(peer.value)) {
+            return;  // it said LEAVE_DONE and every process has the map without it
+        }
         const std::string message = "node " + std::to_string(peer.value) + " lost";
         if (!is_launcher() && peer == s_.members.front().node) {
             exit_with(Status::kNodeLost, message);  // nobody left to tell
@@ -566,14 +596,24 @@ public:
             hold_timers_.erase(held);
             home_event(HomeEventKind::kHoldExpired, FrameHeader{}, page, {});
         }
+        if (const auto due = timers_.find(timer.value); due != timers_.end()) {
+            const std::function<void()> what = std::move(due->second);
+            timers_.erase(due);
+            what();
+        }
         std::deque<FaultEvent> faults;
         std::deque<Add> adds;
         std::deque<StoreNote> notes;
+        std::deque<std::function<void()>> calls;
         {
             const std::lock_guard<std::mutex> lock{mutex_};
             faults.swap(faults_);
             adds.swap(adds_);
             notes.swap(store_notes_);
+            calls.swap(calls_);
+        }
+        for (const std::function<void()>& call : calls) {
+            call();
         }
         // What the store did on its own: the directory records where each page is, and
         // whatever waited for the store goes on.
@@ -586,14 +626,16 @@ public:
         }
         if (!notes.empty()) {
             resume_home();
+            continue_moves();
         }
         for (const Add& add : adds) {
-            std::array<std::byte, 24> payload{};
-            static_cast<void>(wire_encode(add.op, payload));
-            post(home_of(page_of(kRegionBase + add.op.offset)), Opcode::kAtomicOp, payload, add.req,
-                 0, ReplyTimer::kTimed);
+            add_ops_[add.req.value] = add.op;
+            send_add(add.req.value, add.req);
         }
         for (const FaultEvent& fault : faults) {
+            if (evicting_) {
+                continue;  // a leaving node serves no more faults (STATE_MACHINES.md, 1.6)
+            }
             node_event(fault.kind == FaultKind::kRead ? NodeEventKind::kNeedRead
                                                       : NodeEventKind::kNeedWrite,
                        fault.page, kNoReq, {}, false);
@@ -672,6 +714,41 @@ private:
         std::array<std::byte, 8> buffer{};
         static_cast<void>(wire_encode(PageIdPayload{page}, buffer));
         post(to, opcode, buffer, req, 0, timer);
+    }
+
+    // Runs `what` on the network thread after `delay`. Network thread only.
+    void after(Nanos delay, std::function<void()> what) noexcept {
+        timers_[net_->start_timer(delay).value] = std::move(what);
+    }
+
+    // Runs `what` on the network thread soon. Any thread.
+    void on_network_thread(std::function<void()> what) noexcept {
+        {
+            const std::lock_guard<std::mutex> lock{mutex_};
+            calls_.push_back(std::move(what));
+        }
+        run_on_network_thread();
+    }
+
+    // The wait before a request is sent again after BUSY_RETRY or REDIRECT: it doubles for
+    // each retry of the same thing, up to the most (coh.busy_retry_backoff).
+    Nanos backoff(std::uint64_t key) noexcept {
+        const std::uint32_t tries = std::min<std::uint32_t>(retries_[key]++, 16);
+        return std::min(s_.busy_initial * (1U << tries), s_.busy_max);
+    }
+
+    // Sends the pm_atomic_add that began as request `first` to the page's home under the map
+    // of this moment, as a new request.
+    void send_add(std::uint64_t first, ReqId req) noexcept {
+        const auto op = add_ops_.find(first);
+        if (op == add_ops_.end()) {
+            return;
+        }
+        add_first_[req.value] = first;
+        std::array<std::byte, 24> payload{};
+        static_cast<void>(wire_encode(op->second, payload));
+        post(home_of(page_of(kRegionBase + op->second.offset)), Opcode::kAtomicOp, payload, req, 0,
+             ReplyTimer::kTimed);
     }
 
     // Delivers the frames this process addressed to itself.
@@ -778,6 +855,15 @@ private:
                 }
                 return;
             }
+            if (frame.value().header.opcode == Opcode::kLLeave) {
+                on_network_thread([this] { begin_leave(); });
+            } else if (frame.value().header.opcode == Opcode::kLLeaveIntent) {
+                const Result<LeaveIntentPayload> who =
+                    wire_decode_leave_intent(frame.value().payload);
+                if (who.ok()) {
+                    on_network_thread([this, node = who.value().node] { member_leaving(node); });
+                }
+            }
             if (frame.value().header.opcode == Opcode::kLAbort) {
                 const Result<StatusTextPayload> why =
                     wire_decode_spawn_decline(frame.value().payload);
@@ -794,28 +880,7 @@ private:
         }
         if (is_launcher() && !map_sent_) {
             map_sent_ = true;
-            SegMapPayload map;
-            std::vector<PlacementMember> placement;
-            for (const Member& member : s_.members) {
-                const std::uint8_t flags = member.node == s_.self ? kMemberLauncher : 0;
-                map.members.push_back(
-                    {member.node, member.slot, flags, member.at.ipv4, member.at.port, 1});
-                placement.push_back(
-                    {member.node, member.slot, 1});  // without pmd every member weighs the same
-            }
-            map.homes.resize(segments_);
-            if (!store_place_segments(placement, map.homes).ok()) {
-                abort_job(Status::kInternal, kNoNode, "cannot place the segments");
-                return;
-            }
-            apply_map(Epoch{1}, map);
-            std::vector<std::byte> buffer(4 + 20 * map.members.size() + map.homes.size());
-            const Result<std::size_t> size = wire_encode(map, buffer);
-            for (const Member& member : s_.members) {
-                if (member.node != s_.self && size.ok()) {
-                    post(member.node, Opcode::kSegMap, buffer);
-                }
-            }
+            send_map(kNoNode, false);
             if (s_.members.size() == 1) {
                 set_up();
             }
@@ -834,15 +899,392 @@ private:
         changed_.notify_all();
     }
 
+    // Launcher: places the segments, applies the map at the next epoch and sends it to every
+    // member. A member that is leaving is named once more, flagged, with no weight, so it is
+    // home for nothing; with `drop` it is named no longer (docs/PROTOCOL.md, SEG_MAP and 8.2).
+    void send_map(NodeId leaver, bool drop) noexcept {
+        SegMapPayload map;
+        std::vector<PlacementMember> placement;
+        for (const Member& member : s_.members) {
+            const bool leaving = member.node == leaver;
+            if (leaving && drop) {
+                continue;  // apply_map() takes it out of the members and the copysets
+            }
+            std::uint8_t flags = member.node == s_.self ? kMemberLauncher : 0;
+            flags |= leaving ? kMemberLeaving : 0;
+            // Without pmd's commitments every member weighs the same.
+            const std::uint64_t weight = leaving ? 0 : 1;
+            map.members.push_back(
+                {member.node, member.slot, flags, member.at.ipv4, member.at.port, weight});
+            placement.push_back({member.node, member.slot, weight});
+        }
+        map.homes.resize(segments_);
+        if (!store_place_segments(placement, map.homes).ok()) {
+            abort_job(Status::kInternal, kNoNode, "cannot place the segments");
+            return;
+        }
+        acks_ = 0;
+        dropping_ = drop;
+        apply_map(Epoch{epoch_.value + 1}, map);
+        std::vector<std::byte> buffer(4 + 20 * map.members.size() + map.homes.size());
+        const Result<std::size_t> size = wire_encode(map, buffer);
+        for (const Member& member : s_.members) {
+            if (member.node != s_.self && size.ok()) {
+                post(member.node, Opcode::kSegMap, buffer);
+            }
+        }
+        if (drop && s_.members.size() == 1) {
+            map_acked();  // nobody is left to acknowledge it
+        }
+    }
+
+    // Launcher: every member has applied the newest map.
+    void map_acked() noexcept {
+        if (!up_) {
+            set_up();
+            return;
+        }
+        if (!dropping_ || leavers_.empty()) {
+            return;
+        }
+        // The map without the leaver is everywhere: nobody will address it again, and it may go.
+        const NodeId gone = leavers_.front();
+        leavers_.pop_front();
+        dropping_ = false;
+        post_job_end(gone, Status::kLeft, gone, "");
+        if (Tasks* queue = tasks(); queue != nullptr) {
+            queue->return_chunks(gone);
+        }
+        platform_.logger->log(LogLevel::kInfo, "member_left",
+                              JsonObject{{"node", JsonValue{std::int64_t{gone.value}}},
+                                         {"segments", JsonValue{std::int64_t{segments_moved_}}}});
+        if (!leavers_.empty()) {
+            start_leave();
+        }
+    }
+
+    // ---- a member leaves (docs/PROTOCOL.md, 8.2) ------------------------------------------------
+
+    // Launcher: a member is leaving (L_LEAVE_INTENT). One at a time; another waits its turn.
+    void member_leaving(NodeId node) noexcept {
+        const bool member = std::any_of(s_.members.begin(), s_.members.end(),
+                                        [node](const Member& m) { return m.node == node; });
+        if (!is_launcher() || !up_ || node == s_.self || !member ||
+            std::find(leavers_.begin(), leavers_.end(), node) != leavers_.end()) {
+            return;
+        }
+        leavers_.push_back(node);
+        if (leavers_.size() == 1) {
+            start_leave();
+        }
+    }
+
+    // No more chunks for the leaver; what it has not finished after the grace goes back in the
+    // queue; and a map in which it is home for nothing.
+    void start_leave() noexcept {
+        const NodeId node = leavers_.front();
+        platform_.logger->log(LogLevel::kInfo, "member_leaving",
+                              JsonObject{{"node", JsonValue{std::int64_t{node.value}}}});
+        if (Tasks* queue = tasks(); queue != nullptr) {
+            queue->member_leaving(node);
+            after(kLeaveGrace, [this, node] {
+                if (Tasks* later = tasks(); later != nullptr && !ending_ && !aborting_) {
+                    later->return_chunks(node);
+                }
+            });
+        }
+        send_map(node, false);
+    }
+
+    // This process is to leave (L_LEAVE): its threads take no more chunks, and when they are
+    // idle, or after the grace, it gives up every page it holds.
+    void begin_leave() noexcept {
+        if (is_launcher() || leaving_ || !up_) {
+            return;
+        }
+        leaving_ = true;
+        platform_.logger->log(LogLevel::kInfo, "leaving", JsonObject{});
+        if (Tasks* queue = tasks(); queue != nullptr) {
+            queue->leave();
+        }
+        after(kLeaveGrace, [this] { give_up_pages(); });
+        wait_for_tasks();
+    }
+
+    void wait_for_tasks() noexcept {
+        Tasks* queue = tasks();
+        if (queue == nullptr || queue->idle()) {
+            give_up_pages();
+        } else if (!evicting_) {
+            after(kLeavePoll, [this] { wait_for_tasks(); });
+        }
+    }
+
+    // Leave, step 3: EVICT on every page held, so modified pages are written back and read
+    // copies dropped. From here on no fault of this process is served (STATE_MACHINES.md, 1.6);
+    // a page still on its way in is given up as soon as it arrives.
+    void give_up_pages() noexcept {
+        if (evicting_) {
+            return;
+        }
+        evicting_ = true;
+        for (std::uint64_t page = 0; page < states_.size(); page++) {
+            if (states_[page] == PageState::kShared || states_[page] == PageState::kModified) {
+                node_event(NodeEventKind::kEvict, PageId{page}, kNoReq, {}, false);
+            }
+        }
+        pump();
+        leave_if_done();
+    }
+
+    // LEAVE_DONE, once this node holds no page and is home for nothing.
+    void leave_if_done() noexcept {
+        const bool hosting = std::any_of(seg_.begin(), seg_.end(), [](Seg s) {
+            return s == Seg::kServing || s == Seg::kFrozen || s == Seg::kArriving;
+        });
+        if (!evicting_ || leave_done_ || held_pages_ != 0 || hosting || !hosts_nothing()) {
+            return;
+        }
+        leave_done_ = true;
+        std::array<std::byte, 4> done{};
+        static_cast<void>(wire_encode(LeaveDonePayload{segments_moved_}, done));
+        post(s_.members.front().node, Opcode::kLeaveDone, done);
+    }
+
+    // True once a map has made this node home for no segment.
+    [[nodiscard]] bool hosts_nothing() const noexcept {
+        return epoch_.value > 1 && std::none_of(homes_.begin(), homes_.end(),
+                                                [this](Slot home) { return home == my_slot_; });
+    }
+
+    // ---- segments on the move (docs/STATE_MACHINES.md, section 3) ------------------------------
+
+    // Is a page request for this node to handle? If not it is answered here: REDIRECT when
+    // this node knows better where the page lives, BUSY_RETRY when the sender knows a newer
+    // map or the segment has not arrived yet.
+    bool serves(const FrameHeader& header, PageId page) noexcept {
+        const std::uint32_t segment = segment_of(page).value;
+        const Seg state = segment < seg_.size() ? seg_[segment] : Seg::kOther;
+        if (state == Seg::kServing) {
+            return true;
+        }
+        if (state == Seg::kArriving ||
+            (state == Seg::kOther && header.epoch.value > epoch_.value)) {
+            post_page_id(header.src, Opcode::kBusyRetry, page, header.req, ReplyTimer::kNone);
+            return false;
+        }
+        std::array<std::byte, 16> redirect{};
+        static_cast<void>(wire_encode(RedirectPayload{page, epoch_, home_of(page)}, redirect));
+        post(header.src, Opcode::kRedirect, redirect, header.req);
+        return false;
+    }
+
+    // BUSY_RETRY or REDIRECT came for a request of this process: it is sent again, as a new
+    // request, after the back-off, to the page's home under the map this process then has.
+    // ponytail: after a REDIRECT this does not wait for the map of the epoch it names; if the
+    // old map is still the newest here the request is redirected once more.
+    void try_again(const FrameHeader& header, std::span<const std::byte> payload) noexcept {
+        sent_again_++;
+        if (const auto add = add_first_.find(header.req.value); add != add_first_.end()) {
+            const std::uint64_t first = add->second;
+            add_first_.erase(add);
+            after(backoff(kAddRetry | first), [this, first] { send_add(first, fresh()); });
+            return;
+        }
+        PageId page;
+        if (header.opcode == Opcode::kBusyRetry) {
+            const Result<PageIdPayload> busy = wire_decode_page_id(payload);
+            page = busy.ok() ? busy.value().page : PageId{states_.size()};
+        } else {
+            const Result<RedirectPayload> redirect = wire_decode_redirect(payload);
+            page = redirect.ok() ? redirect.value().page : PageId{states_.size()};
+        }
+        if (page.value >= states_.size()) {
+            abort_job(Status::kProtocol, header.src,
+                      "malformed frame from node " + std::to_string(header.src.value));
+            return;
+        }
+        node_event(header.opcode == Opcode::kBusyRetry ? NodeEventKind::kBusyRetry
+                                                       : NodeEventKind::kRedirect,
+                   page, header.req, {}, false);
+    }
+
+    // Sends frozen segments that have nothing in progress any more, and goes on with those
+    // that waited for the store.
+    void continue_moves() noexcept {
+        if (!stalled_) {
+            for (std::size_t s = 0; s < seg_.size(); s++) {
+                if (seg_[s] == Seg::kFrozen) {
+                    send_segment(SegmentId{static_cast<std::uint32_t>(s)});
+                }
+            }
+        }
+        take_segments();
+    }
+
+    // SEG_MIGRATE for one frozen segment, from where it stopped: every entry of the directory,
+    // with the home copy where there is one. A page in the spill file is asked for first and
+    // the sending goes on when the store has it.
+    // ponytail: up to kMigrateBatch pages are copied out of the store for one frame, outside
+    // its cap, for as long as the frame takes to leave.
+    void send_segment(SegmentId segment) noexcept {
+        const auto found = sending_.find(segment.value);
+        std::size_t next = found == sending_.end() ? 0 : found->second;
+        if (next > kPagesPerSegment || home_segment_busy(*dir_, segment) ||
+            net_->now() < moves_from_) {
+            return;  // sent, and waiting for SEG_MIGRATE_DONE; or an operation is still ending
+        }
+        const NodeId to = home_of(PageId{segment.value * kPagesPerSegment});
+        std::vector<std::array<std::byte, kPageSize>> pages(kMigrateBatch);
+        std::vector<std::byte> frame(8 + kMaxMigrateEntries * 24 + kMigrateBatch * kPageSize);
+        while (next <= kPagesPerSegment) {
+            SegMigratePayload batch;
+            batch.segment = segment;
+            std::size_t copied = 0;
+            bool waiting = false;  // for the store to read a page back
+            for (; next < kPagesPerSegment && copied < kMigrateBatch &&
+                   batch.entries.size() < kMaxMigrateEntries;
+                 next++) {
+                const PageId page{segment.value * kPagesPerSegment + next};
+                const HomeEntryView entry = home_entry(*dir_, page);
+                if (entry.state == HomeState::kUncached && entry.where == HomeWhere::kZero &&
+                    entry.version == 0) {
+                    continue;  // never touched: no entry is sent
+                }
+                SegMigrateEntry out;
+                out.page = static_cast<std::uint16_t>(next);
+                out.state = static_cast<std::uint8_t>(entry.state);
+                out.owner = entry.owner;
+                out.version = entry.version;
+                out.copyset = entry.copyset;
+                if (entry.where == HomeWhere::kNone) {
+                    out.where = 2;
+                } else if (entry.where != HomeWhere::kZero) {
+                    const Result<StoreLookup> got = store_->get(page, pages[copied]);
+                    if (got.ok() && got.value() == StoreLookup::kSpilled &&
+                        store_->load(page).ok()) {
+                        waiting = true;  // goes on from this page at the store's next word
+                        break;
+                    }
+                    if (!got.ok() || got.value() != StoreLookup::kCopied) {
+                        abort_job(Status::kInternal, s_.self,
+                                  "the home has no copy of page " + std::to_string(page.value));
+                        return;
+                    }
+                    out.where = 1;
+                    out.data = pages[copied++];
+                }
+                batch.entries.push_back(out);
+            }
+            batch.last = next == kPagesPerSegment;
+            if (!batch.entries.empty() || batch.last) {
+                const Result<std::size_t> size = wire_encode(batch, frame);
+                if (size.ok()) {
+                    post(to, Opcode::kSegMigrate, std::span{frame}.first(size.value()), fresh(), 0,
+                         batch.last ? ReplyTimer::kTimed : ReplyTimer::kNone);
+                }
+            }
+            if (batch.last) {
+                next = kPagesPerSegment + 1;  // all sent
+            }
+            if (waiting) {
+                break;
+            }
+        }
+        sending_[segment.value] = next;
+    }
+
+    // SEG_MIGRATE_DONE: the new home serves the segment. Its entries and home copies go.
+    void segment_gone(SegmentId segment) noexcept {
+        if (seg_[segment.value] != Seg::kFrozen) {
+            return;
+        }
+        for (std::uint64_t i = 0; i < kPagesPerSegment; i++) {
+            store_->drop(PageId{segment.value * kPagesPerSegment + i});
+        }
+        home_remove_segment(*dir_, segment);
+        sending_.erase(segment.value);
+        seg_[segment.value] = Seg::kMoved;
+        segments_moved_++;
+        leave_if_done();
+    }
+
+    // The SEG_MIGRATE frames that have come, in order: each entry into the directory and its
+    // page into the store, which may be making room. After the last frame of a segment this
+    // node serves it and says SEG_MIGRATE_DONE.
+    void take_segments() noexcept {
+        while (!incoming_.empty() && !aborting_) {
+            const Incoming& frame = incoming_.front();
+            const Result<SegMigratePayload> batch = wire_decode_seg_migrate(frame.bytes);
+            if (batch.ok() && frame.epoch.value > epoch_.value) {
+                return;  // the map that makes this node the home has not come yet
+            }
+            if (!batch.ok() || batch.value().segment.value >= seg_.size() ||
+                seg_[batch.value().segment.value] != Seg::kArriving) {
+                abort_job(Status::kProtocol, frame.from,
+                          "malformed frame from node " + std::to_string(frame.from.value));
+                return;
+            }
+            const SegmentId segment = batch.value().segment;
+            for (; incoming_at_ < batch.value().entries.size(); incoming_at_++) {
+                const SegMigrateEntry& in = batch.value().entries[incoming_at_];
+                const PageId page{segment.value * kPagesPerSegment + in.page};
+                if (in.where == 1) {
+                    const Result<void> put = store_->put(page, in.data.first<kPageSize>());
+                    if (!put.ok() && put.error().code == Errc::kState) {
+                        return;  // goes on from this entry at the store's next word
+                    }
+                    if (!put.ok()) {
+                        abort_job(Status::kInternal, s_.self, "the home store is full");
+                        return;
+                    }
+                }
+                HomeEntryView entry;
+                entry.state = static_cast<HomeState>(in.state);
+                static constexpr std::array kWhere{HomeWhere::kZero, HomeWhere::kRam,
+                                                   HomeWhere::kNone};
+                entry.where = kWhere.at(in.where);
+                entry.owner = in.owner;
+                entry.copyset = in.copyset;
+                entry.version = in.version;
+                if (!home_import_entry(*dir_, page, entry).ok()) {
+                    abort_job(Status::kProtocol, frame.from,
+                              "malformed frame from node " + std::to_string(frame.from.value));
+                    return;
+                }
+            }
+            if (batch.value().last) {
+                seg_[segment.value] = Seg::kServing;
+                std::array<std::byte, 4> done{};
+                static_cast<void>(wire_encode(SegMigrateDonePayload{segment}, done));
+                post(frame.from, Opcode::kSegMigrateDone, done, frame.req);
+            }
+            incoming_.pop_front();
+            incoming_at_ = 0;
+        }
+    }
+
+    // The first map makes this node home for its segments, all untouched. A later one moves
+    // segments (docs/STATE_MACHINES.md, section 3): one this node was serving and no longer
+    // hosts is frozen and sent to its new home; one it now hosts and did not is on its way.
     void apply_map(Epoch epoch, const SegMapPayload& map) noexcept {
-        epoch_ = epoch;
-        homes_ = map.homes;
-        slot_node_.fill(kNoNode);
+        const bool first = !have_map_;
+        {
+            const std::lock_guard<std::mutex> lock{mutex_};
+            epoch_ = epoch;
+            homes_ = map.homes;
+            slot_node_.fill(kNoNode);
+            for (const SegMapMember& member : map.members) {
+                slot_node_.at(member.slot.value) = member.node;
+            }
+        }
         for (const SegMapMember& member : map.members) {
-            slot_node_.at(member.slot.value) = member.node;
             if (member.node == s_.self) {
                 my_slot_ = member.slot;
             }
+            // The directory sends INV and FETCH to the node behind a copyset bit.
+            home_set_member(*dir_, member.slot, member.node);
+            slots_[member.node.value] = member.slot;
             // A worker started by pmd hears of the other workers here, and connects to them.
             const bool known =
                 std::any_of(s_.members.begin(), s_.members.end(),
@@ -853,25 +1295,57 @@ private:
                 static_cast<void>(net_->add_peer(member.node, at));
             }
         }
-        for (std::size_t segment = 0; segment < homes_.size(); segment++) {
-            if (homes_[segment] == my_slot_) {
-                static_cast<void>(
-                    home_add_segment(*dir_, SegmentId{static_cast<std::uint32_t>(segment)}));
+        // A member named no longer has left: it is in no copyset, and its connection closing
+        // is no loss.
+        std::erase_if(s_.members, [&](const Member& gone) {
+            const bool listed =
+                std::any_of(map.members.begin(), map.members.end(),
+                            [&gone](const SegMapMember& m) { return m.node == gone.node; });
+            if (!listed) {
+                home_drop_member(*dir_, gone.slot);
+                left_.insert(gone.node.value);
+            }
+            return !listed;
+        });
+        if (first) {
+            seg_.assign(homes_.size(), Seg::kOther);
+            states_.assign(homes_.size() * kPagesPerSegment, PageState::kInvalid);
+            allocator_ = RegionAllocator{homes_.size() * kSegmentSize};
+            region_bytes_ = homes_.size() * kSegmentSize;
+        }
+        for (std::size_t s = 0; s < homes_.size(); s++) {
+            const SegmentId segment{static_cast<std::uint32_t>(s)};
+            const bool mine = homes_[s] == my_slot_;
+            if (first && mine) {
+                static_cast<void>(home_add_segment(*dir_, segment));
+                seg_[s] = Seg::kServing;
+            } else if (seg_[s] == Seg::kServing && !mine) {
+                seg_[s] = Seg::kFrozen;
+                if (s_.move_delay > Nanos{} && moves_from_ <= net_->now()) {
+                    moves_from_ = net_->now() + s_.move_delay;
+                    after(s_.move_delay, [this] { continue_moves(); });
+                }
+                actions_.clear();
+                home_freeze_segment(*dir_, segment, slot_node_.at(homes_[s].value), actions_);
+                run_home_actions(actions_, {}, net_->now());
+            } else if (!first && mine && (seg_[s] == Seg::kOther || seg_[s] == Seg::kMoved)) {
+                static_cast<void>(home_add_segment(*dir_, segment));
+                seg_[s] = Seg::kArriving;
             }
         }
-        states_.assign(homes_.size() * kPagesPerSegment, PageState::kInvalid);
-        allocator_ = RegionAllocator{homes_.size() * kSegmentSize};
-        region_bytes_ = homes_.size() * kSegmentSize;
         have_map_ = true;
+        if (!first) {
+            continue_moves();
+            leave_if_done();
+        }
     }
 
+    // The copyset bit of a node. A member that has left keeps its bit for the frames it sent
+    // before it went: a slot is never given to another member (docs/PROTOCOL.md, [GATE P5]),
+    // and a home that asked it for an INV_ACK just before the map without it still gets one.
     [[nodiscard]] Slot slot_of(NodeId node) const noexcept {
-        for (std::size_t slot = 0; slot < slot_node_.size(); slot++) {
-            if (slot_node_.at(slot) == node) {
-                return Slot{static_cast<std::uint8_t>(slot)};
-            }
-        }
-        return Slot{0};
+        const auto found = slots_.find(node.value);
+        return found == slots_.end() ? Slot{0} : found->second;
     }
 
     // ---- one frame -----------------------------------------------------------------------------
@@ -881,7 +1355,77 @@ private:
     void log_pages() const noexcept {
         platform_.logger->log(
             LogLevel::kInfo, "job_pages",
-            JsonObject{{"received", JsonValue{static_cast<std::int64_t>(pages_in_)}}});
+            JsonObject{{"received", JsonValue{static_cast<std::int64_t>(pages_in_)}},
+                       {"sent_again", JsonValue{static_cast<std::int64_t>(sent_again_)}}});
+    }
+
+    // The frames of maps, of segments on the move and of leaving. True if it was one of them.
+    template <typename Bad>
+    bool handle_map_or_move(const FrameHeader& header, std::span<const std::byte> payload,
+                            const Bad& bad) noexcept {
+        switch (header.opcode) {
+            case Opcode::kSegMap: {
+                const Result<SegMapPayload> map = wire_decode_seg_map(payload);
+                if (!map.ok() || is_launcher()) {
+                    bad();
+                    return true;
+                }
+                const bool first = !have_map_;
+                apply_map(header.epoch, map.value());
+                if (first) {
+                    advance_start();
+                } else {
+                    std::array<std::byte, 4> ack{};
+                    static_cast<void>(wire_encode(SegMapAckPayload{epoch_}, ack));
+                    post(s_.members.front().node, Opcode::kSegMapAck, ack);
+                }
+                return true;
+            }
+            case Opcode::kSegMapAck: {
+                const Result<SegMapAckPayload> ack = wire_decode_seg_map_ack(payload);
+                if (!ack.ok()) {
+                    bad();
+                    return true;
+                }
+                // Every member but the launcher, and but one that is leaving (it is told with
+                // JOB_END), has applied the newest map.
+                if (ack.value().epoch == epoch_ && ++acks_ + 1 == s_.members.size()) {
+                    map_acked();
+                }
+                return true;
+            }
+            case Opcode::kBusyRetry:
+            case Opcode::kRedirect:
+                try_again(header, payload);
+                return true;
+            case Opcode::kSegMigrate:
+                incoming_.push_back(Incoming{
+                    header.src, header.req, header.epoch, {payload.begin(), payload.end()}});
+                take_segments();
+                return true;
+            case Opcode::kSegMigrateDone: {
+                const Result<SegMigrateDonePayload> done = wire_decode_seg_migrate_done(payload);
+                if (!done.ok() || done.value().segment.value >= seg_.size()) {
+                    bad();
+                    return true;
+                }
+                segment_gone(done.value().segment);
+                return true;
+            }
+            case Opcode::kLeaveDone: {
+                const Result<LeaveDonePayload> done = wire_decode_leave_done(payload);
+                if (!done.ok() || !is_launcher() || leavers_.empty() ||
+                    leavers_.front() != header.src) {
+                    bad();
+                    return true;
+                }
+                segments_moved_ = done.value().segments;
+                send_map(header.src, true);  // the map without the leaver
+                return true;
+            }
+            default:
+                return false;
+        }
     }
 
     void handle(const FrameHeader& header, std::span<const std::byte> payload) noexcept {
@@ -894,22 +1438,10 @@ private:
             abort_job(Status::kProtocol, header.src,
                       "malformed frame from node " + std::to_string(header.src.value));
         };
+        if (handle_map_or_move(header, payload, bad)) {
+            return;
+        }
         switch (header.opcode) {
-            case Opcode::kSegMap: {
-                const Result<SegMapPayload> map = wire_decode_seg_map(payload);
-                if (!map.ok() || is_launcher()) {
-                    bad();
-                    return;
-                }
-                apply_map(header.epoch, map.value());
-                advance_start();
-                return;
-            }
-            case Opcode::kSegMapAck:
-                if (++acks_ + 1 == s_.members.size()) {
-                    set_up();
-                }
-                return;
             // The messages that carry a page ID and nothing else: to the home machine ...
             case Opcode::kReadReq:
             case Opcode::kWriteReq:
@@ -947,13 +1479,14 @@ private:
                         node_event(NodeEventKind::kWritebackAck, page, header.req, {}, false);
                         break;
                     case Opcode::kInv:
-                        node_event(NodeEventKind::kInv, page, header.req, {}, false);
+                        node_event(NodeEventKind::kInv, page, header.req, {}, false, header.src);
                         break;
                     case Opcode::kFetch:
-                        node_event(NodeEventKind::kFetch, page, header.req, {}, false);
+                        node_event(NodeEventKind::kFetch, page, header.req, {}, false, header.src);
                         break;
                     default:
-                        node_event(NodeEventKind::kFetchInv, page, header.req, {}, false);
+                        node_event(NodeEventKind::kFetchInv, page, header.req, {}, false,
+                                   header.src);
                         break;
                 }
                 return;
@@ -971,12 +1504,17 @@ private:
             }
             case Opcode::kAtomicResult: {
                 const Result<AtomicResultPayload> result = wire_decode_atomic_result(payload);
+                const auto first = add_first_.find(header.req.value);
                 const std::lock_guard<std::mutex> lock{mutex_};
-                const auto waiting = add_results_.find(header.req.value);
+                const auto waiting = first == add_first_.end() ? add_results_.end()
+                                                               : add_results_.find(first->second);
                 if (!result.ok() || waiting == add_results_.end()) {
                     bad();
                     return;
                 }
+                add_ops_.erase(first->second);
+                retries_.erase(kAddRetry | first->second);
+                add_first_.erase(first);
                 waiting->second = result.value().old;
                 changed_.notify_all();
                 return;
@@ -1032,10 +1570,12 @@ private:
                     abort_job(end.value().status, end.value().node, end.value().message);
                     return;
                 }
-                if (end.value().status == Status::kOk) {
+                if (end.value().status == Status::kOk || end.value().status == Status::kLeft) {
                     log_pages();
                 }
-                exit_with(end.value().status, end.value().message);
+                // LEFT: the reply to this node's LEAVE_DONE. Nobody will address it again.
+                exit_with(end.value().status == Status::kLeft ? Status::kOk : end.value().status,
+                          end.value().message);
             }
             default:
                 abort_job(Status::kUnsupported, header.src,
@@ -1084,8 +1624,10 @@ private:
     // ---- the node machine
     // ------------------------------------------------------------------------
 
+    // `from`: for INV, FETCH and FETCH_INV, the home that asks; its answer goes back to it,
+    // which is not the page's home under this node's map while a segment is moving.
     void node_event(NodeEventKind kind, PageId page, ReqId req, std::span<const std::byte> data,
-                    bool zero) noexcept {
+                    bool zero, NodeId from = kNoNode) noexcept {
         if (aborting_ || page.value >= states_.size()) {
             if (!aborting_) {
                 abort_job(Status::kInternal, s_.self, "an access outside the job's region");
@@ -1096,11 +1638,20 @@ private:
         // sees a page's events in the order they came.
         const bool behind = std::any_of(held_.begin(), held_.end(),
                                         [page](const Held& h) { return h.page == page; });
-        if (behind || !node_step(kind, page, req, data, zero)) {
-            held_.push_back(Held{kind, page, req, {data.begin(), data.end()}, zero});
+        if (behind || !node_step(kind, page, req, data, zero, from)) {
+            held_.push_back(Held{kind, page, req, {data.begin(), data.end()}, zero, from});
         }
         if (depth_ == 0) {
             release_held();
+        }
+        // A leaving node keeps nothing: a page that has just arrived is given up at once.
+        if (evicting_ && kind != NodeEventKind::kEvict &&
+            (states_[page.value] == PageState::kShared ||
+             states_[page.value] == PageState::kModified)) {
+            node_event(NodeEventKind::kEvict, page, kNoReq, {}, false);
+        }
+        if (evicting_ && depth_ == 0) {
+            leave_if_done();
         }
     }
 
@@ -1109,17 +1660,27 @@ private:
         while (!held_.empty() && !aborting_) {
             Held next = std::move(held_.front());
             held_.pop_front();
-            if (!node_step(next.kind, next.page, next.req, next.data, next.zero)) {
+            if (!node_step(next.kind, next.page, next.req, next.data, next.zero, next.from)) {
                 held_.push_front(std::move(next));
                 return;
             }
         }
     }
 
+    // What a leave needs counted: the pages held, and that a request got through at last.
+    void note_step(NodeEventKind kind, PageId page, PageState before, PageState after) noexcept {
+        held_pages_ += after != PageState::kInvalid ? 1 : 0;
+        held_pages_ -= before != PageState::kInvalid ? 1 : 0;
+        if (kind == NodeEventKind::kReadData || kind == NodeEventKind::kWriteGrant ||
+            kind == NodeEventKind::kUpgradeGrant || kind == NodeEventKind::kWritebackAck) {
+            retries_.erase(page.value);
+        }
+    }
+
     // One event through the node machine. False if it would install a page and the local
     // cache has no room until a page given up is discarded: nothing has been done then.
     bool node_step(NodeEventKind kind, PageId page, ReqId req, std::span<const std::byte> data,
-                   bool zero) noexcept {
+                   bool zero, NodeId from) noexcept {
         NodeEvent event;
         event.kind = kind;
         event.page = page;
@@ -1139,6 +1700,7 @@ private:
         if (installs && !make_room(page)) {
             return false;
         }
+        note_step(kind, page, before, step.state);
         states_[page.value] = step.state;
         if (step.current == kNoReq) {
             current_.erase(page.value);
@@ -1157,8 +1719,8 @@ private:
                     if (a.with_page) {
                         ok = mem_->read(page, std::span{buffer}.last<kPageSize>()).ok();
                     }
-                    post(home_of(page), a.opcode,
-                         std::span{buffer}.first(a.with_page ? buffer.size() : 8), a.req,
+                    post(a.kind == NodeActionKind::kReply && from != kNoNode ? from : home_of(page),
+                         a.opcode, std::span{buffer}.first(a.with_page ? buffer.size() : 8), a.req,
                          a.read_only ? kFlagReadOnly : std::uint16_t{0},
                          a.kind == NodeActionKind::kSend ? ReplyTimer::kTimed : ReplyTimer::kNone);
                     break;
@@ -1189,6 +1751,12 @@ private:
                     break;
                 case NodeActionKind::kWake:
                     ok = mem_->wake(page).ok();
+                    break;
+                case NodeActionKind::kArmResend:  // BUSY_RETRY or REDIRECT: again, later
+                    after(backoff(page.value), [this, page] {
+                        node_event(NodeEventKind::kResend, page, kNoReq, {}, false);
+                        pump();
+                    });
                     break;
                 default:
                     ok = false;
@@ -1247,6 +1815,16 @@ private:
                 kind, header, page, {data.begin(), data.end()}, offset_in_page, operand});
             return;
         }
+        // Section 3: a request is handled only for a segment this node serves, and what is
+        // left of a segment that has gone (a timer, a word from the store) is nothing.
+        const std::uint32_t segment = segment_of(page).value;
+        const Seg where = segment < seg_.size() ? seg_[segment] : Seg::kOther;
+        const bool request = kind == HomeEventKind::kReadReq || kind == HomeEventKind::kWriteReq ||
+                             kind == HomeEventKind::kUpgradeReq ||
+                             kind == HomeEventKind::kWriteback || kind == HomeEventKind::kAtomicOp;
+        if (request ? !serves(header, page) : (where != Seg::kServing && where != Seg::kFrozen)) {
+            return;
+        }
         // The store says a page is in RAM. Only an entry waiting for that takes it as an event:
         // otherwise this node asked on its own (see home_copy()), or the page was there already.
         if (kind == HomeEventKind::kLoaded) {
@@ -1267,9 +1845,26 @@ private:
         event.slot = slot_of(header.src);
         event.req = header.req;
         event.now = net_->now();
+        const HomeEntryView was = home_entry(*dir_, page);
         actions_.clear();
         home_step(*dir_, event, actions_);
+        if (std::any_of(actions_.begin(), actions_.end(),
+                        [](const HomeAction& a) { return a.kind == HomeActionKind::kAbort; })) {
+            // docs/STATE_MACHINES.md, [GATE S8]: name the page, the state and the event.
+            abort_job(Status::kInternal, s_.self,
+                      "the home machine met an impossible event: page " +
+                          std::to_string(page.value) + ", event " +
+                          std::to_string(static_cast<int>(kind)) + " from node " +
+                          std::to_string(header.src.value) + ", state " +
+                          std::to_string(static_cast<int>(was.state)) + ", waiting for " +
+                          std::to_string(static_cast<int>(was.wait)) + ", segment state " +
+                          std::to_string(static_cast<int>(where)));
+            return;
+        }
         run_home_actions(actions_, data, event.now);
+        if (where == Seg::kFrozen && !stalled_) {
+            send_segment(SegmentId{segment});  // if that was the last operation in progress
+        }
     }
 
     // What became of one home action.
@@ -1310,6 +1905,12 @@ private:
     }
 
     Done home_reply(const HomeAction& a, std::span<const std::byte> data) noexcept {
+        if (a.opcode == Opcode::kRedirect) {  // a waiting request of a segment that moves
+            std::array<std::byte, 16> redirect{};
+            static_cast<void>(wire_encode(RedirectPayload{a.page, epoch_, a.other}, redirect));
+            post(a.to, a.opcode, redirect, a.req);
+            return Done::kYes;
+        }
         std::array<std::byte, 8 + kPageSize> buffer{};
         put_u64(buffer, 0, a.page.value);
         std::uint16_t flags = a.read_only ? kFlagReadOnly : std::uint16_t{0};
@@ -1372,6 +1973,7 @@ private:
             home_event(next.kind, next.header, next.page, next.data, next.offset_in_page,
                        next.operand);
         }
+        continue_moves();
     }
 
     // `data`: the page that came with the event; `now`: when the event came. An action the
@@ -1473,6 +2075,7 @@ private:
     std::unordered_map<std::uint64_t, ReqId> current_;
     std::deque<Local> local_;
     std::uint64_t pages_in_ = 0;
+    std::uint64_t sent_again_ = 0;  // requests answered BUSY_RETRY or REDIRECT
     // Events held back until the local cache has room (M4-2), in the order they came.
     struct Held {
         NodeEventKind kind;
@@ -1480,8 +2083,35 @@ private:
         ReqId req;
         std::vector<std::byte> data;
         bool zero;
+        NodeId from;
     };
     std::deque<Held> held_;
+    // Leaving and segments on the move (M4-5).
+    enum class Seg : std::uint8_t { kOther, kServing, kFrozen, kMoved, kArriving };
+    struct Incoming {
+        NodeId from;
+        ReqId req;
+        Epoch epoch;
+        std::vector<std::byte> bytes;
+    };
+    std::vector<Seg> seg_;  // one state for each segment (section 3)
+    std::unordered_map<std::uint32_t, std::size_t> sending_;  // frozen: the next page to send
+    std::deque<Incoming> incoming_;                  // SEG_MIGRATE frames not yet installed
+    std::size_t incoming_at_ = 0;                    // the next entry of the first of them
+    std::unordered_set<std::uint16_t> left_;         // members that have left
+    std::unordered_map<std::uint16_t, Slot> slots_;  // every member there has been: its bit
+    std::deque<NodeId> leavers_;                     // launcher: leaving, the first in progress
+    bool dropping_ = false;                          // launcher: the map without it is out
+    bool leaving_ = false;                           // this process is leaving
+    bool evicting_ = false;                          // and serves no more faults
+    bool leave_done_ = false;                        // LEAVE_DONE is sent
+    std::uint64_t held_pages_ = 0;                   // pages not in state I
+    std::uint32_t segments_moved_ = 0;
+    Nanos moves_from_{};  // tests only: no segment is sent before this
+    std::unordered_map<std::uint64_t, std::function<void()>> timers_;
+    std::unordered_map<std::uint64_t, std::uint32_t> retries_;    // by page, or kAddRetry | add
+    std::unordered_map<std::uint64_t, AtomicOpPayload> add_ops_;  // by first request: unanswered
+    std::unordered_map<std::uint64_t, std::uint64_t> add_first_;  // by request in flight
     // The same for the home side and its store (M4-3): the actions waiting for the store, and
     // the events that came meanwhile.
     struct Stalled {
@@ -1510,11 +2140,12 @@ private:
     std::atomic<bool> ending_{false};
     std::atomic<std::uint64_t> region_bytes_{0};  // 0 until the segment map is applied
     TimerId linger_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable changed_;
     std::deque<FaultEvent> faults_;
     std::deque<Add> adds_;
     std::deque<StoreNote> store_notes_;
+    std::deque<std::function<void()>> calls_;  // for the network thread, from any thread
     std::set<std::pair<std::uint16_t, std::uint64_t>> task_seen_;  // (node, task) logged
     std::unordered_map<std::uint64_t, std::optional<std::uint64_t>> add_results_;
     std::string abort_message_;
@@ -1731,6 +2362,18 @@ int pm_test_run_on_workers(uint32_t id) {
         return PM_ERR_STATE;
     }
     return paramesh::job()->run_on_workers(id);
+}
+
+void pm_test_leave(void) {  // NOLINT(modernize-redundant-void-arg): also a C header
+    if (paramesh::job() != nullptr) {
+        paramesh::job()->test_leave();
+    }
+}
+
+void pm_test_member_leaving(uint16_t node) {
+    if (paramesh::job() != nullptr) {
+        paramesh::job()->test_member_leaving(paramesh::NodeId{node});
+    }
 }
 
 void pm_test_fail(const char* message) {

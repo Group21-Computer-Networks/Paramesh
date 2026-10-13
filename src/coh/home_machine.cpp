@@ -377,6 +377,12 @@ void home_drop_member(HomeDirectory& directory, Slot slot) {
     directory.nodes.at(slot.value) = kNoNode;
 }
 
+void home_set_member(HomeDirectory& directory, Slot slot, NodeId node) {
+    if (slot.value < kMaxSlots) {
+        directory.nodes.at(slot.value) = node;
+    }
+}
+
 HomeEntryView home_entry(const HomeDirectory& directory, PageId page) {
     HomeEntryView view;
     const auto found = directory.entries.find(page.value);

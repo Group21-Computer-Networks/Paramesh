@@ -23,6 +23,12 @@ void pm_test_register(uint32_t id, pm_test_fn fn);
  * PM_OK when all of them have finished. */
 int pm_test_run_on_workers(uint32_t id);
 
+/* For tests of leaving without a daemon (M4-5). pm_test_leave(): this process begins to leave,
+ * as on L_LEAVE from its pmd; call it on a worker, from a task. pm_test_member_leaving(): the
+ * launcher is told that node is leaving, as on L_LEAVE_INTENT; call it on the launcher. */
+void pm_test_leave(void);
+void pm_test_member_leaving(uint16_t node);
+
 /* Ends the job everywhere with this message; the calling process exits with status 1. */
 void pm_test_fail(const char* message);
 

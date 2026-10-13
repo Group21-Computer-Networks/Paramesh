@@ -137,6 +137,9 @@ Result<void> home_import_entry(HomeDirectory& directory, PageId page, const Home
 void home_set_where(HomeDirectory& directory, PageId page, HomeWhere where);
 // A member left the job: clear its bit in every copyset.
 void home_drop_member(HomeDirectory& directory, Slot slot);
+// The node behind a copyset bit. The caller tells the directory every member of each map: a
+// segment that arrives names readers that never sent this node a request (added by M4-5).
+void home_set_member(HomeDirectory& directory, Slot slot, NodeId node);
 
 }  // namespace paramesh
 
