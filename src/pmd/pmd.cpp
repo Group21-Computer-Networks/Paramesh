@@ -330,7 +330,15 @@ Result<void> Pmd::open() {
     return {};
 }
 
+void Pmd::leave() const noexcept {
+    leave_asked_ = true;
+    const std::uint64_t one = 1;
+    const ssize_t written = ::write(stop_fd_, &one, sizeof one);
+    static_cast<void>(written);
+}
+
 void Pmd::stop() const noexcept {
+    stop_asked_ = true;
     const std::uint64_t one = 1;
     const ssize_t written = ::write(stop_fd_, &one, sizeof one);
     static_cast<void>(written);
@@ -349,8 +357,15 @@ void Pmd::run() {
             return;
         }
         if (fds[0].revents != 0) {
-            say_bye();
-            return;
+            std::uint64_t count = 0;
+            static_cast<void>(::read(stop_fd_, &count, sizeof count));
+            if (stop_asked_) {
+                say_bye();
+                return;
+            }
+            if (leave_asked_.exchange(false) && !leaving_) {
+                begin_leave(kLeaveInterrupt);
+            }
         }
         if ((fds[3].revents & POLLIN) != 0) {
             hear();
@@ -368,6 +383,14 @@ void Pmd::run() {
             }
         }
         std::erase_if(connections_, [](const Connection& c) { return c.fd < 0; });
+        // A leaving node goes once every worker of it has left its job, and no job it launched
+        // is still running (pm leave --force ended them).
+        if (leaving_ && workers_.empty() &&
+            std::none_of(runs_.begin(), runs_.end(),
+                         [](const Run& r) { return r.launcher != 0; })) {
+            say_bye();
+            return;
+        }
         if ((fds[1].revents & POLLIN) != 0) {
             accept_on(control_listener_, false);
         }
@@ -431,6 +454,10 @@ void Pmd::handle(Connection& connection, const FrameHeader& header,
         on_run_req(connection, header, payload);
     } else if (connection.local && header.opcode == Opcode::kLAdmitReq) {
         on_admit_req(connection, header, payload);
+    } else if (connection.local && header.opcode == Opcode::kLLeaveReq) {
+        on_leave_req(connection, payload);
+    } else if (!connection.local && header.opcode == Opcode::kLeaveIntent) {
+        on_leave_intent(header, payload);
     } else {
         platform_.logger->log(
             LogLevel::kWarn, "frame_ignored",
@@ -452,6 +479,11 @@ void Pmd::on_spawn_req(Connection& connection, const FrameHeader& header,
     const SpawnReqPayload& request = decoded.value();
     spawn.hash = request.binary_hash;
     const std::string here = " on node " + std::to_string(config_.node.value);
+    if (leaving_) {
+        decline(spawn, Status::kLeaving,
+                "node " + std::to_string(config_.node.value) + " is leaving");
+        return;
+    }
 
     std::ifstream file{request.path, std::ios::binary};
     const std::vector<char> image{std::istreambuf_iterator<char>{file},
@@ -537,6 +569,7 @@ void Pmd::on_register(Connection& connection, const FrameHeader& header,
             reply(spawn->asked_on, Opcode::kSpawnOk, spawn->job, spawn->asker, spawn->req,
                   SpawnOkPayload{config_.node, process.data_port, config_.cap_cores,
                                  config_.cap_ram, config_.spill_budget});
+            workers_.push_back(Worker{spawn->job, connection.id, spawn->asked_on});
         }
         spawns_.erase(spawn);
     }
@@ -656,6 +689,7 @@ void Pmd::beacon(Nanos now) {
     hello.spill_budget = config_.spill_budget;
     hello.free_spill = config_.spill_budget;
     hello.jobs = static_cast<std::uint16_t>(std::min<std::size_t>(runs_.size(), 65535));
+    hello.flags = leaving_ ? kHelloLeaving : std::uint16_t{0};
     std::array<std::byte, 300> bytes{};
     if (const Result<std::size_t> size = wire_encode(hello, bytes); size.ok()) {
         announce(Opcode::kHello, std::span{bytes}.first(size.value()));
@@ -803,6 +837,11 @@ void Pmd::on_run_req(Connection& connection, const FrameHeader& /*header*/,
     if (!request.ok()) {
         reply(connection.id, Opcode::kLRunRefused, JobId{0}, kNoNode, kNoReq,
               StatusTextPayload{Status::kProtocol, "a malformed L_RUN_REQ"});
+        return;
+    }
+    if (leaving_) {
+        reply(connection.id, Opcode::kLRunRefused, JobId{0}, kNoNode, kNoReq,
+              StatusTextPayload{Status::kLeaving, "this node is leaving"});
         return;
     }
     Run run;
@@ -1004,10 +1043,73 @@ void Pmd::finish_admission(Run& run) {
                    {"asked_for", JsonValue{std::int64_t{run.request.nodes}}}});
 }
 
+// L_LEAVE_REQ from `pm leave`. A node that launched a job still running does not leave
+// unless forced, which ends those jobs (docs/PLAN.md, changes from the HLD, 10).
+void Pmd::on_leave_req(Connection& connection, std::span<const std::byte> payload) {
+    const Result<LLeaveReqPayload> asked = wire_decode_l_leave_req(payload);
+    const auto running =
+        std::find_if(runs_.begin(), runs_.end(), [](const Run& r) { return r.launcher != 0; });
+    StatusTextPayload answer{Status::kOk,
+                             "node " + std::to_string(config_.node.value) + " is leaving"};
+    if (!asked.ok()) {
+        answer = {Status::kProtocol, "a malformed L_LEAVE_REQ"};
+    } else if (leaving_) {
+        answer = {Status::kLeaving, "this node is already leaving"};
+    } else if (running != runs_.end() && !asked.value().force) {
+        answer = {Status::kDeclined, "this node launched job " +
+                                         std::to_string(running->job.value) +
+                                         ", which is still running; pm leave --force ends it"};
+    }
+    reply(connection.id, Opcode::kLLeaveReply, JobId{0}, kNoNode, kNoReq, answer);
+    if (answer.status != Status::kOk) {
+        return;
+    }
+    for (const Run& run : runs_) {
+        if (run.launcher != 0) {
+            reply(run.launcher, Opcode::kLAbort, run.job, kNoNode, kNoReq,
+                  StatusTextPayload{Status::kUserAbort, answer.message});
+        }
+    }
+    begin_leave(kLeaveAsked);
+}
+
+// Leave, step 1: the launcher's pmd of every job served here is told (LEAVE_INTENT, on the
+// control connection its SPAWN_REQ came on), and so is the worker itself (L_LEAVE). Beacons say
+// "leaving" from now on, so nobody asks this node for a worker again.
+void Pmd::begin_leave(std::uint8_t reason) {
+    leaving_ = true;
+    // A worker still starting is not given to its job: declined, and stopped.
+    for (const Spawn& spawn : spawns_) {
+        decline(spawn, Status::kLeaving,
+                "node " + std::to_string(config_.node.value) + " is leaving");
+        ::kill(spawn.pid, SIGKILL);
+    }
+    spawns_.clear();
+    for (const Worker& worker : workers_) {
+        reply(worker.control, Opcode::kLeaveIntent, worker.job, kNoNode, kNoReq,
+              LeaveIntentPayload{config_.node, reason});
+        reply(worker.local, Opcode::kLLeave, worker.job, kNoNode, kNoReq, LLeavePayload{reason});
+    }
+    platform_.logger->log(
+        LogLevel::kInfo, "leaving",
+        JsonObject{{"workers", JsonValue{static_cast<std::int64_t>(workers_.size())}},
+                   {"reason", JsonValue{std::int64_t{reason}}}});
+}
+
+// LEAVE_INTENT from a worker's pmd: passed to the launcher of that job.
+void Pmd::on_leave_intent(const FrameHeader& header, std::span<const std::byte> payload) {
+    const Result<LeaveIntentPayload> intent = wire_decode_leave_intent(payload);
+    Run* run = run_of(header.job);
+    if (intent.ok() && run != nullptr && run->launcher != 0) {
+        reply(run->launcher, Opcode::kLLeaveIntent, run->job, kNoNode, kNoReq, intent.value());
+    }
+}
+
 // A connection has closed. pmrun going away while its job runs means the user interrupted it:
 // the launcher is told to end the job. The launcher going away ends the job here. A peer
 // going away with a request outstanding counts as one that declined.
 void Pmd::on_closed(const Connection& connection) {
+    std::erase_if(workers_, [&](const Worker& w) { return w.local == connection.id; });
     for (auto ask = asks_.begin(); ask != asks_.end();) {
         if (ask->second.connection != connection.id) {
             ++ask;
