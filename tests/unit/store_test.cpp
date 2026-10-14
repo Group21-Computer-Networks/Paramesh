@@ -32,8 +32,26 @@ public:
 // Records what the store says it did, and waits for it.
 class Told final : public paramesh::StoreEvents {
 public:
-    void on_loaded(PageId page) noexcept override { add(loaded_, page); }
+    void on_loaded(PageId page) noexcept override {
+        add(loaded_, page);
+        std::unique_lock<std::mutex> lock{mu_};
+        changed_.wait_for(lock, std::chrono::seconds{10}, [this] { return !holding_; });
+    }
     void on_spilled(PageId page) noexcept override { add(spilled_, page); }
+
+    // While held, the store's I/O thread stops in the next on_loaded until let go: what the
+    // test checks then cannot change under it.
+    void hold() {
+        const std::lock_guard<std::mutex> lock{mu_};
+        holding_ = true;
+    }
+    void let_go() {
+        {
+            const std::lock_guard<std::mutex> lock{mu_};
+            holding_ = false;
+        }
+        changed_.notify_all();
+    }
 
     // The pages spilled, or loaded, so far; waits until there are at least `count`.
     std::vector<PageId> spilled(std::size_t count) { return wait(spilled_, count); }
@@ -57,6 +75,7 @@ private:
     std::condition_variable changed_;
     std::vector<PageId> spilled_;
     std::vector<PageId> loaded_;
+    bool holding_ = false;
 };
 
 // A store that may hold `ram_pages` in RAM and `spill_pages` in a spill file under /tmp.
@@ -147,6 +166,7 @@ TEST_CASE("a full store spills the cold page, says so, and reads it back on load
     CHECK(store->get(PageId{2}, out).value() == paramesh::StoreLookup::kCopied);
     CHECK(out == filled(2));
 
+    told.hold();  // the I/O thread stops once page 1 is back, until let_go() below
     REQUIRE(store->load(PageId{1}).ok());  // there is room: it comes back beside page 2
     CHECK(told.loaded(1) == std::vector<PageId>{PageId{1}});
     CHECK(store->get(PageId{1}, out).value() == paramesh::StoreLookup::kCopied);
@@ -157,6 +177,7 @@ TEST_CASE("a full store spills the cold page, says so, and reads it back on load
     // once a page has been spilled. The store never holds a third page in RAM.
     CHECK(store->put(PageId{3}, filled(3)).error().code == Errc::kState);
     CHECK(store->ram_bytes() == 2 * paramesh::kPageSize);
+    told.let_go();  // now the page asked for is spilled
     REQUIRE(told.spilled(2).size() == 2);
     REQUIRE(store->put(PageId{3}, filled(3)).ok());
     CHECK(store->ram_bytes() <= 2 * paramesh::kPageSize);
