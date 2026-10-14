@@ -107,7 +107,7 @@ Result<void> Tasks::parallel_for(const ParallelFor& call) {
     for (const auto& [lo, hi] : cuts) {
         // Where the chunk's data lives, as far as the launcher's own segment map says.
         const NodeId home = array ? host_.home_of(page_of(data + lo * call.stride)) : kNoNode;
-        queue_.push_back(Chunk{next_chunk_++, id, lo, hi, home});
+        queue_.push_back(Chunk{next_chunk_++, id, lo, hi, home, kNoNode, 0});
     }
     sync_.work_added(cuts.size());
     changed_.notify_all();  // the launcher's own threads may be waiting out an empty queue
@@ -168,6 +168,7 @@ void Tasks::work(std::uint16_t thread) {
         while (!me.refused && !me.no_more && me.have.size() + me.asking < config_.prefetch) {
             ask(thread);
         }
+        me.running = true;
         hold.unlock();
         const pm_task_ctx ctx{host_.self().value, thread,
                               static_cast<std::uint32_t>(chunk.arg.size())};
@@ -176,6 +177,7 @@ void Tasks::work(std::uint16_t thread) {
                     chunk.arg.empty() ? nullptr : chunk.arg.data());
         const std::uint64_t cpu = thread_cpu_ns() - before;
         hold.lock();
+        me.running = false;
         if (launcher_) {
             done(chunk.chunk_id, host_.self(), cpu);
         } else {
@@ -190,7 +192,7 @@ void Tasks::ask(std::uint16_t thread) {
     Worker& me = workers_[thread];
     if (launcher_) {
         TaskAssignPayload chunk;
-        if (take(host_.self(), chunk)) {
+        if (take(host_.self(), thread, chunk)) {
             me.have.push_back(std::move(chunk));
         } else {
             me.refused = true;
@@ -205,7 +207,7 @@ void Tasks::ask(std::uint16_t thread) {
 
 // Launcher: a chunk for `asker`, if the queue has any, with its call's argument: the first one
 // whose data is homed on that node, or else the first one.
-bool Tasks::take(NodeId asker, TaskAssignPayload& out) {
+bool Tasks::take(NodeId asker, std::uint16_t thread, TaskAssignPayload& out) {
     if (queue_.empty()) {
         return false;
     }
@@ -217,8 +219,10 @@ bool Tasks::take(NodeId asker, TaskAssignPayload& out) {
                                         [asker](const Chunk& c) { return c.home == asker; });
         pick = homed != queue_.end() ? homed : pick;
     }
-    const Chunk chunk = *pick;
+    Chunk chunk = *pick;
     queue_.erase(pick);
+    chunk.taker = asker;
+    chunk.thread = thread;
     taken_[chunk.id] = chunk;
     const Call& call = calls_[chunk.call];
     out = TaskAssignPayload{chunk.id, call.task_id, chunk.lo, chunk.hi, chunk.call, call.arg};
@@ -242,19 +246,60 @@ void Tasks::done(std::uint64_t chunk_id, NodeId ran_by, std::uint64_t cpu_ns) {
     sync_.work_done(1);
 }
 
+void Tasks::member_leaving(NodeId node) {
+    const std::scoped_lock hold{mu_};
+    leaving_.push_back(node);
+}
+
+void Tasks::return_chunks(NodeId node) {
+    const std::scoped_lock hold{mu_};
+    for (auto taken = taken_.begin(); taken != taken_.end();) {
+        if (taken->second.taker != node) {
+            ++taken;
+            continue;
+        }
+        if (sync_.holds_lock(node, taken->second.thread)) {
+            host_.abort_job(Status::kInternal,
+                            "a chunk has to be run again while its thread holds a lock");
+        }
+        queue_.push_front(taken->second);
+        taken = taken_.erase(taken);
+    }
+    changed_.notify_all();  // the launcher's own threads may be waiting out an empty queue
+}
+
+void Tasks::leave() {
+    const std::scoped_lock hold{mu_};
+    for (Worker& worker : workers_) {
+        worker.no_more = true;
+    }
+    changed_.notify_all();
+}
+
+bool Tasks::idle() {
+    const std::scoped_lock hold{mu_};
+    return std::none_of(workers_.begin(), workers_.end(), [](const Worker& w) {
+        return w.running || w.asking > 0 || !w.have.empty();
+    });
+}
+
 void Tasks::on_frame(const FrameHeader& header, std::span<const std::byte> payload) noexcept {
     const auto bad = [this] { host_.abort_job(Status::kProtocol, "a task frame is malformed"); };
     const std::scoped_lock hold{mu_};
     switch (header.opcode) {
         case Opcode::kTaskReq: {
-            if (!launcher_ || !wire_decode_task_req(payload).ok()) {
+            const Result<TaskReqPayload> request = wire_decode_task_req(payload);
+            if (!launcher_ || !request.ok()) {
                 bad();
             }
+            const bool leaving =
+                std::find(leaving_.begin(), leaving_.end(), header.src) != leaving_.end();
             TaskAssignPayload chunk;
-            if (take(header.src, chunk)) {
+            if (!leaving && take(header.src, request.value().thread, chunk)) {
                 send(header.src, Opcode::kTaskAssign, header.req, chunk, ReplyTimer::kNone);
             } else {
-                send(header.src, Opcode::kNoTask, header.req, NoTaskPayload{1}, ReplyTimer::kNone);
+                send(header.src, Opcode::kNoTask, header.req,
+                     NoTaskPayload{static_cast<std::uint8_t>(leaving ? 2 : 1)}, ReplyTimer::kNone);
             }
             break;
         }

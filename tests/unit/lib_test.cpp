@@ -23,7 +23,9 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
@@ -358,6 +360,35 @@ void write_many(const MarkArgs* args, std::uint64_t which) {
     }
 }
 
+struct LeaveArgs {
+    std::uint64_t* numbers;
+    std::uint64_t* told;  // told[0] becomes 1 when node 3 has been told to leave
+    std::uint64_t round;  // 1: fill; 2: go over it again
+    std::uint64_t slow;   // 1: node 3's chunk does not end within the leave's grace
+};
+
+PM_TASK(lib_test_leave) {
+    const auto* args = static_cast<const LeaveArgs*>(arg);
+    if (args->round == 2) {
+        static std::atomic<bool> once{false};
+        if (ctx->node == 3 && !once.exchange(true)) {
+            pm_test_leave();
+            args->told[0] = 1;
+            if (args->slow != 0) {
+                ::usleep(13U * 1000000U);  // past the 10 s a leaver's chunks are given
+            }
+        }
+        ::usleep(4000);  // long enough for the leave to happen while chunks are running
+    }
+    if (args->round == 2) {
+        // An atomic add of nothing: the number's home must answer, wherever the page now lives.
+        pm_atomic_add(&args->numbers[lo], 0);
+    }
+    for (std::uint64_t i = lo; i < hi; i++) {
+        args->numbers[i] = args->round == 1 ? i : i * 2 + 7;  // the same whoever runs it, or twice
+    }
+}
+
 PM_TASK(lib_test_left) {
     write_many(static_cast<const MarkArgs*>(arg), 2 * lo);
     static_cast<void>(hi);
@@ -478,6 +509,58 @@ int fill_program() {
     return pm_finalize() == PM_OK ? 0 : 6;
 }
 
+// The leave program (M4-5): an array over six segments is filled by tasks on every node, so
+// every node is home for some of it and holds modified pages of the rest. Then the tasks go
+// over it again, slowly, and in the middle node 3 is told to leave. The launcher checks every
+// number at the end: the ones node 3 was home for are served by their new homes.
+int leave_program() {
+    pm_config config{};
+    config.region_bytes = kRegionBytes;
+    config.threads_per_node = 2;
+    if (pm_init(nullptr, nullptr, &config) != PM_OK) {
+        return 2;
+    }
+    LeaveArgs args{};
+    args.numbers = static_cast<std::uint64_t*>(pm_malloc(kFillPages * paramesh::kPageSize));
+    args.told = static_cast<std::uint64_t*>(pm_malloc(paramesh::kPageSize));
+    if (args.numbers == nullptr || args.told == nullptr) {
+        return 3;
+    }
+    const std::uint64_t count = kFillPages * 512;
+    const char* which = std::getenv("TEST_FUNCTION");
+    args.slow = which != nullptr && *which == 's' ? 1 : 0;
+    args.round = 1;
+    if (pm_parallel_for_data("lib_test_leave", 0, count, 8ULL * 512, &args, sizeof args,
+                             args.numbers, sizeof(std::uint64_t)) != PM_OK ||
+        pm_wait_all() != PM_OK) {
+        return 4;
+    }
+    args.round = 2;
+    if (pm_parallel_for_data("lib_test_leave", 0, count, 8ULL * 512, &args, sizeof args,
+                             args.numbers, sizeof(std::uint64_t)) != PM_OK) {
+        return 5;
+    }
+    // Node 3 tells itself to leave in its first chunk of this round, as its pmd would; the
+    // launcher is told as soon as that is seen, as its own pmd would tell it.
+    volatile std::uint64_t* told = args.told;
+    for (int waited = 0; waited < 20000 && told[0] == 0; waited++) {
+        ::usleep(1000);
+    }
+    if (told[0] == 0) {
+        return 6;  // node 3 ran no chunk of the round
+    }
+    pm_test_member_leaving(3);
+    if (pm_wait_all() != PM_OK) {
+        return 7;
+    }
+    for (std::uint64_t i = 0; i < count; i++) {
+        if (args.numbers[i] != i * 2 + 7) {
+            return 8;  // a chunk was lost, or a page did not survive the move
+        }
+    }
+    return pm_finalize() == PM_OK ? 0 : 9;
+}
+
 // The false-sharing program: 24 chunks of each of two tasks, every chunk writing its own number,
 // all the numbers in one page.
 int neighbours_program() {
@@ -582,6 +665,23 @@ int wait_for(pid_t pid, int seconds) {
     return -1;
 }
 
+// The time, in nanoseconds, of the first log line that has `what` and was logged by `node`.
+double logged_at(const std::string& log, const std::string& what, int node) {
+    const std::string who = "\"node\":" + std::to_string(node) + ",";
+    const std::string_view key = "\"time\":";
+    for (std::size_t from = 0; from < log.size();) {
+        const std::size_t end = std::min(log.find('\n', from), log.size());
+        const std::string line = log.substr(from, end - from);
+        const auto time = line.find(key);
+        if (line.find(what) != std::string::npos && line.find(who) != std::string::npos &&
+            time != std::string::npos) {
+            return std::strtod(line.c_str() + time + key.size(), nullptr);
+        }
+        from = end + 1;
+    }
+    return 0;
+}
+
 std::string read_all(int fd) {
     std::string text;
     std::array<char, 1024> chunk{};
@@ -640,6 +740,65 @@ TEST_CASE("a task that throws on a worker ends the job everywhere, with its name
     CHECK(wait_for(job.pids[2], 10) == 1);
     CHECK(read_all(job.launcher_stderr) ==
           "job 42 aborted: task 'lib_test_throws' threw: the matrix is singular\n");
+}
+
+TEST_CASE("a worker leaves in the middle of a run: the job finishes with every number right" *
+          doctest::skip(!can_run())) {
+    const Started job = start_job("0", leave_program, "PARAMESH_CFG_LOG_LEVEL=info");
+    CHECK(wait_for(job.pids[0], 120) == 0);  // the launcher: every number was right
+    CHECK(wait_for(job.pids[1], 10) == 0);
+    CHECK(wait_for(job.pids[2], 10) == 0);  // node 3 left in order: no error, nobody "lost"
+    const std::string log = read_all(job.launcher_stderr);
+    INFO(log);
+    CHECK(log.find("aborted") == std::string::npos);
+    CHECK(log.find("\"event\":\"leaving\"") != std::string::npos);         // node 3 began
+    CHECK(log.find("\"event\":\"member_leaving\"") != std::string::npos);  // the launcher heard
+    CHECK(log.find("\"event\":\"member_left\"") != std::string::npos);     // and let it go
+    // Node 3 was home for some of the eight segments, and sent every one to a new home.
+    const std::string_view moved = "\"segments\":";
+    const auto at = log.find(moved);
+    REQUIRE(at != std::string::npos);
+    CHECK(std::strtol(log.c_str() + at + moved.size(), nullptr, 10) > 0);
+}
+
+TEST_CASE("a chunk the leaver has not finished after 10 s is run by another node" *
+          doctest::skip(!can_run())) {
+    const Started job = start_job("s", leave_program, "PARAMESH_CFG_LOG_LEVEL=info");
+    CHECK(wait_for(job.pids[0], 120) == 0);  // every number right: the chunk was not lost
+    CHECK(wait_for(job.pids[1], 10) == 0);
+    CHECK(wait_for(job.pids[2], 10) == 0);  // node 3 left with that thread still in its task
+    const std::string log = read_all(job.launcher_stderr);
+    INFO(log);
+    CHECK(log.find("aborted") == std::string::npos);
+    CHECK(log.find("\"event\":\"member_left\"") != std::string::npos);
+    // From the launcher hearing of the leave to the end of its job: not before the chunk went
+    // back in the queue at 10 s, and without waiting for node 3's thread, asleep for 13 s.
+    const double seconds =
+        (logged_at(log, R"("event":"job_pages")", 1) - logged_at(log, "member_leaving", 1)) / 1e9;
+    MESSAGE("the job ended " << seconds << " s after the leave began");
+    CHECK(seconds >= 10.0);
+    CHECK(seconds < 12.5);
+}
+
+TEST_CASE("requests that meet a segment on the move are sent again and answered by its new home" *
+          doctest::skip(!can_run())) {
+    // Node 3 holds its segments back for 300 ms after they are frozen. Chunks on the other
+    // nodes write to those segments and do atomic adds in them meanwhile: each such request is
+    // answered REDIRECT or BUSY_RETRY until the segment has arrived.
+    const Started job = start_job("0", leave_program, "PARAMESH_TEST_MOVE_DELAY_MS=300");
+    CHECK(wait_for(job.pids[0], 120) == 0);
+    CHECK(wait_for(job.pids[1], 10) == 0);
+    CHECK(wait_for(job.pids[2], 10) == 0);
+    const std::string log = read_all(job.launcher_stderr);
+    INFO(log);
+    CHECK(log.find("aborted") == std::string::npos);
+    const std::string_view key = "\"sent_again\":";
+    long again = 0;
+    for (auto at = log.find(key); at != std::string::npos; at = log.find(key, at + 1)) {
+        again += std::strtol(log.c_str() + at + key.size(), nullptr, 10);
+    }
+    MESSAGE("requests sent again: " << again);
+    CHECK(again > 0);
 }
 
 // Runs a program with one more setting and returns the page transfers its three processes

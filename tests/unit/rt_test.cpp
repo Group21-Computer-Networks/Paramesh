@@ -936,3 +936,106 @@ TEST_CASE("a node that asks is given a chunk whose data it is home for, else the
     CHECK(handed_out(false, true) == "123456");  // affinity off: first in, first out
     CHECK(handed_out(true, false) == "123456");  // a call with no array has no home to prefer
 }
+
+// ---- a member leaves (M4-5)
+// ----------------------------------------------------------------------
+
+TEST_CASE("a leaving member gets NO_TASK reason 2, and its unfinished chunks are run by others") {
+    Process launcher;
+    paramesh::TasksConfig config;
+    config.threads = 0;
+    config.region_bytes = paramesh::kSegmentSize;
+    paramesh::Tasks tasks{launcher.net, launcher.host, launcher.sync, config};
+    std::uint64_t sum = 0;
+    const Out out{&sum};
+    paramesh::ParallelFor call;
+    call.task = "rt_test_sum";
+    call.lo = 0;
+    call.hi = 12;
+    call.grain = 4;
+    call.arg = std::as_bytes(std::span{&out, 1});
+    REQUIRE(tasks.parallel_for(call).ok());
+
+    const paramesh::TaskReqPayload ask{0};
+    task_frame(launcher, tasks, Opcode::kTaskReq, 2, 1, ask);
+    CHECK(launcher.net.take() == "TASK_ASSIGN>2 req 1 chunk 1 [0,4) call 1 arg 8");
+    task_frame(launcher, tasks, Opcode::kTaskReq, 3, 1, ask);
+    CHECK(launcher.net.take() == "TASK_ASSIGN>3 req 1 chunk 2 [4,8) call 1 arg 8");
+
+    tasks.member_leaving(NodeId{2});
+    task_frame(launcher, tasks, Opcode::kTaskReq, 2, 2, ask);
+    CHECK(launcher.net.take() == "NO_TASK>2 req 2 reason 2");  // though chunk 3 is waiting
+    CHECK(launcher.sync.outstanding() == 3);
+
+    // The grace is over and node 2 has not reported chunk 1: it goes to the front of the
+    // queue. Node 3's chunk is not touched.
+    tasks.return_chunks(NodeId{2});
+    CHECK(launcher.sync.outstanding() == 3);  // nothing is lost and nothing counted twice
+    task_frame(launcher, tasks, Opcode::kTaskReq, 3, 2, ask);
+    CHECK(launcher.net.take() == "TASK_ASSIGN>3 req 2 chunk 1 [0,4) call 1 arg 8");
+    task_frame(launcher, tasks, Opcode::kTaskReq, 3, 3, ask);
+    CHECK(launcher.net.take() == "TASK_ASSIGN>3 req 3 chunk 3 [8,12) call 1 arg 8");
+
+    // Node 2 finishes chunk 1 after all: the first report counts, node 3's later one does not.
+    task_frame(launcher, tasks, Opcode::kTaskDone, 2, 0, paramesh::TaskDonePayload{1, 0, 0});
+    CHECK(launcher.sync.outstanding() == 2);
+    for (const std::uint64_t chunk : {1ULL, 2ULL, 3ULL}) {
+        task_frame(launcher, tasks, Opcode::kTaskDone, 3, 0,
+                   paramesh::TaskDonePayload{chunk, 0, 0});
+    }
+    CHECK(launcher.sync.outstanding() == 0);
+    tasks.return_chunks(NodeId{2});  // nothing left to return
+    CHECK(launcher.net.take().empty());
+}
+
+TEST_CASE("a chunk that would run again while its thread holds a lock ends the job") {
+    int status = 0;
+    const std::string said = stderr_of(
+        [] {
+            Process launcher;
+            paramesh::TasksConfig config;
+            config.threads = 0;
+            config.region_bytes = paramesh::kSegmentSize;
+            paramesh::Tasks tasks{launcher.net, launcher.host, launcher.sync, config};
+            paramesh::ParallelFor call;
+            call.task = "rt_test_sum";
+            call.lo = 0;
+            call.hi = 4;
+            call.grain = 4;
+            REQUIRE(tasks.parallel_for(call).ok());
+            task_frame(launcher, tasks, Opcode::kTaskReq, 2, 1, paramesh::TaskReqPayload{5});
+            const pm_lock_t lock = launcher.sync.lock_create();
+            launcher.frame(Opcode::kLockAcq, 2, 9, lock.id, 5);  // node 2's thread 5 takes it
+            tasks.return_chunks(NodeId{2});
+        },
+        status);
+    CHECK(status != 0);
+    CHECK(said.find("a chunk has to be run again while its thread holds a lock") !=
+          std::string::npos);
+}
+
+TEST_CASE("a process that leaves asks for no more chunks and is idle when the last one ends") {
+    Process worker{2};
+    paramesh::TasksConfig config;
+    config.threads = 1;
+    config.prefetch = 1;
+    config.region_bytes = paramesh::kSegmentSize;
+    paramesh::Tasks tasks{worker.net, worker.host, worker.sync, config};
+    REQUIRE(tasks.start().ok());
+    const std::string asked = worker.net.wait(2);  // one chunk to run and one more
+    CHECK(asked.find("TASK_REQ>1 req ") == 0);
+    const std::vector<ReqId> reqs = worker.net.reqs();
+    REQUIRE(reqs.size() == 2);
+    CHECK_FALSE(tasks.idle());  // two TASK_REQs are waiting for answers
+    tasks.leave();
+    // Both are answered NO_TASK, as the launcher answers a leaver: the thread ends, having
+    // asked for nothing more.
+    task_frame(worker, tasks, Opcode::kNoTask, 1, reqs[0].value, paramesh::NoTaskPayload{2});
+    task_frame(worker, tasks, Opcode::kNoTask, 1, reqs[1].value, paramesh::NoTaskPayload{2});
+    for (int tries = 0; tries < 500 && !tasks.idle(); tries++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    CHECK(tasks.idle());
+    CHECK(worker.net.take().empty());
+    tasks.stop();
+}

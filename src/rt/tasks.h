@@ -81,6 +81,16 @@ public:
     // A TASK_REQ, TASK_ASSIGN, NO_TASK or TASK_DONE frame arrived.
     void on_frame(const FrameHeader& header, std::span<const std::byte> payload) noexcept;
 
+    // A member is leaving (docs/PROTOCOL.md, 8.2). Launcher: from now on its TASK_REQs are
+    // answered NO_TASK, reason 2; return_chunks() puts the chunks it took and has not reported
+    // done back in the queue, and ends the job if one of its threads holds a lock.
+    void member_leaving(NodeId node);
+    void return_chunks(NodeId node);
+    // The leaver itself: its threads ask for no more chunks; idle() is true once none of them
+    // has a chunk to run, is running one, or waits for an answer.
+    void leave();
+    [[nodiscard]] bool idle();
+
 private:
     struct Call {
         std::uint64_t task_id = 0;
@@ -92,7 +102,9 @@ private:
         std::uint32_t call = 0;
         std::uint64_t lo = 0;
         std::uint64_t hi = 0;
-        NodeId home;  // the home of the chunk's first page; kNoNode for a call with no array
+        NodeId home;   // the home of the chunk's first page; kNoNode for a call with no array
+        NodeId taker;  // who took it, while it is in taken_
+        std::uint16_t thread = 0;  // and which of its threads
     };
     struct Worker {
         std::thread thread;
@@ -100,11 +112,12 @@ private:
         std::uint32_t asking = 0;            // TASK_REQs of this thread not yet answered
         bool refused = false;                // the last answer was NO_TASK: wait before asking
         bool no_more = false;                // NO_TASK reason 2: stop asking
+        bool running = false;                // inside a task body
     };
 
     void work(std::uint16_t thread);
     void ask(std::uint16_t thread);
-    bool take(NodeId asker, TaskAssignPayload& out);
+    bool take(NodeId asker, std::uint16_t thread, TaskAssignPayload& out);
     void done(std::uint64_t chunk_id, NodeId ran_by, std::uint64_t cpu_ns);
     template <typename Payload>
     void send(NodeId to, Opcode opcode, ReqId req, const Payload& payload, ReplyTimer timer);
@@ -122,6 +135,7 @@ private:
     // they belong to.
     std::deque<Chunk> queue_;
     std::unordered_map<std::uint64_t, Chunk> taken_;
+    std::vector<NodeId> leaving_;  // members that get no more chunks
     std::unordered_map<std::uint32_t, Call> calls_;
     std::uint64_t next_chunk_ = 1;
     std::uint32_t next_call_ = 1;
