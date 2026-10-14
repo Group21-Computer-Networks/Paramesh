@@ -719,6 +719,21 @@ Result<LeaveIntentPayload> wire_decode_leave_intent(std::span<const std::byte> i
     return payload;
 }
 
+Result<std::size_t> wire_encode(const LMemberPayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    put_member(w, payload.member);
+    return w.done();
+}
+
+Result<LMemberPayload> wire_decode_l_member(std::span<const std::byte> in) {
+    Reader r{in};
+    LMemberPayload payload{get_member(r)};
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
 Result<std::size_t> wire_encode(const LLeavePayload& payload, std::span<std::byte> out) {
     if (payload.reason != kLeaveAsked && payload.reason != kLeaveInterrupt) {
         return kUnsendable;

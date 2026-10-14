@@ -500,7 +500,7 @@ struct SquareArgs {
     std::uint64_t* by_node;    // by_node[n]: indexes node n ran, n below 8
     std::uint64_t* by_thread;  // by_thread[t]: chunks run by a thread with index t, t below 64
     std::uint64_t* started;    // started[n]: node n has begun a chunk
-    std::uint64_t slow;        // 1: every chunk takes a long time (for the test of Ctrl+C)
+    std::uint64_t slow;        // 1: every chunk takes ten minutes (Ctrl+C); 2: 2 ms (a join)
 };
 
 bool region_can_be_mapped() {
@@ -581,14 +581,49 @@ PM_TASK(pmd_test_square) {
     for (std::uint64_t i = lo; i < hi; i++) {
         args->squares[i] = i * i;
     }
-    if (args->slow != 0) {
+    if (args->slow == 1) {
         ::usleep(600U * 1000000U);  // ten minutes: far longer than the test waits
+    } else if (args->slow == 2) {
+        ::usleep(2000);  // long enough for a node that joins to be given some
     }
     pm_atomic_add(&args->by_thread[ctx->thread < 64 ? ctx->thread : 63], 1);
     pm_atomic_add(&args->by_node[ctx->node < 8 ? ctx->node : 0], hi - lo);
 }
 
 namespace {
+
+// The join mode (M4-7): once node 3 has begun a chunk the report says so, and the test makes
+// node 3 leave and starts node 4. Rounds of chunks then go on until node 4 has run some, at
+// most for 120 s; the last round is checked.
+int join_program(const std::string& report, const SquareArgs& args, std::uint64_t count) {
+    const volatile std::uint64_t* started = args.started;
+    const volatile std::uint64_t* by_node = args.by_node;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{120};
+    bool told = false;
+    do {
+        if (pm_parallel_for_data("pmd_test_square", 0, count, 512, &args, sizeof args, args.squares,
+                                 sizeof(std::uint64_t)) != PM_OK) {
+            return 32;
+        }
+        while (!told && started[3] == 0 && std::chrono::steady_clock::now() < until) {
+            ::usleep(1000);
+        }
+        if (!told) {
+            write_report(report + ".three", "");
+            told = true;
+        }
+        if (pm_wait_all() != PM_OK) {
+            return 32;
+        }
+    } while (by_node[4] == 0 && std::chrono::steady_clock::now() < until);
+    std::uint64_t wrong = 0;
+    for (std::uint64_t i = 0; i < count; i++) {
+        wrong += args.squares[i] != i * i ? 1U : 0U;
+    }
+    write_report(report,
+                 "wrong=" + std::to_string(wrong) + "\nnode4=" + std::to_string(by_node[4]) + "\n");
+    return pm_finalize() == PM_OK ? 0 : 33;
+}
 
 // The launcher's side; a worker does not return from pm_init(). Writes its report, or the
 // number of the step that failed.
@@ -616,12 +651,19 @@ int program(const std::string& report, std::string_view mode) {
     args.by_node = static_cast<std::uint64_t*>(pm_malloc(8 * sizeof(std::uint64_t)));
     args.by_thread = static_cast<std::uint64_t*>(pm_malloc(64 * sizeof(std::uint64_t)));
     args.started = static_cast<std::uint64_t*>(pm_malloc(8 * sizeof(std::uint64_t)));
+    const bool join = mode == "join";
     args.slow = slow ? 1 : 0;
+    if (join) {
+        args.slow = 2;
+    }
     if (args.squares == nullptr || args.by_node == nullptr || args.by_thread == nullptr ||
         args.started == nullptr) {
         return 31;
     }
     write_report(report + ".up", "pid=" + std::to_string(::getpid()) + "\n");
+    if (join) {
+        return join_program(report, args, count);
+    }
     if (pm_parallel_for_data("pmd_test_square", 0, count, huge ? 4096 : 512, &args, sizeof args,
                              args.squares, sizeof(std::uint64_t)) != PM_OK ||
         pm_wait_all() != PM_OK) {
@@ -1623,6 +1665,45 @@ TEST_CASE(
         CHECK(contents(said).find("\"event\":\"member_left\"") != std::string::npos);
         CHECK(stops_within(nodes.three, 10));  // node 3's daemon went once its worker had
         CHECK_FALSE(nodes.two.stopped);
+    }
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): as above
+    ::unsetenv("PARAMESH_CFG_LOG_LEVEL");
+}
+
+TEST_CASE("after a worker leaves, a fourth node joins the running job and runs chunks" *
+          doctest::skip(!region_can_be_mapped())) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): no other thread of this process is running
+    ::setenv("PARAMESH_CFG_LOG_LEVEL", "info", 1);
+    {
+        const ThreeNodes nodes;
+        const std::string report = nodes.reports + "/program";
+        const std::string said = nodes.reports + "/stderr";
+        const pid_t pmrun = start_pmrun({"-n", "3", "--state-dir", nodes.one.state_dir, own_path(),
+                                         "--as-program", report, "join"},
+                                        said);
+        for (int tenths = 0; tenths < 600 && !std::filesystem::exists(report + ".three");
+             tenths++) {
+            ::usleep(100000);
+        }
+        REQUIRE(std::filesystem::exists(report + ".three"));  // node 3 is running a chunk
+        CHECK(run_tool(tool("pm"), {"leave", "--state-dir", nodes.three.state_dir},
+                       nodes.reports + "/pm") == 0);
+        CHECK(stops_within(nodes.three, 30));  // node 3 has left: the job is a node short
+
+        // Node 4 comes up knowing node 1 as a seed; node 1 hears it and offers it the job.
+        const Daemon four{4, {}, [&nodes](paramesh::PmdConfig& c) {
+                              c.peers.push_back(nodes.one.endpoint());
+                              c.peer_discovery_ports.push_back(nodes.one.pmd.discovery_port());
+                          }};
+        CHECK(exit_status(pmrun, 180) == 0);
+        const std::string result = contents(report);
+        INFO(result);
+        INFO(contents(said));
+        CHECK(field(result, "wrong") == "0");
+        CHECK(std::strtoull(field(result, "node4").c_str(), nullptr, 10) > 0);  // node 4 ran chunks
+        MESSAGE("chunks' indexes run by node 4: " << field(result, "node4"));
+        CHECK(contents(said).find("\"event\":\"member_joined\"") != std::string::npos);
+        CHECK(contents(said).find("\"event\":\"member_left\"") != std::string::npos);
     }
     // NOLINTNEXTLINE(concurrency-mt-unsafe): as above
     ::unsetenv("PARAMESH_CFG_LOG_LEVEL");
