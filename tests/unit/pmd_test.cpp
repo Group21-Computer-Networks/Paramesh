@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -99,6 +100,7 @@ struct Daemon {
     std::string state_dir;
     paramesh::Pmd pmd;
     std::thread thread;
+    std::atomic<bool> stopped{false};  // run() has returned: the daemon has stopped or left
     int control = -1;
 
     using Adjust = std::function<void(paramesh::PmdConfig&)>;
@@ -131,7 +133,10 @@ struct Daemon {
           pmd(config(state_dir, node, std::move(peers), adjust), platform) {
         const paramesh::Result<void> opened = pmd.open();
         REQUIRE_MESSAGE(opened.ok(), opened.error().what);
-        thread = std::thread{[this] { pmd.run(); }};
+        thread = std::thread{[this] {
+            pmd.run();
+            stopped = true;
+        }};
         control = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         sockaddr_in to{};
         to.sin_family = AF_INET;
@@ -1432,4 +1437,193 @@ TEST_CASE("a node that goes silent ends the job after 3 s without a heartbeat" *
     CHECK(job.said_lost());
     REQUIRE(::kill(job.worker, SIGKILL) == 0);  // the silent one itself cannot be told
     CHECK(job.all_gone());
+}
+
+// ---- leaving (M4-5) ----------------------------------------------------------------------------
+
+namespace {
+
+// Runs a tool of this build (pm, or matmul) to the end with its output in `out`; its exit
+// status, or -1 if it took longer than `seconds`.
+int run_tool(const std::string& path, const std::vector<std::string>& arguments,
+             const std::string& out, int seconds = 60) {
+    std::vector<std::string> all{path};
+    all.insert(all.end(), arguments.begin(), arguments.end());
+    std::vector<char*> argv;
+    argv.reserve(all.size() + 1);
+    for (std::string& argument : all) {
+        argv.push_back(argument.data());
+    }
+    argv.push_back(nullptr);
+    const pid_t child = ::fork();
+    if (child == 0) {
+        const int file = ::open(out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        ::dup2(file, STDOUT_FILENO);
+        ::dup2(file, STDERR_FILENO);
+        ::execv(argv[0], argv.data());
+        ::_exit(127);
+    }
+    return exit_status(child, seconds);
+}
+
+std::string tool(const char* name) {
+    return (std::filesystem::path{pmrun_path()}.parent_path() / name).string();
+}
+
+std::string matmul_path() {
+    return (std::filesystem::path{own_path()}.parent_path() / "../../apps/matmul/matmul")
+        .lexically_normal()
+        .string();
+}
+
+bool stops_within(const Daemon& daemon, int seconds) {
+    for (int tenths = 0; tenths < seconds * 10 && !daemon.stopped; tenths++) {
+        ::usleep(100000);
+    }
+    return daemon.stopped;
+}
+
+}  // namespace
+
+TEST_CASE("pm leave on a node that serves no job: it says so, and its daemon goes") {
+    const Daemon alone;
+    const std::string out = alone.state_dir + "/out";
+    CHECK(run_tool(tool("pm"), {"leave", "--state-dir", alone.state_dir}, out) == 0);
+    CHECK(contents(out) == "pm: node 5 is leaving\n");
+    CHECK(stops_within(alone, 5));
+    CHECK(run_tool(tool("pm"), {"leave", "--state-dir", "/tmp/pmd-test-no-daemon"}, out) == 1);
+    CHECK(contents(out).find("cannot reach pmd") != std::string::npos);
+    CHECK(run_tool(tool("pm"), {"leave", "--forcibly"}, out) == 2);
+}
+
+TEST_CASE("Ctrl+C on pmd is a graceful leave: it logs why and goes; a second one stops at once") {
+    const std::string pmd = (std::filesystem::path{pmrun_path()}.parent_path() / "../pmd/pmd")
+                                .lexically_normal()
+                                .string();
+    for (const int presses : {1, 2}) {
+        std::string state = "/tmp/pmd-test-int-XXXXXX";
+        REQUIRE(::mkdtemp(state.data()) != nullptr);
+        const std::string log = state + "/log";
+        std::vector<std::string> all{pmd, "--node-id",      "9", "--no-multicast", "--http-port",
+                                     "0", "--control-port", "0", "--state-dir",    state};
+        std::vector<char*> argv;
+        argv.reserve(all.size() + 1);
+        for (std::string& argument : all) {
+            argv.push_back(argument.data());
+        }
+        argv.push_back(nullptr);
+        const pid_t child = ::fork();
+        if (child == 0) {
+            ::dup2(::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600), STDERR_FILENO);
+            ::execv(argv[0], argv.data());
+            ::_exit(127);
+        }
+        for (int tenths = 0; tenths < 50 && !std::filesystem::exists(state + "/pmd.sock");
+             tenths++) {
+            ::usleep(100000);
+        }
+        REQUIRE(std::filesystem::exists(state + "/pmd.sock"));
+        for (int i = 0; i < presses; i++) {
+            REQUIRE(::kill(child, SIGINT) == 0);
+        }
+        CHECK(exit_status(child, 5) == 0);
+        const std::string said = contents(log);
+        INFO(said);
+        if (presses == 1) {
+            CHECK(said.find("\"event\":\"leaving\",\"fields\":{\"reason\":2,\"workers\":0}") !=
+                  std::string::npos);
+        }
+        std::filesystem::remove_all(state);
+    }
+}
+
+TEST_CASE("on a launcher pm leave is refused while its job runs, and pm leave --force ends it" *
+          doctest::skip(!region_can_be_mapped())) {
+    const RunningJob job;
+    const std::string out = job.nodes.reports + "/pm";
+    const std::string& here = job.nodes.one.state_dir;
+    CHECK(run_tool(tool("pm"), {"leave", "--state-dir", here}, out) == 1);
+    CHECK(contents(out).find("this node launched job ") != std::string::npos);
+    CHECK(contents(out).find(", which is still running; pm leave --force ends it") !=
+          std::string::npos);
+    CHECK_FALSE(job.nodes.one.stopped);  // nothing happened
+
+    CHECK(run_tool(tool("pm"), {"leave", "--force", "--state-dir", here}, out) == 0);
+    CHECK(contents(out) == "pm: node 1 is leaving\n");
+    CHECK(exit_status(job.pmrun, 30) == 1);  // the job was ended ...
+    CHECK(contents(job.said).find(" aborted: node 1 is leaving") != std::string::npos);
+    CHECK(job.all_gone());                  // ... on every node
+    CHECK(stops_within(job.nodes.one, 5));  // and the launcher's node went
+}
+
+TEST_CASE(
+    "a worker leaves during matrix multiply: the job finishes with the single-machine result" *
+    doctest::skip(!region_can_be_mapped())) {
+    const std::string plain_out = "/tmp/pmd-test-matmul-plain";
+    REQUIRE(run_tool(matmul_path(), {"--plain", "1024"}, plain_out, 120) == 0);
+    const std::string plain = contents(plain_out);
+    const std::string expected = plain.substr(plain.find("checksum "));
+    std::filesystem::remove(plain_out);
+
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): no other thread of this process is running
+    ::setenv("PARAMESH_CFG_LOG_LEVEL", "info", 1);
+    {
+        const ThreeNodes nodes;
+        const std::string said = nodes.reports + "/stderr";
+        const std::string printed = nodes.reports + "/stdout";
+        std::vector<std::string> all{pmrun_path(),        "-n",          "3",    "--state-dir",
+                                     nodes.one.state_dir, matmul_path(), "1024", "2"};
+        std::vector<char*> argv;
+        argv.reserve(all.size() + 1);
+        for (std::string& argument : all) {
+            argv.push_back(argument.data());
+        }
+        argv.push_back(nullptr);
+        const pid_t pmrun = ::fork();
+        if (pmrun == 0) {
+            ::dup2(::open(printed.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600), STDOUT_FILENO);
+            ::dup2(::open(said.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600), STDERR_FILENO);
+            ::execv(argv[0], argv.data());
+            ::_exit(127);
+        }
+        // Node 3's worker is running chunks: node 3 leaves, as `pm leave` there asks.
+        // In the job means connected to the launcher and to node 2 besides its pmd and its
+        // listener: four sockets.
+        bool running = false;
+        for (int tenths = 0; tenths < 600 && !running; tenths++) {
+            ::usleep(100000);
+            for (const auto& entry : std::filesystem::directory_iterator{"/proc"}) {
+                const std::string environment = contents(entry.path().string() + "/environ");
+                if (contents(entry.path().string() + "/cmdline").find(matmul_path()) ==
+                        std::string::npos ||
+                    environment.find("PARAMESH_NODE_ID=3") == std::string::npos) {
+                    continue;
+                }
+                int sockets = 0;
+                std::error_code ignored;
+                for (const auto& fd :
+                     std::filesystem::directory_iterator{entry.path() / "fd", ignored}) {
+                    const std::string target = std::filesystem::read_symlink(fd.path(), ignored);
+                    sockets += target.starts_with("socket:") ? 1 : 0;
+                }
+                running = running || sockets >= 4;
+            }
+        }
+        REQUIRE(running);
+        ::usleep(500000);
+        const std::string out = nodes.reports + "/pm";
+        CHECK(run_tool(tool("pm"), {"leave", "--state-dir", nodes.three.state_dir}, out) == 0);
+        CHECK(contents(out) == "pm: node 3 is leaving\n");
+
+        CHECK(exit_status(pmrun, 180) == 0);
+        const std::string result = contents(printed);
+        INFO(result);
+        INFO(contents(said));
+        CHECK(result.find(expected) != std::string::npos);  // every chunk done, every page kept
+        CHECK(contents(said).find("\"event\":\"member_left\"") != std::string::npos);
+        CHECK(stops_within(nodes.three, 10));  // node 3's daemon went once its worker had
+        CHECK_FALSE(nodes.two.stopped);
+    }
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): as above
+    ::unsetenv("PARAMESH_CFG_LOG_LEVEL");
 }

@@ -1,15 +1,19 @@
 #include "tools/pm.h"
 
+#include "net/frame_io.h"
 #include "platform/factory.h"
+#include "wire/payloads.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <array>
 #include <charconv>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <variant>
 
@@ -18,6 +22,9 @@ namespace paramesh {
 namespace {
 
 constexpr std::uint16_t kStatusPort = 47002;  // pmd's --http-port default
+constexpr const char* kUsage =
+    "usage: pm status [--http-port N]\n"
+    "       pm leave [--force] [--state-dir DIRECTORY]\n";
 
 std::int64_t number(const JsonObject& object, const char* key) {
     const auto found = object.find(key);
@@ -120,7 +127,64 @@ Result<std::string> http_get(std::uint16_t port, std::string_view path) {
     return answer.substr(body + 4);
 }
 
+// `pm leave [--force] [--state-dir DIRECTORY]`: asks the local pmd to leave.
+int leave(std::span<const std::string_view> args) {
+    bool force = false;
+    std::string state_dir;
+    for (std::size_t at = 1; at < args.size(); at++) {
+        if (args[at] == "--force") {
+            force = true;
+        } else if (args[at] == "--state-dir" && at + 1 < args.size()) {
+            state_dir = args[++at];
+        } else {
+            static_cast<void>(std::fputs(kUsage, stderr));
+            return 2;
+        }
+    }
+    if (state_dir.empty()) {
+        const char* home = std::getenv("HOME");  // NOLINT(concurrency-mt-unsafe): one thread
+        state_dir = std::string{home != nullptr ? home : "."} + "/.local/state/paramesh";
+    }
+    const std::string socket = state_dir + "/pmd.sock";
+    sockaddr_un to{};
+    to.sun_family = AF_UNIX;
+    if (socket.size() < sizeof to.sun_path) {
+        std::copy(socket.begin(), socket.end(), std::begin(to.sun_path));
+    }
+    const int pmd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    Result<Platform> platform =
+        platform_open({}, PlatformOptions{kNoNode, JobId{0}, 2, LogLevel::kWarn});
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API
+    if (pmd < 0 || !platform.ok() ||
+        ::connect(pmd, reinterpret_cast<const sockaddr*>(&to), sizeof to) != 0) {
+        static_cast<void>(
+            std::fprintf(stderr, "pm: cannot reach pmd at %s; is it running?\n", socket.c_str()));
+        return 1;
+    }
+    std::array<std::byte, 4> request{};
+    static_cast<void>(wire_encode(LLeaveReqPayload{force}, request));
+    FrameHeader header;
+    header.opcode = Opcode::kLLeaveReq;
+    const Checksum& checksum = *platform.value().checksum;
+    const Result<Frame> answer = frame_write(pmd, checksum, header, request).ok()
+                                     ? frame_read(pmd, checksum)
+                                     : Result<Frame>{Error{Errc::kIo}};
+    ::close(pmd);
+    const Result<StatusTextPayload> said = answer.ok()
+                                               ? wire_decode_spawn_decline(answer.value().payload)
+                                               : Result<StatusTextPayload>{answer.error()};
+    if (!said.ok() || answer.value().header.opcode != Opcode::kLLeaveReply) {
+        static_cast<void>(std::fputs("pm: pmd gave no answer\n", stderr));
+        return 1;
+    }
+    static_cast<void>(std::printf("pm: %s\n", said.value().message.c_str()));
+    return said.value().status == Status::kOk ? 0 : 1;
+}
+
 int pm(std::span<const std::string_view> args) {
+    if (!args.empty() && args[0] == "leave") {
+        return leave(args);
+    }
     std::uint16_t port = kStatusPort;
     if (args.size() == 3 && args[1] == "--http-port") {
         unsigned value = 0;
@@ -134,7 +198,7 @@ int pm(std::span<const std::string_view> args) {
         port = static_cast<std::uint16_t>(value);
     }
     if ((args.size() != 1 && args.size() != 3) || args[0] != "status") {
-        static_cast<void>(std::fputs("usage: pm status [--http-port N]\n", stderr));
+        static_cast<void>(std::fputs(kUsage, stderr));
         return 2;
     }
     return status(port);

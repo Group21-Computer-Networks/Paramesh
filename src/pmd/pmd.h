@@ -25,6 +25,7 @@
 
 #include <sys/types.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -88,6 +89,9 @@ public:
     // Serves until stop(). stop() may be called from any thread and from a signal handler.
     void run();
     void stop() const noexcept;
+    // A graceful leave, as `pm leave` asks (docs/PROTOCOL.md, 8.2): every job this node serves
+    // is told, and run() returns once its workers have gone. Any thread or a signal handler.
+    void leave() const noexcept;
 
 private:
     struct Connection {
@@ -104,6 +108,13 @@ private:
         NodeId asker;
         ReqId req;
         std::array<std::byte, 32> hash{};
+    };
+
+    // A worker that has registered, until its local connection closes.
+    struct Worker {
+        JobId job;
+        std::uint64_t local = 0;    // its connection on the local socket
+        std::uint64_t control = 0;  // the control connection its SPAWN_REQ came on
     };
 
     // A job launched on this node, from L_RUN_REQ until its launcher has gone.
@@ -134,6 +145,9 @@ private:
                       std::span<const std::byte> payload);
     void on_spawn_answer(const FrameHeader& header, std::span<const std::byte> payload);
     void on_closed(const Connection& connection);
+    void on_leave_req(Connection& connection, std::span<const std::byte> payload);
+    void on_leave_intent(const FrameHeader& header, std::span<const std::byte> payload);
+    void begin_leave(std::uint8_t reason);
     void ask_peers(Run& run);
     void ask_next_peer(Run& run);
     void finish_admission(Run& run);
@@ -173,6 +187,10 @@ private:
     std::uint64_t next_connection_ = 1;
     std::deque<Connection> connections_;  // a deque: handling a frame may add one
     std::vector<Spawn> spawns_;
+    std::vector<Worker> workers_;
+    bool leaving_ = false;
+    mutable std::atomic<bool> stop_asked_{false};
+    mutable std::atomic<bool> leave_asked_{false};
     std::vector<pid_t> children_;  // every worker started and not yet collected
     std::vector<Run> runs_;
     std::unordered_map<std::uint64_t, Ask> asks_;  // by the SPAWN_REQ's request number

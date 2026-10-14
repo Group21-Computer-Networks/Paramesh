@@ -16,9 +16,17 @@ paramesh::Pmd*& running() {
     return daemon;
 }
 
-void on_signal(int /*signal*/) {
-    if (running() != nullptr) {
-        running()->stop();  // one write to an eventfd
+// Ctrl+C is a graceful leave; a second one, or SIGTERM, stops at once.
+void on_signal(int signal) {
+    static volatile std::sig_atomic_t interrupted = 0;
+    if (running() == nullptr) {
+        return;
+    }
+    if (signal == SIGINT && interrupted == 0) {
+        interrupted = 1;
+        running()->leave();  // one write to an eventfd
+    } else {
+        running()->stop();
     }
 }
 

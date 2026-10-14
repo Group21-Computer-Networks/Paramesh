@@ -894,9 +894,19 @@ private:
     }
 
     void set_up() noexcept {
-        const std::lock_guard<std::mutex> lock{mutex_};
-        up_ = true;
-        changed_.notify_all();
+        {
+            const std::lock_guard<std::mutex> lock{mutex_};
+            up_ = true;
+            changed_.notify_all();
+        }
+        // A leave that pmd told of while the job was starting begins now.
+        if (leave_early_) {
+            on_network_thread([this] { begin_leave(); });
+        }
+        for (const NodeId node : early_leavers_) {
+            on_network_thread([this, node] { member_leaving(node); });
+        }
+        early_leavers_.clear();
     }
 
     // Launcher: places the segments, applies the map at the next epoch and sends it to every
@@ -967,6 +977,10 @@ private:
 
     // Launcher: a member is leaving (L_LEAVE_INTENT). One at a time; another waits its turn.
     void member_leaving(NodeId node) noexcept {
+        if (is_launcher() && !up_) {
+            early_leavers_.push_back(node);  // taken when the job is up (set_up)
+            return;
+        }
         const bool member = std::any_of(s_.members.begin(), s_.members.end(),
                                         [node](const Member& m) { return m.node == node; });
         if (!is_launcher() || !up_ || node == s_.self || !member ||
@@ -999,7 +1013,11 @@ private:
     // This process is to leave (L_LEAVE): its threads take no more chunks, and when they are
     // idle, or after the grace, it gives up every page it holds.
     void begin_leave() noexcept {
-        if (is_launcher() || leaving_ || !up_) {
+        if (!up_) {
+            leave_early_ = true;  // taken when the job is up (set_up)
+            return;
+        }
+        if (is_launcher() || leaving_) {
             return;
         }
         leaving_ = true;
@@ -2101,11 +2119,13 @@ private:
     std::unordered_set<std::uint16_t> left_;         // members that have left
     std::unordered_map<std::uint16_t, Slot> slots_;  // every member there has been: its bit
     std::deque<NodeId> leavers_;                     // launcher: leaving, the first in progress
-    bool dropping_ = false;                          // launcher: the map without it is out
-    bool leaving_ = false;                           // this process is leaving
-    bool evicting_ = false;                          // and serves no more faults
-    bool leave_done_ = false;                        // LEAVE_DONE is sent
-    std::uint64_t held_pages_ = 0;                   // pages not in state I
+    std::vector<NodeId> early_leavers_;              // launcher: told of before the job was up
+    bool leave_early_ = false;      // this process was told to leave before it was up
+    bool dropping_ = false;         // launcher: the map without it is out
+    bool leaving_ = false;          // this process is leaving
+    bool evicting_ = false;         // and serves no more faults
+    bool leave_done_ = false;       // LEAVE_DONE is sent
+    std::uint64_t held_pages_ = 0;  // pages not in state I
     std::uint32_t segments_moved_ = 0;
     Nanos moves_from_{};  // tests only: no segment is sent before this
     std::unordered_map<std::uint64_t, std::function<void()>> timers_;
