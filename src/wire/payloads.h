@@ -145,6 +145,7 @@ struct ByePayload {
 };
 
 // SPAWN_REQ: a launcher's pmd asks a peer's pmd to start one worker process.
+inline constexpr std::uint16_t kSpawnMidRun = 0x0001;  // SPAWN_REQ: join a running job
 struct SpawnReqPayload {
     NodeId launcher_node;
     std::uint16_t flags = 0;
@@ -226,6 +227,10 @@ inline constexpr std::uint8_t kLeaveInterrupt = 2;  // Ctrl+C on pmd
 struct LeaveIntentPayload {
     NodeId node;
     std::uint8_t reason = kLeaveAsked;
+};
+// L_MEMBER: a node spawned for a running job (M4-7), one member entry with slot 0.
+struct LMemberPayload {
+    SegMapMember member;
 };
 struct LLeavePayload {
     std::uint8_t reason = kLeaveAsked;
@@ -327,6 +332,8 @@ Result<std::size_t> wire_encode(const LeaveDonePayload& payload, std::span<std::
 Result<std::size_t> wire_encode(const LLeaveReqPayload& payload, std::span<std::byte> out);
 Result<RedirectPayload> wire_decode_redirect(std::span<const std::byte> in);
 Result<LeaveIntentPayload> wire_decode_leave_intent(std::span<const std::byte> in);
+Result<std::size_t> wire_encode(const LMemberPayload& payload, std::span<std::byte> out);
+Result<LMemberPayload> wire_decode_l_member(std::span<const std::byte> in);
 Result<LLeavePayload> wire_decode_l_leave(std::span<const std::byte> in);
 // The entries' data are views of `in`.
 Result<SegMigratePayload> wire_decode_seg_migrate(std::span<const std::byte> in);

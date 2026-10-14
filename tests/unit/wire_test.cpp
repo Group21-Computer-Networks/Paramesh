@@ -642,3 +642,21 @@ TEST_CASE("the leave payloads: REDIRECT, LEAVE_INTENT, L_LEAVE, SEG_MIGRATE and 
     }
     CHECK(paramesh::wire_encode(migrate, room).value() == 8 + 254 * (24 + paramesh::kPageSize));
 }
+
+TEST_CASE("the join payload: L_MEMBER, one member entry") {
+    paramesh::LMemberPayload joined;
+    joined.member = paramesh::SegMapMember{
+        paramesh::NodeId{4}, paramesh::Slot{0}, paramesh::kMemberNoHomes, 0x7F000001, 47010,
+        1ULL << 20U};
+    const auto bytes = hex("00 04 00 02 7f 00 00 01 b7 a2 00 00 00 00 00 00 00 10 00 00");
+    CHECK(encoded(joined) == bytes);
+    const auto back = paramesh::wire_decode_l_member(bytes);
+    REQUIRE(back.ok());
+    CHECK(back.value().member.node == paramesh::NodeId{4});
+    CHECK(back.value().member.flags == paramesh::kMemberNoHomes);
+    CHECK(back.value().member.addr == 0x7F000001);
+    CHECK(back.value().member.port == 47010);
+    CHECK(back.value().member.ram_weight == 1ULL << 20U);
+    CHECK(paramesh::wire_decode_l_member(hex("00 04 00 02")).error().code == Errc::kProtocol);
+    CHECK(paramesh::kSpawnMidRun == 0x0001);
+}
