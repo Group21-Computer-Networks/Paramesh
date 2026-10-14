@@ -761,6 +761,9 @@ void Pmd::hear() {
                 clashes_.push_back(Peer{node, address, hello.value(), platform_.clock->now()});
             }
         }
+        if (heard == PeerTable::Heard::kNew && (hello.value().flags & kHelloLeaving) == 0) {
+            refill(node, Endpoint{address, hello.value().control_port});
+        }
         if (heard == PeerTable::Heard::kNew || heard == PeerTable::Heard::kClash) {
             const bool fresh = heard == PeerTable::Heard::kNew;
             platform_.logger->log(fresh ? LogLevel::kInfo : LogLevel::kWarn,
@@ -947,7 +950,23 @@ void Pmd::ask_peers(Run& run) {
 // Sends SPAWN_REQ to the next candidate this job has not asked. A peer that cannot be
 // reached counts as one that declined: the caller's loop goes on to the one after.
 void Pmd::ask_next_peer(Run& run) {
-    const Endpoint peer = run.candidates[run.next_peer++];
+    ask_peer(run, run.candidates[run.next_peer++], 0);
+}
+
+// A running job with fewer members than it asked for is offered to a peer newly heard
+// (docs/PROTOCOL.md, 8.3): SPAWN_REQ with MID_RUN, one peer at a time for each job.
+void Pmd::refill(NodeId node, Endpoint peer) {
+    for (Run& run : runs_) {
+        const bool member = std::any_of(run.members.begin(), run.members.end(),
+                                        [node](const SegMapMember& m) { return m.node == node; });
+        if (!leaving_ && run.launcher != 0 && run.wants.region_bytes != 0 && !run.admitting &&
+            run.asked == 0 && run.members.size() < run.request.nodes && !member) {
+            ask_peer(run, peer, kSpawnMidRun);
+        }
+    }
+}
+
+void Pmd::ask_peer(Run& run, Endpoint peer, std::uint16_t flags) {
     sockaddr_in to{};
     to.sin_family = AF_INET;
     to.sin_addr.s_addr = htonl(peer.ipv4);
@@ -975,6 +994,7 @@ void Pmd::ask_next_peer(Run& run) {
 
     SpawnReqPayload request;
     request.launcher_node = config_.node;
+    request.flags = flags;
     request.launcher_addr = ntohl(mine.sin_addr.s_addr);  // this node, as that peer reaches it
     request.launcher_port = run.members.front().port;
     request.threads_per_node = run.wants.threads_per_node;
@@ -984,7 +1004,7 @@ void Pmd::ask_next_peer(Run& run) {
     request.cwd = run.request.cwd;
     request.argv = run.request.argv;
     const ReqId req{next_req_++};
-    asks_[req.value] = Ask{run.job, connection, peer};
+    asks_[req.value] = Ask{run.job, connection, peer, flags != 0};
     run.asked++;
     reply(connection, Opcode::kSpawnReq, run.job, kNoNode, req, request);
 }
@@ -1003,6 +1023,22 @@ void Pmd::on_spawn_answer(const FrameHeader& header, std::span<const std::byte> 
     }
     run->asked--;
     const Result<SpawnOkPayload> ok = wire_decode_spawn_ok(payload);
+    if (ask.mid_run) {
+        if (header.opcode == Opcode::kSpawnOk && ok.ok()) {
+            const SegMapMember joined{ok.value().node,      Slot{0},
+                                      kMemberNoHomes,       ask.peer.ipv4,
+                                      ok.value().data_port, ok.value().ram_commit};
+            run->members.push_back(joined);
+            reply(run->launcher, Opcode::kLMember, run->job, kNoNode, kNoReq,
+                  LMemberPayload{joined});
+        }
+        platform_.logger->log(
+            LogLevel::kInfo, "refill",
+            JsonObject{{"job", JsonValue{std::int64_t{run->job.value}}},
+                       {"peer", JsonValue{dotted(ask.peer.ipv4)}},
+                       {"joined", JsonValue{header.opcode == Opcode::kSpawnOk && ok.ok()}}});
+        return;
+    }
     if (header.opcode == Opcode::kSpawnOk && ok.ok()) {
         run->members.push_back(SegMapMember{ok.value().node, Slot{0}, 0, ask.peer.ipv4,
                                             ok.value().data_port, ok.value().ram_commit});
@@ -1102,6 +1138,9 @@ void Pmd::on_leave_intent(const FrameHeader& header, std::span<const std::byte> 
     Run* run = run_of(header.job);
     if (intent.ok() && run != nullptr && run->launcher != 0) {
         reply(run->launcher, Opcode::kLLeaveIntent, run->job, kNoNode, kNoReq, intent.value());
+        // The job is a member short now: a peer heard from now on may refill it (M4-7).
+        std::erase_if(run->members,
+                      [&](const SegMapMember& m) { return m.node == intent.value().node; });
     }
 }
 

@@ -137,6 +137,7 @@ private:
         JobId job;
         std::uint64_t connection = 0;
         Endpoint peer;
+        bool mid_run = false;  // a refill of a running job (M4-7)
     };
 
     void on_run_req(Connection& connection, const FrameHeader& header,
@@ -150,6 +151,8 @@ private:
     void begin_leave(std::uint8_t reason);
     void ask_peers(Run& run);
     void ask_next_peer(Run& run);
+    void ask_peer(Run& run, Endpoint peer, std::uint16_t flags);
+    void refill(NodeId node, Endpoint peer);
     void finish_admission(Run& run);
     void refuse(Run& run, std::uint64_t available, std::size_t nodes);
     std::uint32_t next_job_number();

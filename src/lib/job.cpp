@@ -550,6 +550,10 @@ public:
             return;
         }
         joined_.insert(peer.node.value);
+        if (is_launcher() && up_ && peer.node == joining_ && !join_sent_) {
+            send_join_map();
+            return;
+        }
         advance_start();
     }
 
@@ -857,6 +861,14 @@ private:
             }
             if (frame.value().header.opcode == Opcode::kLLeave) {
                 on_network_thread([this] { begin_leave(); });
+            } else if (frame.value().header.opcode == Opcode::kLMember) {
+                const Result<LMemberPayload> joined = wire_decode_l_member(frame.value().payload);
+                if (joined.ok()) {
+                    on_network_thread([this, m = joined.value().member] {
+                        joiners_.push_back(m);
+                        try_join();
+                    });
+                }
             } else if (frame.value().header.opcode == Opcode::kLLeaveIntent) {
                 const Result<LeaveIntentPayload> who =
                     wire_decode_leave_intent(frame.value().payload);
@@ -907,6 +919,7 @@ private:
             on_network_thread([this, node] { member_leaving(node); });
         }
         early_leavers_.clear();
+        on_network_thread([this] { try_join(); });  // a node offered while the job started
     }
 
     // Launcher: places the segments, applies the map at the next epoch and sends it to every
@@ -920,10 +933,13 @@ private:
             if (leaving && drop) {
                 continue;  // apply_map() takes it out of the members and the copysets
             }
+            const bool no_homes = no_homes_.contains(member.node.value);
             std::uint8_t flags = member.node == s_.self ? kMemberLauncher : 0;
             flags |= leaving ? kMemberLeaving : 0;
-            // Without pmd's commitments every member weighs the same.
-            const std::uint64_t weight = leaving ? 0 : 1;
+            flags |= no_homes ? kMemberNoHomes : 0;
+            // Without pmd's commitments every member weighs the same; one that joined mid-run
+            // or is leaving weighs nothing, so no segment moves to it.
+            const std::uint64_t weight = leaving || no_homes ? 0 : 1;
             map.members.push_back(
                 {member.node, member.slot, flags, member.at.ipv4, member.at.port, weight});
             placement.push_back({member.node, member.slot, weight});
@@ -954,7 +970,14 @@ private:
             set_up();
             return;
         }
+        if (join_sent_) {  // the newest map names the node that joined: it may take chunks
+            platform_.logger->log(LogLevel::kInfo, "member_joined",
+                                  JsonObject{{"node", JsonValue{std::int64_t{joining_.value}}}});
+            joining_ = kNoNode;
+            join_sent_ = false;
+        }
         if (!dropping_ || leavers_.empty()) {
+            try_join();
             return;
         }
         // The map without the leaver is everywhere: nobody will address it again, and it may go.
@@ -971,6 +994,42 @@ private:
         if (!leavers_.empty()) {
             start_leave();
         }
+        try_join();
+    }
+
+    // ---- a node joins (docs/PROTOCOL.md, 8.3) ---------------------------------------------------
+
+    // Launcher: the next node pmd spawned for this job (L_MEMBER) becomes a member with a new
+    // slot, hosting no segment. One at a time, and not while a leave is under way; the map
+    // naming it goes out once it has connected.
+    void try_join() noexcept {
+        if (!is_launcher() || !up_ || joining_ != kNoNode || !leavers_.empty() ||
+            joiners_.empty()) {
+            return;
+        }
+        const SegMapMember joiner = joiners_.front();
+        joiners_.pop_front();
+        std::uint8_t slot = 0;
+        for (const auto& [node, used] : slots_) {
+            slot = std::max<std::uint8_t>(slot, used.value + 1);
+        }
+        const Endpoint at{joiner.addr, joiner.port};
+        if (slot >= kMaxSlots || !net_->add_peer(joiner.node, at).ok()) {
+            try_join();  // ponytail: a node that cannot be added is passed over
+            return;
+        }
+        s_.members.push_back(Member{joiner.node, Slot{slot}, at});
+        slots_[joiner.node.value] = Slot{slot};
+        no_homes_.insert(joiner.node.value);
+        joining_ = joiner.node;
+        if (joined_.contains(joiner.node.value)) {
+            send_join_map();
+        }
+    }
+
+    void send_join_map() noexcept {
+        join_sent_ = true;
+        send_map(kNoNode, false);
     }
 
     // ---- a member leaves (docs/PROTOCOL.md, 8.2) ------------------------------------------------
@@ -2120,6 +2179,10 @@ private:
     std::unordered_map<std::uint16_t, Slot> slots_;  // every member there has been: its bit
     std::deque<NodeId> leavers_;                     // launcher: leaving, the first in progress
     std::vector<NodeId> early_leavers_;              // launcher: told of before the job was up
+    std::deque<SegMapMember> joiners_;               // launcher: spawned for it, not yet members
+    std::unordered_set<std::uint16_t> no_homes_;     // launcher: members that joined mid-run
+    NodeId joining_ = kNoNode;                       // launcher: the one joining now
+    bool join_sent_ = false;                         // and the map naming it is out
     bool leave_early_ = false;      // this process was told to leave before it was up
     bool dropping_ = false;         // launcher: the map without it is out
     bool leaving_ = false;          // this process is leaving
