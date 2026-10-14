@@ -14,16 +14,9 @@
 
 set -u
 
-if [ -z "${PM_IN_NAMESPACE:-}" ]; then
-    self="$(readlink -f "$0")"
-    if unshare --user --map-root-user --net --mount true 2>/dev/null; then
-        exec unshare --user --map-root-user --net --mount env PM_IN_NAMESPACE=1 "$self" "$@"
-    elif sudo -n true 2>/dev/null; then
-        exec sudo -n unshare --net --mount env PM_IN_NAMESPACE=1 "$self" "$@"
-    fi
-    echo "cannot create network namespaces here; see tools/check_env.sh" >&2
-    exit 2
-fi
+# shellcheck source=tests/multi/netns.sh
+. "$(dirname "$(readlink -f "$0")")/netns.sh"
+netns_enter "$0" "$@"
 
 nodes=3
 delay=0
@@ -48,34 +41,7 @@ if [ $# -lt 1 ] || ! [ "$nodes" -ge 1 ] 2>/dev/null || [ "$nodes" -gt 8 ]; then
     exit 2
 fi
 
-# This shell is the "switch": a bridge, and one veth cable to each node's namespace.
-holders=()
-trap 'for pid in "${holders[@]}"; do kill "$pid" 2>/dev/null; done' EXIT
-ip link set lo up
-ip link add pmbr0 type bridge && ip link set pmbr0 up || {
-    echo "cannot create a bridge in the namespace" >&2
-    exit 2
-}
+netns_nodes "$nodes" "$delay" "$loss"
 
-addrs=""
-for i in $(seq 1 "$nodes"); do
-    unshare --net sleep infinity &
-    holder=$!
-    holders+=("$holder")
-    # The holder has its own namespace once its link differs from this shell's.
-    for _ in $(seq 1 50); do
-        [ "$(readlink "/proc/$holder/ns/net" 2>/dev/null)" != "$(readlink /proc/$$/ns/net)" ] && break
-        sleep 0.05
-    done
-    ip link add "pmveth$i" type veth peer name eth0 netns "$holder" &&
-        ip link set "pmveth$i" master pmbr0 up &&
-        nsenter -t "$holder" -n sh -c "ip link set lo up && ip addr add 10.77.0.$i/24 dev eth0 && ip link set eth0 up &&
-            tc qdisc add dev eth0 root netem delay ${delay}ms loss ${loss}%" || {
-        echo "cannot set up the namespace of node $i" >&2
-        exit 2
-    }
-    addrs="$addrs 10.77.0.$i"
-done
-
-PM_NODE_ADDRS="$addrs" PM_NODE_NS="${holders[*]}" PM_NETEM="delay ${delay} ms, loss ${loss}%" \
+PM_NODE_ADDRS="${NS_ADDRS[*]}" PM_NODE_NS="${NS_HOLDERS[*]}" PM_NETEM="delay ${delay} ms, loss ${loss}%" \
     "$(dirname "$(readlink -f "$0")")/run_local.sh" -n "$nodes" -t "$limit" "$@"

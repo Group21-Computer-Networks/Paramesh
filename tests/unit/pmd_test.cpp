@@ -592,10 +592,12 @@ PM_TASK(pmd_test_square) {
 
 namespace {
 
-// The join mode (M4-7): once node 3 has begun a chunk the report says so, and the test makes
-// node 3 leave and starts node 4. Rounds of chunks then go on until node 4 has run some, at
-// most for 120 s; the last round is checked.
-int join_program(const std::string& report, const SquareArgs& args, std::uint64_t count) {
+// The modes that run in rounds (M4-7, M4-8): once node 3 has begun a chunk the report says so
+// (`.three`), and the test or script makes something happen. Rounds of chunks then go on until
+// node 4 has run some (join), or until the file `.stop` beside the report exists (until-stop,
+// big-until-stop), at most for 120 s. The last round is checked.
+int rounds_program(const std::string& report, const SquareArgs& args, std::uint64_t count,
+                   bool join) {
     const volatile std::uint64_t* started = args.started;
     const volatile std::uint64_t* by_node = args.by_node;
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{120};
@@ -615,7 +617,8 @@ int join_program(const std::string& report, const SquareArgs& args, std::uint64_
         if (pm_wait_all() != PM_OK) {
             return 32;
         }
-    } while (by_node[4] == 0 && std::chrono::steady_clock::now() < until);
+    } while ((join ? by_node[4] == 0 : !std::filesystem::exists(report + ".stop")) &&
+             std::chrono::steady_clock::now() < until);
     std::uint64_t wrong = 0;
     for (std::uint64_t i = 0; i < count; i++) {
         wrong += args.squares[i] != i * i ? 1U : 0U;
@@ -629,7 +632,10 @@ int join_program(const std::string& report, const SquareArgs& args, std::uint64_
 // number of the step that failed.
 int program(const std::string& report, std::string_view mode) {
     const bool slow = mode == "slow";
-    const bool big = mode == "big";    // squares over many more pages than a node may cache
+    const bool join = mode == "join";
+    const bool rounds = join || mode == "until-stop" || mode == "big-until-stop";
+    // squares over many more pages than a node may cache
+    const bool big = mode == "big" || mode == "big-until-stop";
     const bool huge = mode == "huge";  // and over more than the nodes' home stores hold in RAM
     std::uint64_t count = kSquares;
     if (big || huge) {
@@ -651,9 +657,8 @@ int program(const std::string& report, std::string_view mode) {
     args.by_node = static_cast<std::uint64_t*>(pm_malloc(8 * sizeof(std::uint64_t)));
     args.by_thread = static_cast<std::uint64_t*>(pm_malloc(64 * sizeof(std::uint64_t)));
     args.started = static_cast<std::uint64_t*>(pm_malloc(8 * sizeof(std::uint64_t)));
-    const bool join = mode == "join";
     args.slow = slow ? 1 : 0;
-    if (join) {
+    if (rounds) {
         args.slow = 2;
     }
     if (args.squares == nullptr || args.by_node == nullptr || args.by_thread == nullptr ||
@@ -661,8 +666,8 @@ int program(const std::string& report, std::string_view mode) {
         return 31;
     }
     write_report(report + ".up", "pid=" + std::to_string(::getpid()) + "\n");
-    if (join) {
-        return join_program(report, args, count);
+    if (rounds) {
+        return rounds_program(report, args, count, join);
     }
     if (pm_parallel_for_data("pmd_test_square", 0, count, huge ? 4096 : 512, &args, sizeof args,
                              args.squares, sizeof(std::uint64_t)) != PM_OK ||
