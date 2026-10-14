@@ -378,6 +378,12 @@ PM_TASK(lib_test_leave) {
                 ::usleep(13U * 1000000U);  // past the 10 s a leaver's chunks are given
             }
         }
+        // The other nodes wait until node 3 has a chunk of this round: on a loaded machine
+        // they could otherwise run every chunk before node 3 asks for one.
+        const volatile std::uint64_t* told = args->told;
+        for (int waited = 0; ctx->node != 3 && waited < 20000 && told[0] == 0; waited++) {
+            ::usleep(1000);
+        }
         ::usleep(4000);  // long enough for the leave to happen while chunks are running
     }
     if (args->round == 2) {
