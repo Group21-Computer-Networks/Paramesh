@@ -176,6 +176,10 @@ void Tasks::work(std::uint16_t thread) {
         rt_run_task(host_, chunk.task_id, ctx, chunk.lo, chunk.hi,
                     chunk.arg.empty() ? nullptr : chunk.arg.data());
         const std::uint64_t cpu = thread_cpu_ns() - before;
+        if (!launcher_) {  // the launcher's own are reported by done()
+            host_.chunk_finished(host_.self(), chunk.task_id, chunk.hi - chunk.lo,
+                                 Nanos{static_cast<long>(cpu)});
+        }
         hold.lock();
         me.running = false;
         if (launcher_) {
@@ -242,7 +246,9 @@ void Tasks::done(std::uint64_t chunk_id, NodeId ran_by, std::uint64_t cpu_ns) {
     if (--call->second.chunks_left == 0) {
         calls_.erase(call);
     }
-    host_.chunk_finished(ran_by, task_id, chunk.hi - chunk.lo, Nanos{static_cast<long>(cpu_ns)});
+    // A peer's chunk is reported with 0: the CPU time in its TASK_DONE is the peer's to claim.
+    const std::uint64_t measured = ran_by == host_.self() ? cpu_ns : 0;
+    host_.chunk_finished(ran_by, task_id, chunk.hi - chunk.lo, Nanos{static_cast<long>(measured)});
     sync_.work_done(1);
 }
 

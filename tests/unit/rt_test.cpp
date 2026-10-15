@@ -197,11 +197,24 @@ public:
         static_cast<void>(std::fflush(stderr));
         _exit(42);
     }
-    void chunk_finished(NodeId /*ran_by*/, std::uint64_t /*task_id*/, std::uint64_t /*indexes*/,
-                        paramesh::Nanos /*cpu*/) noexcept override {}
+    // Every chunk_finished, as "node N task T indexes I cpu C", C being "0" or "some".
+    void chunk_finished(NodeId ran_by, std::uint64_t task_id, std::uint64_t indexes,
+                        paramesh::Nanos cpu) noexcept override {
+        const std::lock_guard<std::mutex> lock{mu_};
+        finished_.push_back("node " + std::to_string(ran_by.value) +
+                            (task_id == paramesh::rt_task_id("rt_test_sum") ? " sum" : " other") +
+                            " indexes " + std::to_string(indexes) + " cpu " +
+                            (cpu.count() == 0 ? "0" : "some"));
+    }
+    std::vector<std::string> finished() {
+        const std::lock_guard<std::mutex> lock{mu_};
+        return finished_;
+    }
 
 private:
     NodeId self_;
+    std::mutex mu_;
+    std::vector<std::string> finished_;
 };
 
 // One process's Sync with its fakes. Node 1 is the launcher.
@@ -713,6 +726,8 @@ TEST_CASE("the launcher hands out chunks in order and counts each chunk done onc
     CHECK(launcher.sync.outstanding() == 3);
     task_frame(launcher, tasks, Opcode::kTaskDone, 2, 0, paramesh::TaskDonePayload{1, 500, 0});
     CHECK(launcher.sync.outstanding() == 3);  // only the first report of a chunk counts
+    // For the ledger: node 2 ran 4 indexes; the CPU time it reported is not passed on.
+    CHECK(launcher.host.finished() == std::vector<std::string>{"node 2 sum indexes 4 cpu 0"});
     task_frame(launcher, tasks, Opcode::kTaskDone, 3, 0, paramesh::TaskDonePayload{99, 0, 0});
     CHECK(launcher.sync.outstanding() == 3);  // nor does one for a chunk nobody was given
     for (const std::uint64_t chunk : {2ULL, 3ULL, 4ULL}) {
@@ -843,6 +858,9 @@ TEST_CASE("a worker thread asks for a chunk and one more, runs them, and backs o
     CHECK(ran == "TASK_DONE>1 req 0 chunk 41 thread 0, TASK_REQ>1 req " +
                      std::to_string(worker.net.last_req().value & 0xFFFFU) + " thread 0");
     CHECK(sum == 3 + 4 + 5 + 6);
+    // For the ledger: this node ran 4 indexes, reported here with the CPU time it measured.
+    REQUIRE(worker.host.finished().size() == 1);
+    CHECK(worker.host.finished()[0].starts_with("node 2 sum indexes 4 cpu "));
 
     // Both outstanding requests are refused: after the back-off it asks twice again.
     reqs = worker.net.reqs();

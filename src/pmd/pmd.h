@@ -19,6 +19,7 @@
 #include "platform/factory.h"
 #include "platform/ids.h"
 #include "platform/result.h"
+#include "pmd/ledger.h"
 #include "pmd/peers.h"
 #include "wire/frame.h"
 #include "wire/payloads.h"
@@ -31,6 +32,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -113,8 +115,11 @@ private:
     // A worker that has registered, until its local connection closes.
     struct Worker {
         JobId job;
-        std::uint64_t local = 0;    // its connection on the local socket
-        std::uint64_t control = 0;  // the control connection its SPAWN_REQ came on
+        std::uint64_t local = 0;               // its connection on the local socket
+        std::uint64_t control = 0;             // the control connection its SPAWN_REQ came on
+        NodeId launcher;                       // the job's launcher node
+        std::vector<LSegmentsEntry> segments;  // the newest L_SEGMENTS, since `since`
+        Nanos since{};
     };
 
     // A job launched on this node, from L_RUN_REQ until its launcher has gone.
@@ -131,6 +136,8 @@ private:
         bool unlimited = false;             // a member has no RAM cap
         std::size_t asked = 0;              // SPAWN_REQs not yet answered
         bool admitting = false;
+        std::vector<LSegmentsEntry> segments;  // the newest L_SEGMENTS, since `since`
+        Nanos since{};
     };
     // One SPAWN_REQ this daemon sent and has no answer to.
     struct Ask {
@@ -149,6 +156,12 @@ private:
     void on_leave_req(Connection& connection, std::span<const std::byte> payload);
     void on_leave_intent(const FrameHeader& header, std::span<const std::byte> payload);
     void begin_leave(std::uint8_t reason);
+    void on_chunk(const Connection& connection, const FrameHeader& header,
+                  std::span<const std::byte> payload);
+    void on_segments(const Connection& connection, const FrameHeader& header,
+                     std::span<const std::byte> payload);
+    void accrue(JobId job, NodeId launcher, std::vector<LSegmentsEntry>& segments, Nanos& since);
+    void save_ledger();
     void ask_peers(Run& run);
     void ask_next_peer(Run& run);
     void ask_peer(Run& run, Endpoint peer, std::uint16_t flags);
@@ -206,6 +219,8 @@ private:
     std::mutex peers_mu_;               // the table is read by the HTTP thread too
     std::vector<Peer> clashes_;         // beacons that claimed a node ID another daemon has
     std::unique_ptr<PeerTable> table_;  // made by open(), once the node ID is known
+    std::optional<Ledger> ledger_;      // read by open() from the state directory
+    Nanos last_save_{};
 };
 
 }  // namespace paramesh

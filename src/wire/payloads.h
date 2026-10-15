@@ -228,6 +228,24 @@ struct LeaveIntentPayload {
     NodeId node;
     std::uint8_t reason = kLeaveAsked;
 };
+// L_CHUNK: one finished chunk, for the ledger (M5-1). cpu_ns is 0 unless `node` is this node.
+struct LChunkPayload {
+    NodeId node;
+    std::uint64_t task_id = 0;
+    std::uint64_t indexes = 0;
+    std::uint64_t cpu_ns = 0;
+};
+
+// L_SEGMENTS: how many of the job's segments each member is home for at an epoch (M5-1).
+struct LSegmentsEntry {
+    NodeId node;
+    std::uint16_t segments = 0;
+};
+struct LSegmentsPayload {
+    Epoch epoch;
+    std::vector<LSegmentsEntry> entries;  // 1 to 8
+};
+
 // L_MEMBER: a node spawned for a running job (M4-7), one member entry with slot 0.
 struct LMemberPayload {
     SegMapMember member;
@@ -333,6 +351,10 @@ Result<std::size_t> wire_encode(const LLeaveReqPayload& payload, std::span<std::
 Result<RedirectPayload> wire_decode_redirect(std::span<const std::byte> in);
 Result<LeaveIntentPayload> wire_decode_leave_intent(std::span<const std::byte> in);
 Result<std::size_t> wire_encode(const LMemberPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const LChunkPayload& payload, std::span<std::byte> out);
+Result<LChunkPayload> wire_decode_l_chunk(std::span<const std::byte> in);
+Result<std::size_t> wire_encode(const LSegmentsPayload& payload, std::span<std::byte> out);
+Result<LSegmentsPayload> wire_decode_l_segments(std::span<const std::byte> in);
 Result<LMemberPayload> wire_decode_l_member(std::span<const std::byte> in);
 Result<LLeavePayload> wire_decode_l_leave(std::span<const std::byte> in);
 // The entries' data are views of `in`.

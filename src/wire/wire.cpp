@@ -734,6 +734,64 @@ Result<LMemberPayload> wire_decode_l_member(std::span<const std::byte> in) {
     return payload;
 }
 
+Result<std::size_t> wire_encode(const LChunkPayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    w.put(payload.node.value, 2);
+    w.put(0, 2);  // reserved
+    w.put(payload.task_id, 8);
+    w.put(payload.indexes, 8);
+    w.put(payload.cpu_ns, 8);
+    return w.done();
+}
+
+Result<LChunkPayload> wire_decode_l_chunk(std::span<const std::byte> in) {
+    Reader r{in};
+    LChunkPayload payload;
+    payload.node = NodeId{static_cast<std::uint16_t>(r.get(2))};
+    r.take(2);
+    payload.task_id = r.get(8);
+    payload.indexes = r.get(8);
+    payload.cpu_ns = r.get(8);
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const LSegmentsPayload& payload, std::span<std::byte> out) {
+    if (payload.entries.empty() || payload.entries.size() > kMaxMembers) {
+        return kUnsendable;
+    }
+    Writer w{out};
+    w.put(payload.epoch.value, 4);
+    w.put(payload.entries.size(), 1);
+    w.put(0, 3);  // reserved
+    for (const LSegmentsEntry& entry : payload.entries) {
+        w.put(entry.node.value, 2);
+        w.put(entry.segments, 2);
+    }
+    return w.done();
+}
+
+Result<LSegmentsPayload> wire_decode_l_segments(std::span<const std::byte> in) {
+    Reader r{in};
+    LSegmentsPayload payload;
+    payload.epoch = Epoch{static_cast<std::uint32_t>(r.get(4))};
+    const std::size_t count = r.get(1);
+    r.take(3);
+    if (count == 0 || count > kMaxMembers || in.size() != 8 + 4 * count) {
+        return kMalformed;
+    }
+    for (std::size_t i = 0; i < count; i++) {
+        const auto node = NodeId{static_cast<std::uint16_t>(r.get(2))};
+        payload.entries.push_back({node, static_cast<std::uint16_t>(r.get(2))});
+    }
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
 Result<std::size_t> wire_encode(const LLeavePayload& payload, std::span<std::byte> out) {
     if (payload.reason != kLeaveAsked && payload.reason != kLeaveInterrupt) {
         return kUnsendable;

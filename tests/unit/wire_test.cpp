@@ -660,3 +660,34 @@ TEST_CASE("the join payload: L_MEMBER, one member entry") {
     CHECK(paramesh::wire_decode_l_member(hex("00 04 00 02")).error().code == Errc::kProtocol);
     CHECK(paramesh::kSpawnMidRun == 0x0001);
 }
+
+TEST_CASE("the ledger reports: L_CHUNK and L_SEGMENTS") {
+    const paramesh::LChunkPayload chunk{paramesh::NodeId{3}, 0x0102030405060708ULL, 512, 7000};
+    const auto chunk_bytes =
+        hex("00 03 00 00 01 02 03 04 05 06 07 08 00 00 00 00 00 00 02 00 00 00 00 00 00 00 1b 58");
+    CHECK(encoded(chunk) == chunk_bytes);
+    const auto back = paramesh::wire_decode_l_chunk(chunk_bytes);
+    REQUIRE(back.ok());
+    CHECK(back.value().node == paramesh::NodeId{3});
+    CHECK(back.value().task_id == 0x0102030405060708ULL);
+    CHECK(back.value().indexes == 512);
+    CHECK(back.value().cpu_ns == 7000);
+    CHECK(paramesh::wire_decode_l_chunk(hex("00 03 00 00")).error().code == Errc::kProtocol);
+
+    paramesh::LSegmentsPayload segments;
+    segments.epoch = paramesh::Epoch{5};
+    segments.entries = {{paramesh::NodeId{1}, 3}, {paramesh::NodeId{2}, 4}};
+    const auto segment_bytes = hex("00 00 00 05 02 00 00 00 00 01 00 03 00 02 00 04");
+    CHECK(encoded(segments) == segment_bytes);
+    const auto read = paramesh::wire_decode_l_segments(segment_bytes);
+    REQUIRE(read.ok());
+    CHECK(read.value().epoch == paramesh::Epoch{5});
+    REQUIRE(read.value().entries.size() == 2);
+    CHECK(read.value().entries[1].node == paramesh::NodeId{2});
+    CHECK(read.value().entries[1].segments == 4);
+    CHECK(
+        paramesh::wire_decode_l_segments(hex("00 00 00 05 03 00 00 00 00 01 00 03")).error().code ==
+        Errc::kProtocol);  // says three entries, has one
+    CHECK(paramesh::wire_decode_l_segments(hex("00 00 00 05 00 00 00 00")).error().code ==
+          Errc::kProtocol);
+}
