@@ -2,6 +2,9 @@
 
 #include "pmd/pmd.h"
 
+#include <pthread.h>
+
+#include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <exception>
@@ -19,15 +22,23 @@ paramesh::Pmd*& running() {
 // Ctrl+C is a graceful leave; a second one, or SIGTERM, stops at once.
 void on_signal(int signal) {
     static volatile std::sig_atomic_t interrupted = 0;
-    if (running() == nullptr) {
-        return;
-    }
+    const int saved = errno;  // the write below must not change it under the interrupted code
     if (signal == SIGINT && interrupted == 0) {
         interrupted = 1;
         running()->leave();  // one write to an eventfd
     } else {
         running()->stop();
     }
+    errno = saved;
+}
+
+// SIGINT and SIGTERM, held back from every thread until the main one is ready for them.
+sigset_t stop_signals() {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    return set;
 }
 
 int serve(const std::vector<std::string_view>& args) {
@@ -35,6 +46,10 @@ int serve(const std::vector<std::string_view>& args) {
         static_cast<void>(std::fputs(paramesh::pmd_usage().data(), stdout));
         return 0;
     }
+    // Blocked before any thread starts, so the daemon's other threads never take them, and one
+    // that comes before the handler is ready waits instead of being lost.
+    const sigset_t held = stop_signals();
+    pthread_sigmask(SIG_BLOCK, &held, nullptr);
     paramesh::Result<paramesh::PmdConfig> config = paramesh::pmd_parse_args(args);
     if (!config.ok()) {
         static_cast<void>(
@@ -56,7 +71,9 @@ int serve(const std::vector<std::string_view>& args) {
     running() = &daemon;
     static_cast<void>(std::signal(SIGINT, on_signal));
     static_cast<void>(std::signal(SIGTERM, on_signal));
+    pthread_sigmask(SIG_UNBLOCK, &held, nullptr);  // the main thread only
     daemon.run();
+    pthread_sigmask(SIG_BLOCK, &held, nullptr);  // none may reach the handler from here on
     running() = nullptr;
     return 0;
 }
