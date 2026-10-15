@@ -18,15 +18,19 @@ namespace {
 
 constexpr std::int64_t kVersion = 1;
 
-JsonValue to_json(const WorkSide& side) {
+JsonValue to_json(const std::map<std::uint64_t, TaskWork>& by_task) {
     JsonObject tasks;
-    for (const auto& [task, work] : side.tasks) {
+    for (const auto& [task, work] : by_task) {
         tasks[std::to_string(task)] =
             JsonValue{JsonObject{{"chunks", JsonValue{static_cast<std::int64_t>(work.chunks)}},
                                  {"indexes", JsonValue{static_cast<std::int64_t>(work.indexes)}},
                                  {"cpu_ns", JsonValue{static_cast<std::int64_t>(work.cpu_ns)}}}};
     }
-    return JsonValue{JsonObject{{"tasks", JsonValue{std::move(tasks)}},
+    return JsonValue{std::move(tasks)};
+}
+
+JsonValue to_json(const WorkSide& side) {
+    return JsonValue{JsonObject{{"tasks", to_json(side.tasks)},
                                 {"segment_seconds", JsonValue{side.segment_seconds}},
                                 {"credit", JsonValue{side.credit}}}};
 }
@@ -75,6 +79,26 @@ std::optional<Number> key_number(std::string_view key) {
     return number;
 }
 
+// Tasks by ID, each with its counts.
+std::optional<std::map<std::uint64_t, TaskWork>> tasks_from(const JsonObject& tasks) {
+    std::map<std::uint64_t, TaskWork> out;
+    for (const auto& [key, work_value] : tasks) {
+        const std::optional<std::uint64_t> task = key_number<std::uint64_t>(key);
+        const JsonObject* work = object(work_value);
+        if (!task || work == nullptr) {
+            return std::nullopt;
+        }
+        const auto chunks = count(*work, "chunks");
+        const auto indexes = count(*work, "indexes");
+        const auto cpu_ns = count(*work, "cpu_ns");
+        if (!chunks || !indexes || !cpu_ns) {
+            return std::nullopt;
+        }
+        out[*task] = TaskWork{*chunks, *indexes, *cpu_ns};
+    }
+    return out;
+}
+
 std::optional<WorkSide> side_from(const JsonValue* value) {
     const JsonObject* in = value != nullptr ? object(*value) : nullptr;
     const JsonValue* tasks_value = in != nullptr ? member(*in, "tasks") : nullptr;
@@ -90,20 +114,11 @@ std::optional<WorkSide> side_from(const JsonValue* value) {
     }
     side.segment_seconds = *segment_seconds;
     side.credit = *credit;
-    for (const auto& [key, work_value] : *tasks) {
-        const std::optional<std::uint64_t> task = key_number<std::uint64_t>(key);
-        const JsonObject* work = object(work_value);
-        if (!task || work == nullptr) {
-            return std::nullopt;
-        }
-        const auto chunks = count(*work, "chunks");
-        const auto indexes = count(*work, "indexes");
-        const auto cpu_ns = count(*work, "cpu_ns");
-        if (!chunks || !indexes || !cpu_ns) {
-            return std::nullopt;
-        }
-        side.tasks[*task] = TaskWork{*chunks, *indexes, *cpu_ns};
+    std::optional<std::map<std::uint64_t, TaskWork>> by_task = tasks_from(*tasks);
+    if (!by_task) {
+        return std::nullopt;
     }
+    side.tasks = std::move(*by_task);
     return side;
 }
 
@@ -171,6 +186,17 @@ Result<Ledger> Ledger::open(std::string path, const JsonCodec& json) {
         return Error{Errc::kInvalidArgument, 0, "the ledger file is not a ledger"};
     }
     ledger.data_ = std::move(*data);
+    // "own" came with M5-2; a ledger saved before it has none.
+    const auto& top = std::get<JsonObject>(parsed.value().v);
+    if (const JsonValue* own = member(top, "own"); own != nullptr) {
+        const JsonObject* tasks = object(*own);
+        std::optional<std::map<std::uint64_t, TaskWork>> by_task =
+            tasks != nullptr ? tasks_from(*tasks) : std::nullopt;
+        if (!by_task) {
+            return Error{Errc::kInvalidArgument, 0, "the ledger file is not a ledger"};
+        }
+        ledger.own_ = std::move(*by_task);
+    }
     return ledger;
 }
 
@@ -190,6 +216,66 @@ void Ledger::add_chunk(NodeId peer, JobId job, Direction direction, std::uint64_
 
 void Ledger::add_segment_seconds(NodeId peer, JobId job, Direction direction, double seconds) {
     side(peer, job, direction).segment_seconds += seconds;
+}
+
+void Ledger::add_own_chunk(std::uint64_t task, std::uint64_t indexes, Nanos cpu) {
+    dirty_ = true;
+    TaskWork& work = own_[task];
+    work.chunks++;
+    work.indexes += indexes;
+    work.cpu_ns += static_cast<std::uint64_t>(cpu.count());
+}
+
+namespace {
+
+// Memory credit: segment-seconds x 2 MB, in GB-hours, at the configured rate.
+double memory_credit(double segment_seconds, const CreditRates& rates) {
+    constexpr double kGb = 1024.0 * 1024.0 * 1024.0;
+    const double gb_hours = segment_seconds * static_cast<double>(kSegmentSize) / kGb / 3600.0;
+    return gb_hours * rates.core_seconds_per_gb_hour;
+}
+
+}  // namespace
+
+void Ledger::apply_credits(const CreditRates& rates) {
+    for (auto& [peer, jobs] : data_) {
+        for (auto& [job, work] : jobs) {
+            double given = memory_credit(work.by_peer.segment_seconds, rates);
+            for (const auto& [task, ran] : work.by_peer.tasks) {
+                const auto mine = own_.find(task);
+                if (mine != own_.end() && mine->second.indexes != 0) {
+                    // This node's CPU seconds per index of the task, never the peer's report.
+                    given += static_cast<double>(ran.indexes) *
+                             static_cast<double>(mine->second.cpu_ns) / 1e9 /
+                             static_cast<double>(mine->second.indexes);
+                }
+            }
+            double taken = memory_credit(work.for_peer.segment_seconds, rates);
+            for (const auto& [task, ran] : work.for_peer.tasks) {
+                taken += static_cast<double>(ran.cpu_ns) / 1e9;  // measured here
+            }
+            if (given != work.by_peer.credit || taken != work.for_peer.credit) {
+                work.by_peer.credit = given;
+                work.for_peer.credit = taken;
+                dirty_ = true;
+            }
+        }
+    }
+}
+
+std::uint64_t Ledger::pending_indexes(NodeId peer) const {
+    std::uint64_t pending = 0;
+    const auto found = data_.find(peer.value);
+    if (found == data_.end()) {
+        return 0;
+    }
+    for (const auto& [job, work] : found->second) {
+        for (const auto& [task, ran] : work.by_peer.tasks) {
+            const auto mine = own_.find(task);
+            pending += mine == own_.end() || mine->second.indexes == 0 ? ran.indexes : 0;
+        }
+    }
+    return pending;
 }
 
 double Ledger::balance(NodeId peer) const {
@@ -216,8 +302,9 @@ Result<void> Ledger::save() {
         peers[std::to_string(peer)] = JsonValue{std::move(by_job)};
     }
     const std::string text =
-        json_->encode(JsonValue{
-            JsonObject{{"version", JsonValue{kVersion}}, {"peers", JsonValue{std::move(peers)}}}}) +
+        json_->encode(JsonValue{JsonObject{{"version", JsonValue{kVersion}},
+                                           {"peers", JsonValue{std::move(peers)}},
+                                           {"own", to_json(own_)}}}) +
         "\n";
     const std::string temporary = path_ + ".tmp";
     const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);

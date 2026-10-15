@@ -220,6 +220,7 @@ private:
     std::vector<Peer> clashes_;         // beacons that claimed a node ID another daemon has
     std::unique_ptr<PeerTable> table_;  // made by open(), once the node ID is known
     std::optional<Ledger> ledger_;      // read by open() from the state directory
+    CreditRates rates_;                 // ledger.mem_rate
     Nanos last_save_{};
 };
 

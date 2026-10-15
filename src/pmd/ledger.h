@@ -4,8 +4,8 @@
 // in the state directory and written atomically: a temporary file, then a rename.
 //
 // Raw counts are chunks completed per task (with their indexes and, for this node's own work,
-// the CPU time measured) and segment-seconds hosted. The credits are set by the credit rules
-// (M5-2) from these counts; nothing a peer reports is in here.
+// the CPU time measured) and segment-seconds hosted. The credits come from these counts by the
+// credit rules (M5-2, apply_credits), in core-seconds; nothing a peer reports goes into them.
 //
 // Threads: pmd's one thread.
 #ifndef PARAMESH_PMD_LEDGER_H
@@ -49,6 +49,11 @@ struct JobWork {
 // By peer node ID, then by job ID.
 using LedgerData = std::map<std::uint16_t, std::map<std::uint32_t, JobWork>>;
 
+// The configured conversion of memory to compute credit (ledger.mem_rate).
+struct CreditRates {
+    double core_seconds_per_gb_hour = 450;
+};
+
 // What the slot allocation (M5-3) reads; its tests give it a fake.
 class LedgerView {
 public:
@@ -72,10 +77,23 @@ public:
     void add_chunk(NodeId peer, JobId job, Direction direction, std::uint64_t task,
                    std::uint64_t indexes, Nanos cpu);
     void add_segment_seconds(NodeId peer, JobId job, Direction direction, double seconds);
+    // A chunk this node's own threads ran, for any job, its own: what a chunk of that task
+    // costs here.
+    void add_own_chunk(std::uint64_t task, std::uint64_t indexes, Nanos cpu);
     // For the credit rules, which set `credit`.
     WorkSide& side(NodeId peer, JobId job, Direction direction);
 
+    // The credit rules (M5-2). Given to this node by a peer, for each of its jobs: each index
+    // the peer ran, valued at this node's own measured CPU time per index of that task, plus
+    // the segments the peer hosted x 2 MB x time at `rates`. Taken from it: its own measured
+    // CPU time on the peer's chunks, plus the segments it hosted for the peer the same way.
+    // Indexes of a task this node has never run stay unvalued until it has (pending_indexes).
+    // Every credit is worked out again from the raw counts, so a later measurement values them.
+    void apply_credits(const CreditRates& rates);
+    [[nodiscard]] std::uint64_t pending_indexes(NodeId peer) const;
+
     [[nodiscard]] const LedgerData& data() const noexcept { return data_; }
+    [[nodiscard]] const std::map<std::uint64_t, TaskWork>& own() const noexcept { return own_; }
     [[nodiscard]] double balance(NodeId peer) const override;
     [[nodiscard]] bool dirty() const noexcept { return dirty_; }
 
@@ -89,6 +107,7 @@ private:
     std::string path_;
     const JsonCodec* json_;
     LedgerData data_;
+    std::map<std::uint64_t, TaskWork> own_;  // by task ID
     bool dirty_ = false;
 };
 

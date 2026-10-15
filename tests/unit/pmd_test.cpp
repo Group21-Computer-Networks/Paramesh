@@ -1884,6 +1884,10 @@ TEST_CASE("after a job each daemon's ledger has the work both ways, and keeps it
     // Segment-seconds: node 2 hosted some of the job's segments while it ran, as both see it.
     CHECK(for_one.for_peer.segment_seconds > 0);
     CHECK(by_two.by_peer.segment_seconds > 0);
+    // The credits (M5-2), worked out as each daemon saved: node 1 values node 2's work at its
+    // own cost of the same task, measured on the chunks its own threads ran.
+    CHECK(by_two.by_peer.credit > 0);
+    CHECK(for_one.for_peer.credit > 0);
 
     // A daemon started again on node 2's state directory reads the same ledger, and leaves it so.
     {
@@ -1895,4 +1899,66 @@ TEST_CASE("after a job each daemon's ledger has the work both ways, and keeps it
         running.join();
     }
     CHECK(saved_ledger(nodes.two) == two);
+}
+
+TEST_CASE("credit rules: fixed counts give the expected balances, from this node's measures only") {
+    const paramesh::Platform platform = quiet_platform();
+    const std::string dir = ledger_dir();
+    using paramesh::Direction;
+    using std::chrono::milliseconds;
+    auto opened = paramesh::Ledger::open(dir + "/ledger.json", *platform.json);
+    REQUIRE(opened.ok());
+    paramesh::Ledger ledger = std::move(opened).value();
+    const std::uint64_t task_a = 0xA;
+    const std::uint64_t task_b = 0xB;
+    const std::uint64_t task_c = 0xC;
+    // This node ran 1,000 indexes of task A in 2 s of CPU: 2 ms an index.
+    ledger.add_own_chunk(task_a, 600, milliseconds{1200});
+    ledger.add_own_chunk(task_a, 400, milliseconds{800});
+    // Node 2 ran 500 indexes of A for this node's job 1, and claims 999 s of CPU for them.
+    ledger.add_chunk(NodeId{2}, paramesh::JobId{1}, Direction::kByPeer, task_a, 500,
+                     milliseconds{999000});
+    // ... and hosted segments of it: 512 segments (1 GB) for an hour.
+    ledger.add_segment_seconds(NodeId{2}, paramesh::JobId{1}, Direction::kByPeer, 512.0 * 3600);
+    // This node ran task B for node 2's job 2, measuring 3 s, and hosted half a GB-hour for it.
+    ledger.add_chunk(NodeId{2}, paramesh::JobId{2}, Direction::kForPeer, task_b, 50,
+                     milliseconds{3000});
+    ledger.add_segment_seconds(NodeId{2}, paramesh::JobId{2}, Direction::kForPeer, 256.0 * 3600);
+    // Node 3 ran 700 indexes of task C, which this node has never run.
+    ledger.add_chunk(NodeId{3}, paramesh::JobId{1}, Direction::kByPeer, task_c, 700,
+                     milliseconds{5});
+
+    ledger.apply_credits(paramesh::CreditRates{450});
+    // Given by node 2: 500 x 2 ms = 1 core-second, plus 1 GB-hour = 450. Taken: 3 + 225.
+    CHECK(ledger.data().at(2).at(1).by_peer.credit == doctest::Approx(451.0));
+    CHECK(ledger.data().at(2).at(2).for_peer.credit == doctest::Approx(228.0));
+    CHECK(ledger.balance(NodeId{2}) == doctest::Approx(223.0));
+    // Node 3's work waits for a measure of task C here: no credit yet, 700 indexes pending.
+    CHECK(ledger.balance(NodeId{3}) == doctest::Approx(0.0));
+    CHECK(ledger.pending_indexes(NodeId{3}) == 700);
+    CHECK(ledger.pending_indexes(NodeId{2}) == 0);
+
+    // No input comes from a received message field: a different claimed CPU time, the only such
+    // field in the counts, changes nothing.
+    ledger.add_chunk(NodeId{2}, paramesh::JobId{1}, Direction::kByPeer, task_a, 0,
+                     milliseconds{123456789});
+    ledger.apply_credits(paramesh::CreditRates{450});
+    CHECK(ledger.balance(NodeId{2}) == doctest::Approx(223.0));
+
+    // Once this node has run task C (100 indexes in 0.5 s: 5 ms each), node 3's work is valued.
+    ledger.add_own_chunk(task_c, 100, milliseconds{500});
+    ledger.apply_credits(paramesh::CreditRates{450});
+    CHECK(ledger.balance(NodeId{3}) == doctest::Approx(3.5));
+    CHECK(ledger.pending_indexes(NodeId{3}) == 0);
+    // The rate is the configured one: twice the rate, twice the memory credit.
+    ledger.apply_credits(paramesh::CreditRates{900});
+    CHECK(ledger.balance(NodeId{2}) == doctest::Approx(1.0 + 900 - 3 - 450));
+
+    // The measures of this node are saved with the rest.
+    REQUIRE(ledger.save().ok());
+    const auto again = paramesh::Ledger::open(dir + "/ledger.json", *platform.json);
+    REQUIRE(again.ok());
+    CHECK(again.value().own() == ledger.own());
+    CHECK(again.value().balance(NodeId{2}) == doctest::Approx(ledger.balance(NodeId{2})));
+    std::filesystem::remove_all(dir);
 }
