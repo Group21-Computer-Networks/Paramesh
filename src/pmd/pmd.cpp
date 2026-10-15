@@ -35,6 +35,7 @@ namespace paramesh {
 namespace {
 
 constexpr int kReapEveryMs = 200;  // how often run() looks for workers that have exited
+constexpr Nanos kLedgerSaveEvery = std::chrono::seconds{1};  // at most; and when pmd stops
 constexpr std::size_t kReadAtOnce = 65536;
 
 Error bad_flag(const char* what) {
@@ -262,6 +263,13 @@ Result<void> Pmd::open() {
         }
         config_.node = NodeId{static_cast<std::uint16_t>(id)};
     }
+    if (!failed) {
+        Result<Ledger> ledger = Ledger::open(config_.state_dir + "/ledger.json", *platform_.json);
+        if (!ledger.ok()) {
+            return ledger.error();
+        }
+        ledger_ = std::move(ledger).value();
+    }
     instance_ = static_cast<std::uint32_t>(random());
     table_ = std::make_unique<PeerTable>(config_.node, instance_);
     socket_path_ = config_.state_dir + "/pmd.sock";
@@ -398,6 +406,9 @@ void Pmd::run() {
             accept_on(local_listener_, true);
         }
         reap();
+        if (platform_.clock->now() - last_save_ >= kLedgerSaveEvery) {
+            save_ledger();
+        }
     }
 }
 
@@ -456,6 +467,10 @@ void Pmd::handle(Connection& connection, const FrameHeader& header,
         on_admit_req(connection, header, payload);
     } else if (connection.local && header.opcode == Opcode::kLLeaveReq) {
         on_leave_req(connection, payload);
+    } else if (connection.local && header.opcode == Opcode::kLChunk) {
+        on_chunk(connection, header, payload);
+    } else if (connection.local && header.opcode == Opcode::kLSegments) {
+        on_segments(connection, header, payload);
     } else if (!connection.local && header.opcode == Opcode::kLeaveIntent) {
         on_leave_intent(header, payload);
     } else {
@@ -569,7 +584,12 @@ void Pmd::on_register(Connection& connection, const FrameHeader& header,
             reply(spawn->asked_on, Opcode::kSpawnOk, spawn->job, spawn->asker, spawn->req,
                   SpawnOkPayload{config_.node, process.data_port, config_.cap_cores,
                                  config_.cap_ram, config_.spill_budget});
-            workers_.push_back(Worker{spawn->job, connection.id, spawn->asked_on});
+            workers_.push_back(Worker{spawn->job,
+                                      connection.id,
+                                      spawn->asked_on,
+                                      spawn->asker,
+                                      {},
+                                      platform_.clock->now()});
         }
         spawns_.erase(spawn);
     }
@@ -706,7 +726,20 @@ void Pmd::beacon(Nanos now) {
 }
 
 // BYE, when the daemon stops.
+void Pmd::save_ledger() {
+    last_save_ = platform_.clock->now();
+    if (ledger_ && ledger_->dirty()) {
+        if (const Result<void> saved = ledger_->save(); !saved.ok()) {
+            platform_.logger->log(
+                LogLevel::kWarn, "ledger_not_saved",
+                JsonObject{{"why", JsonValue{std::string{saved.error().what}}},
+                           {"errno", JsonValue{std::int64_t{saved.error().os_error}}}});
+        }
+    }
+}
+
 void Pmd::say_bye() {
+    save_ledger();
     std::array<std::byte, 4> bytes{};
     static_cast<void>(wire_encode(ByePayload{instance_}, bytes));
     announce(Opcode::kBye, bytes);
@@ -1132,6 +1165,68 @@ void Pmd::begin_leave(std::uint8_t reason) {
                    {"reason", JsonValue{std::int64_t{reason}}}});
 }
 
+// ---- the ledger (M5-1) -----------------------------------------------------------------------
+
+// L_CHUNK from a job process here. A worker's own chunk is this node's work for the launcher's
+// job; a launcher reports its peers' chunks, their work for this node's job. A node's own work
+// on its own job is no peer's business and is not recorded.
+void Pmd::on_chunk(const Connection& connection, const FrameHeader& header,
+                   std::span<const std::byte> payload) {
+    const Result<LChunkPayload> chunk = wire_decode_l_chunk(payload);
+    if (!chunk.ok() || !ledger_) {
+        return;
+    }
+    const LChunkPayload& c = chunk.value();
+    const auto worker = std::find_if(workers_.begin(), workers_.end(), [&](const Worker& w) {
+        return w.local == connection.id && w.job == header.job;
+    });
+    Run* run = run_of(header.job);
+    if (worker != workers_.end() && c.node == config_.node && worker->launcher != config_.node) {
+        ledger_->add_chunk(worker->launcher, header.job, Direction::kForPeer, c.task_id, c.indexes,
+                           Nanos{static_cast<std::int64_t>(c.cpu_ns)});
+    } else if (run != nullptr && run->launcher == connection.id && c.node != config_.node) {
+        ledger_->add_chunk(c.node, header.job, Direction::kByPeer, c.task_id, c.indexes, Nanos{0});
+    }
+}
+
+// L_SEGMENTS: the homes at a new epoch. What the previous counts held until now is added first.
+void Pmd::on_segments(const Connection& connection, const FrameHeader& header,
+                      std::span<const std::byte> payload) {
+    Result<LSegmentsPayload> segments = wire_decode_l_segments(payload);
+    if (!segments.ok()) {
+        return;
+    }
+    for (Worker& w : workers_) {
+        if (w.local == connection.id && w.job == header.job) {
+            accrue(w.job, w.launcher, w.segments, w.since);
+            w.segments = segments.value().entries;
+        }
+    }
+    if (Run* run = run_of(header.job); run != nullptr && run->launcher == connection.id) {
+        accrue(run->job, config_.node, run->segments, run->since);
+        run->segments = std::move(segments).value().entries;
+    }
+}
+
+// Segment-seconds from `since` until now. On a worker's node, the segments this node hosts for
+// the launcher's job; on the launcher's, those each peer hosts for this node's job.
+void Pmd::accrue(JobId job, NodeId launcher, std::vector<LSegmentsEntry>& segments, Nanos& since) {
+    const Nanos now = platform_.clock->now();
+    const double seconds = std::chrono::duration<double>(now - since).count();
+    since = now;
+    if (!ledger_) {
+        return;
+    }
+    for (const LSegmentsEntry& entry : segments) {
+        const double hosted = seconds * entry.segments;
+        if (launcher != config_.node && entry.node == config_.node) {
+            ledger_->add_segment_seconds(launcher, job, Direction::kForPeer, hosted);
+        } else if (launcher == config_.node && entry.node != config_.node) {
+            ledger_->add_segment_seconds(entry.node, job, Direction::kByPeer, hosted);
+        }
+    }
+}
+
 // LEAVE_INTENT from a worker's pmd: passed to the launcher of that job.
 void Pmd::on_leave_intent(const FrameHeader& header, std::span<const std::byte> payload) {
     const Result<LeaveIntentPayload> intent = wire_decode_leave_intent(payload);
@@ -1148,7 +1243,12 @@ void Pmd::on_leave_intent(const FrameHeader& header, std::span<const std::byte> 
 // the launcher is told to end the job. The launcher going away ends the job here. A peer
 // going away with a request outstanding counts as one that declined.
 void Pmd::on_closed(const Connection& connection) {
-    std::erase_if(workers_, [&](const Worker& w) { return w.local == connection.id; });
+    std::erase_if(workers_, [&](Worker& w) {
+        if (w.local == connection.id) {
+            accrue(w.job, w.launcher, w.segments, w.since);  // its last segments, until now
+        }
+        return w.local == connection.id;
+    });
     for (auto ask = asks_.begin(); ask != asks_.end();) {
         if (ask->second.connection != connection.id) {
             ++ask;
@@ -1171,7 +1271,10 @@ void Pmd::on_closed(const Connection& connection) {
             }
         }
     }
-    std::erase_if(runs_, [&](const Run& run) {
+    std::erase_if(runs_, [&](Run& run) {
+        if (run.launcher == connection.id) {
+            accrue(run.job, config_.node, run.segments, run.since);
+        }
         return run.launcher == connection.id || (run.launcher == 0 && run.pmrun == 0);
     });
 }

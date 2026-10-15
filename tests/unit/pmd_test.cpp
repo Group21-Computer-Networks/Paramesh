@@ -8,6 +8,7 @@
 
 #include "net/frame_io.h"
 #include "platform/factory.h"
+#include "pmd/ledger.h"
 #include "pmd/peers.h"
 #include "tools/pm.h"
 #include "wire/payloads.h"
@@ -1712,4 +1713,184 @@ TEST_CASE("after a worker leaves, a fourth node joins the running job and runs c
     }
     // NOLINTNEXTLINE(concurrency-mt-unsafe): as above
     ::unsetenv("PARAMESH_CFG_LOG_LEVEL");
+}
+
+namespace {
+
+std::string ledger_dir() {
+    std::array<char, 32> name = {"/tmp/pmd-ledger-XXXXXX"};
+    REQUIRE(::mkdtemp(name.data()) != nullptr);
+    return name.data();
+}
+
+// A ledger with `jobs` jobs of node 2 and one of node 3, every count derived from `seed`.
+void fill_ledger(paramesh::Ledger& ledger, std::uint32_t jobs, std::uint64_t seed) {
+    using paramesh::Direction;
+    for (std::uint32_t job = 1; job <= jobs; job++) {
+        ledger.add_chunk(NodeId{2}, paramesh::JobId{job}, Direction::kForPeer, 0xABCDEF, seed,
+                         std::chrono::nanoseconds{seed * 10});
+        ledger.add_chunk(NodeId{2}, paramesh::JobId{job}, Direction::kByPeer, 7, seed + 1,
+                         std::chrono::nanoseconds{0});
+        ledger.add_segment_seconds(NodeId{2}, paramesh::JobId{job}, Direction::kByPeer, 1.5);
+    }
+    ledger.add_chunk(NodeId{3}, paramesh::JobId{65537}, Direction::kForPeer, 7, seed,
+                     std::chrono::nanoseconds{1});
+}
+
+}  // namespace
+
+TEST_CASE("the ledger keeps both directions per peer and job, and reads back what it saved") {
+    const paramesh::Platform platform = quiet_platform();
+    const std::string dir = ledger_dir();
+    const std::string path = dir + "/ledger.json";
+    using paramesh::Direction;
+    {
+        auto opened = paramesh::Ledger::open(path, *platform.json);
+        REQUIRE(opened.ok());  // no file yet: an empty ledger
+        paramesh::Ledger ledger = std::move(opened).value();
+        CHECK(ledger.data().empty());
+        CHECK_FALSE(ledger.dirty());
+        ledger.add_chunk(NodeId{2}, paramesh::JobId{9}, Direction::kForPeer, 0x1234, 512,
+                         std::chrono::nanoseconds{7000});
+        ledger.add_chunk(NodeId{2}, paramesh::JobId{9}, Direction::kForPeer, 0x1234, 256,
+                         std::chrono::nanoseconds{3000});
+        ledger.add_chunk(NodeId{2}, paramesh::JobId{9}, Direction::kByPeer, 0x1234, 512,
+                         std::chrono::nanoseconds{0});
+        ledger.add_segment_seconds(NodeId{2}, paramesh::JobId{9}, Direction::kForPeer, 2.5);
+        ledger.side(NodeId{2}, paramesh::JobId{9}, Direction::kByPeer).credit = 10.0;
+        ledger.side(NodeId{2}, paramesh::JobId{9}, Direction::kForPeer).credit = 4.0;
+        CHECK(ledger.dirty());
+        CHECK(ledger.balance(NodeId{2}) == doctest::Approx(6.0));  // given 10, taken 4
+        CHECK(ledger.balance(NodeId{3}) == doctest::Approx(0.0));
+        const paramesh::TaskWork mine = ledger.data().at(2).at(9).for_peer.tasks.at(0x1234);
+        CHECK(mine == paramesh::TaskWork{2, 768, 10000});
+        REQUIRE(ledger.save().ok());
+        CHECK_FALSE(ledger.dirty());
+        CHECK_FALSE(std::filesystem::exists(path + ".tmp"));
+    }
+    const auto again = paramesh::Ledger::open(path, *platform.json);
+    REQUIRE(again.ok());
+    const paramesh::JobWork& work = again.value().data().at(2).at(9);
+    CHECK(work.for_peer.tasks.at(0x1234) == paramesh::TaskWork{2, 768, 10000});
+    CHECK(work.by_peer.tasks.at(0x1234) == paramesh::TaskWork{1, 512, 0});
+    CHECK(work.for_peer.segment_seconds == doctest::Approx(2.5));
+    CHECK(again.value().balance(NodeId{2}) == doctest::Approx(6.0));
+
+    for (const std::string text :
+         {"not json", R"({"version":2,"peers":{}})", R"({"version":1,"peers":{"x":{}}})",
+          R"({"version":1,"peers":{"2":{"9":{"for_peer":{}}}}})"}) {
+        std::ofstream{path, std::ios::trunc} << text;
+        const auto refused = paramesh::Ledger::open(path, *platform.json);
+        CHECK(refused.error().code == paramesh::Errc::kInvalidArgument);
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a process killed while it saves the ledger leaves a whole ledger, old or new") {
+    const paramesh::Platform platform = quiet_platform();
+    const std::string dir = ledger_dir();
+    const std::string path = dir + "/ledger.json";
+    // Two different ledgers, large enough that a save takes a while.
+    auto made = paramesh::Ledger::open(path, *platform.json);
+    REQUIRE(made.ok());
+    paramesh::Ledger first = made.value();
+    paramesh::Ledger second = made.value();
+    fill_ledger(first, 2000, 1);
+    fill_ledger(second, 2000, 2);
+    REQUIRE(first.save().ok());
+    int killed_mid_write = 0;
+    for (int round = 0; round < 20; round++) {
+        const pid_t child = ::fork();
+        REQUIRE(child >= 0);
+        if (child == 0) {
+            for (int i = 0;; i++) {  // saves without end until killed
+                static_cast<void>((i % 2 == 0 ? second : first).save());
+            }
+        }
+        // Killed as soon as it has begun writing the temporary file: in the middle of a save.
+        std::filesystem::remove(path + ".tmp");
+        for (int waited = 0; waited < 100000 && !std::filesystem::exists(path + ".tmp"); waited++) {
+            ::usleep(10);
+        }
+        ::usleep(static_cast<useconds_t>((round * 37) % 200));
+        ::kill(child, SIGKILL);
+        ::waitpid(child, nullptr, 0);
+        killed_mid_write += std::filesystem::exists(path + ".tmp") ? 1 : 0;
+        const auto read = paramesh::Ledger::open(path, *platform.json);
+        REQUIRE(read.ok());
+        const bool whole =
+            read.value().data() == first.data() || read.value().data() == second.data();
+        CHECK(whole);
+    }
+    MESSAGE("killed with a temporary file left in " << killed_mid_write << " of 20 rounds");
+    CHECK(killed_mid_write > 0);  // the kills did land during writes
+    std::filesystem::remove_all(dir);
+}
+
+namespace {
+
+// The ledger a daemon saved in its state directory.
+paramesh::LedgerData saved_ledger(const Daemon& daemon) {
+    const auto read =
+        paramesh::Ledger::open(daemon.state_dir + "/ledger.json", *daemon.platform.json);
+    REQUIRE(read.ok());
+    return read.value().data();
+}
+
+std::uint64_t indexes_of(const paramesh::WorkSide& side) {
+    std::uint64_t sum = 0;
+    for (const auto& [task, work] : side.tasks) {
+        sum += work.indexes;
+    }
+    return sum;
+}
+
+}  // namespace
+
+TEST_CASE("after a job each daemon's ledger has the work both ways, and keeps it over a restart" *
+          doctest::skip(!region_can_be_mapped())) {
+    const ThreeNodes nodes;
+    const std::string report = nodes.reports + "/program";
+    REQUIRE(exit_status(start_pmrun({"-n", "3", "--state-dir", nodes.one.state_dir, own_path(),
+                                     "--as-program", report, "quick"}),
+                        180) == 0);
+    REQUIRE(field(contents(report), "every_node") == "yes");
+    for (const Daemon* daemon : {&nodes.one, &nodes.two, &nodes.three}) {
+        daemon->pmd.stop();  // a daemon saves its ledger as it stops
+    }
+    for (const Daemon* daemon : {&nodes.one, &nodes.two, &nodes.three}) {
+        CHECK(stops_within(*daemon, 5));
+    }
+    const paramesh::LedgerData one = saved_ledger(nodes.one);
+    const paramesh::LedgerData two = saved_ledger(nodes.two);
+    const paramesh::LedgerData three = saved_ledger(nodes.three);
+    REQUIRE(one.size() == 2);  // nodes 2 and 3 worked for node 1's job
+    REQUIRE(two.size() == 1);  // node 2 worked for node 1 only
+    REQUIRE(three.size() == 1);
+    const std::uint32_t job = one.at(2).begin()->first;
+    const paramesh::JobWork& by_two = one.at(2).at(job);
+    const paramesh::JobWork& for_one = two.at(1).at(job);
+    // Each side counted the same chunks, from its own records: the launcher from the peers'
+    // TASK_DONE, the worker from its own threads, which also measured their CPU time.
+    CHECK(indexes_of(by_two.by_peer) > 0);
+    CHECK(indexes_of(by_two.by_peer) == indexes_of(for_one.for_peer));
+    CHECK(indexes_of(one.at(3).at(job).by_peer) == indexes_of(three.at(1).at(job).for_peer));
+    CHECK(indexes_of(by_two.by_peer) + indexes_of(one.at(3).at(job).by_peer) < kSquares);
+    CHECK(for_one.for_peer.tasks.begin()->second.cpu_ns > 0);
+    CHECK(by_two.by_peer.tasks.begin()->second.cpu_ns == 0);
+    CHECK(by_two.for_peer.tasks.empty());  // node 1 did nothing for node 2's jobs
+    // Segment-seconds: node 2 hosted some of the job's segments while it ran, as both see it.
+    CHECK(for_one.for_peer.segment_seconds > 0);
+    CHECK(by_two.by_peer.segment_seconds > 0);
+
+    // A daemon started again on node 2's state directory reads the same ledger, and leaves it so.
+    {
+        const paramesh::Platform platform = quiet_platform();
+        paramesh::Pmd again{Daemon::config(nodes.two.state_dir, 2, {}, nullptr), platform};
+        REQUIRE(again.open().ok());
+        std::thread running{[&again] { again.run(); }};
+        again.stop();
+        running.join();
+    }
+    CHECK(saved_ledger(nodes.two) == two);
 }

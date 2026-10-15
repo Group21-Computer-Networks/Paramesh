@@ -456,6 +456,7 @@ public:
         }
         net_->stop();
         thread_.join();
+        flush_reports();
         if (pmd_thread_.joinable()) {
             ::shutdown(pmd_fd_, SHUT_RDWR);  // ends the wait in watch_pmd()
             pmd_thread_.join();
@@ -508,8 +509,10 @@ public:
     }
     // The launcher hears of every chunk. The first time a node finishes a chunk of a task, the
     // log says so: with the thrash report, which names nodes, it tells which tasks fought.
-    void chunk_finished(NodeId ran_by, std::uint64_t task_id, std::uint64_t /*indexes*/,
-                        Nanos /*cpu*/) noexcept override {
+    void chunk_finished(NodeId ran_by, std::uint64_t task_id, std::uint64_t indexes,
+                        Nanos cpu) noexcept override {
+        report(Opcode::kLChunk,
+               LChunkPayload{ran_by, task_id, indexes, static_cast<std::uint64_t>(cpu.count())});
         {
             const std::lock_guard<std::mutex> lock{mutex_};
             if (!task_seen_.insert({ran_by.value, task_id}).second) {
@@ -844,7 +847,69 @@ private:
             }
         }
         pmd_thread_ = std::thread{[this] { watch_pmd(); }};
+        report_thread_ = std::thread{[this] { write_reports(); }};
         return PM_OK;
+    }
+
+    // ---- reports to pmd for its ledger (M5-1) ---------------------------------------------------
+
+    // Any thread: queues one frame for pmd. The writer thread sends it, so that no thread that
+    // must not block (the fault handler, the network thread) ever waits on the socket.
+    template <typename Payload>
+    void report(Opcode opcode, const Payload& payload) noexcept {
+        std::array<std::byte, 64> bytes{};
+        const Result<std::size_t> size = wire_encode(payload, bytes);
+        if (pmd_fd_ < 0 || !size.ok()) {
+            return;
+        }
+        {
+            const std::lock_guard<std::mutex> lock{report_mu_};
+            reports_.push_back(
+                Report{opcode, {bytes.begin(), bytes.begin() + static_cast<long>(size.value())}});
+        }
+        report_ready_.notify_one();
+    }
+
+    // L_SEGMENTS: how many segments each member of `map` is home for.
+    void report_segments(const SegMapPayload& map) noexcept {
+        LSegmentsPayload counts{epoch_, {}};
+        for (const SegMapMember& member : map.members) {
+            const auto homed = std::count(map.homes.begin(), map.homes.end(), member.slot);
+            counts.entries.push_back({member.node, static_cast<std::uint16_t>(homed)});
+        }
+        report(Opcode::kLSegments, counts);
+    }
+
+    // The writer thread: sends the queued reports in order until flush_reports().
+    void write_reports() noexcept {
+        std::unique_lock<std::mutex> lock{report_mu_};
+        for (;;) {
+            report_ready_.wait(lock, [this] { return reports_stop_ || !reports_.empty(); });
+            if (reports_.empty()) {
+                return;  // told to stop, and everything is sent
+            }
+            const Report next = std::move(reports_.front());
+            reports_.pop_front();
+            lock.unlock();
+            FrameHeader header;
+            header.opcode = next.opcode;
+            header.job = s_.job;
+            header.src = s_.self;
+            static_cast<void>(frame_write(pmd_fd_, *platform_.checksum, header, next.payload));
+            lock.lock();
+        }
+    }
+
+    // Sends what is queued and ends the writer thread. Once, when the job ends in order.
+    void flush_reports() noexcept {
+        {
+            const std::lock_guard<std::mutex> lock{report_mu_};
+            reports_stop_ = true;
+        }
+        report_ready_.notify_one();
+        if (report_thread_.joinable()) {
+            report_thread_.join();
+        }
     }
 
     // The local-link thread: waits only on the socket to pmd. pmd may tell a launcher to end
@@ -1411,6 +1476,7 @@ private:
             }
         }
         have_map_ = true;
+        report_segments(map);
         if (!first) {
             continue_moves();
             leave_if_done();
@@ -1649,6 +1715,7 @@ private:
                 }
                 if (end.value().status == Status::kOk || end.value().status == Status::kLeft) {
                     log_pages();
+                    flush_reports();  // every chunk this process ran reaches the ledger
                 }
                 // LEFT: the reply to this node's LEAVE_DONE. Nobody will address it again.
                 exit_with(end.value().status == Status::kLeft ? Status::kOk : end.value().status,
@@ -2131,10 +2198,19 @@ private:
     std::optional<Sync> sync_;
     std::optional<Tasks> tasks_;  // after what it uses, so it goes first
     std::thread thread_;
-    int pmd_fd_ = -1;          // the local socket to pmd, or -1 without pmd
-    std::thread pmd_thread_;   // watch_pmd()
-    std::uint32_t quota_ = 0;  // the thread quota pmd gave; 0 without pmd
-    std::uint64_t ram_ = 0;    // the RAM cap pmd gave; 0 without pmd
+    int pmd_fd_ = -1;         // the local socket to pmd, or -1 without pmd
+    std::thread pmd_thread_;  // watch_pmd()
+    struct Report {
+        Opcode opcode;
+        std::vector<std::byte> payload;
+    };
+    std::mutex report_mu_;  // held only to queue or take one report
+    std::condition_variable report_ready_;
+    std::deque<Report> reports_;
+    bool reports_stop_ = false;
+    std::thread report_thread_;  // write_reports()
+    std::uint32_t quota_ = 0;    // the thread quota pmd gave; 0 without pmd
+    std::uint64_t ram_ = 0;      // the RAM cap pmd gave; 0 without pmd
     std::size_t segments_ = 0;
     RegionAllocator allocator_{0};
 
