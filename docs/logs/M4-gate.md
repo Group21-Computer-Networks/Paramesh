@@ -1,9 +1,9 @@
 # M4 gate
 
 - Milestone: M4
-- Status: open
-- Closed by:
-- Closed on:
+- Status: closed
+- Closed by: Amirishetty Sai Vignesh
+- Closed on: 2026-10-15
 
 <!--
 Only the person closes a gate. An agent may prepare this file and fill in checks it ran,
@@ -33,13 +33,13 @@ Evidence: the command, the log or result file, the trace, or "seen by <who>".
 | FR-8.2: admission headroom | one and three daemons | pass | `unit.pmd_test`, "one node alone refuses a region past 90% of its own RAM cap and spill budget" and "a job that fits is admitted"; `pm_init()` prints the refusal with the sizes (M4-4, PR #44) |
 | FR-10.1: clean abort within 3 s | three simulated nodes | pass | `unit.pmd_test`, "killing a node mid-run ends the job everywhere within 3 s, naming the node": 0.20 s; "a node that goes silent ends the job after 3 s without a heartbeat": 2.6 to 2.7 s (M4-6, PR #45); `run_m4.sh abort`, six of six settings, 0 to 1 s |
 | The above under delay and loss | network namespaces, 0, 5 and 25 ms, 0 and 2% loss | pass | `tests/multi/run_m4.sh`, 24 of 24 (M4-8, PR #51; table in docs/logs/M4-8.md) |
-| FR-1.1, FR-1a, FR-2, FR-8.1, FR-8.2 on hardware | two cabled laptops | pending | not run; commands below |
-| FR-10.1 on hardware: pull the cable mid-run | two cabled laptops | pending | not run; commands below |
+| FR-1.1, FR-1a, FR-2, FR-8.1, FR-8.2 on hardware | two cabled laptops | n/a | waived by Amirishetty Sai Vignesh in chat, 2026-10-15 ("Waive the hardware checks"); the runs are in `docs/TODO.md`, commands under "Hardware runs" |
+| FR-10.1 on hardware: pull the cable mid-run | two cabled laptops | n/a | waived by Amirishetty Sai Vignesh in chat, 2026-10-15 ("Waive the hardware checks"); the runs are in `docs/TODO.md`, commands under "Hardware runs" |
 
 ## Hardware runs
 
 <!-- Which laptops, kernel versions, the cable or switch, and anything unusual. -->
-Not run yet. On each laptop, a build at the same path and the same binary. With A at
+Waived at this gate; not run. On each laptop, a build at the same path and the same binary. With A at
 10.0.0.1 and B at 10.0.0.2, on the cable:
 
 - A: `build/dev/src/pmd/pmd --node-id 1 --peers 10.0.0.2`; B: `build/dev/src/pmd/pmd
@@ -62,9 +62,9 @@ Each "Still open" point or flagged question the person answered at this gate:
 the point's number, the answer, and where it is now recorded (the frozen file, AGENTS.md, docs/TODO.md).
 "None" if none.
 -->
-None yet.
+- The hardware checks: waived (2026-10-15), recorded in docs/TODO.md.
 
 ## Follow-ups
 
 <!-- Items for docs/TODO.md or for the next milestone that came out of the review. "None" if none. -->
-None yet.
+None.
