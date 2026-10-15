@@ -1687,7 +1687,9 @@ TEST_CASE("after a worker leaves, a fourth node joins the running job and runs c
         const pid_t pmrun = start_pmrun({"-n", "3", "--state-dir", nodes.one.state_dir, own_path(),
                                          "--as-program", report, "join"},
                                         said);
-        for (int tenths = 0; tenths < 600 && !std::filesystem::exists(report + ".three");
+        // Start-up alone can take over a minute under a sanitizer on two processors: every
+        // process and daemon hashes the 30 MB test binary at debug-build speed.
+        for (int tenths = 0; tenths < 1800 && !std::filesystem::exists(report + ".three");
              tenths++) {
             ::usleep(100000);
         }
