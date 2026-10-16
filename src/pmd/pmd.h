@@ -21,6 +21,7 @@
 #include "platform/result.h"
 #include "pmd/ledger.h"
 #include "pmd/peers.h"
+#include "pmd/scheduler.h"
 #include "wire/frame.h"
 #include "wire/payloads.h"
 
@@ -110,6 +111,7 @@ private:
         NodeId asker;
         ReqId req;
         std::array<std::byte, 32> hash{};
+        std::uint16_t want = 0;  // the job's threads_per_node; 0 for no bound
     };
 
     // A worker that has registered, until its local connection closes.
@@ -120,6 +122,9 @@ private:
         NodeId launcher;                       // the job's launcher node
         std::vector<LSegmentsEntry> segments;  // the newest L_SEGMENTS, since `since`
         Nanos since{};
+        std::uint16_t want = 0;    // threads_per_node; 0 for no bound
+        std::uint16_t slots = 0;   // its share of this node's worker slots, as last told
+        std::uint32_t waited = 0;  // share-outs in a row it had none at
     };
 
     // A job launched on this node, from L_RUN_REQ until its launcher has gone.
@@ -138,6 +143,9 @@ private:
         bool admitting = false;
         std::vector<LSegmentsEntry> segments;  // the newest L_SEGMENTS, since `since`
         Nanos since{};
+        std::uint16_t slots = 0;   // its share of this node's worker slots, as last told
+        std::uint32_t waited = 0;  // share-outs in a row it had none at
+        bool answered = false;     // L_ADMIT_OK is sent: quotas may be pushed to it
     };
     // One SPAWN_REQ this daemon sent and has no answer to.
     struct Ask {
@@ -162,6 +170,7 @@ private:
                      std::span<const std::byte> payload);
     void accrue(JobId job, NodeId launcher, std::vector<LSegmentsEntry>& segments, Nanos& since);
     void save_ledger();
+    void share_slots(std::uint64_t registering = 0);
     void ask_peers(Run& run);
     void ask_next_peer(Run& run);
     void ask_peer(Run& run, Endpoint peer, std::uint16_t flags);
@@ -221,6 +230,8 @@ private:
     std::unique_ptr<PeerTable> table_;  // made by open(), once the node ID is known
     std::optional<Ledger> ledger_;      // read by open() from the state directory
     CreditRates rates_;                 // ledger.mem_rate
+    double ledger_scale_ = 3600;        // ledger.scale, core-seconds
+    std::uint64_t cache_share_ = 25;    // mem.cache_share, percent, as the job processes take it
     Nanos last_save_{};
 };
 

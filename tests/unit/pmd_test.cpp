@@ -10,6 +10,7 @@
 #include "platform/factory.h"
 #include "pmd/ledger.h"
 #include "pmd/peers.h"
+#include "pmd/scheduler.h"
 #include "tools/pm.h"
 #include "wire/payloads.h"
 
@@ -19,6 +20,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <paramesh.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -224,7 +226,8 @@ int job_process(const std::string& report, const std::string& last_argument) {
     hello.role = 2;
     hello.data_port = kWorkerPort;
     hello.binary_hash = hash_of(platform, own_path());
-    if (!send(fd, platform, Opcode::kLRegister, 0, hello)) {
+    const paramesh::JobId job{static_cast<std::uint32_t>(std::stoul(env("PARAMESH_JOB_ID")))};
+    if (!send(fd, platform, Opcode::kLRegister, 0, hello, job)) {
         return 13;
     }
     const paramesh::Result<Frame> frame = paramesh::frame_read(fd, *platform.checksum);
@@ -242,7 +245,25 @@ int job_process(const std::string& report, const std::string& last_argument) {
         << "\nlauncher=" << env("PARAMESH_LAUNCHER") << "\nlisten=" << env("PARAMESH_LISTEN")
         << "\ncwd=" << std::filesystem::current_path().string()
         << "\nlast_argument=" << last_argument << "\n";
-    return out.good() ? 0 : 16;
+    if (!out.good()) {
+        return 16;
+    }
+    out.close();
+    // "watch": until pmd closes the connection, at most 120 s (a sanitizer build is slow to
+    // start the next job), writing each quota pmd pushes after the first to `report`.pushed.
+    for (int tenths = 0; last_argument == "watch" && tenths < 1200; tenths++) {
+        pollfd ready{fd, POLLIN, 0};
+        if (::poll(&ready, 1, 100) == 1) {
+            const paramesh::Result<Frame> pushed = paramesh::frame_read(fd, *platform.checksum);
+            if (!pushed.ok()) {
+                break;
+            }
+            const auto again = paramesh::wire_decode_l_quota(pushed.value().payload);
+            std::ofstream{report + ".pushed", std::ios::app}
+                << (again.ok() ? std::to_string(again.value().threads) : std::string{"?"}) << ' ';
+        }
+    }
+    return 0;
 }
 
 // Writes a report whole: under another name first.
@@ -871,14 +892,16 @@ TEST_CASE("pmrun starts a job on three simulated nodes from one command") {
     const std::string launcher = nodes.report("launcher");
     CHECK(field(launcher, "job") == "65537");  // node 1 in the high half, counter 1 in the low
     CHECK(field(launcher, "node") == "1");
-    CHECK(field(launcher, "quota") == "3");
-    CHECK(field(launcher, "launcher_quota") == "3");
+    CHECK(field(launcher, "quota") == "3");  // at L_REGISTER the job's bound is not known yet
+    // Since M5-3 a job is given no more slots than it can use: the stand-in asks for at most
+    // 2 threads a node (L_ADMIT_REQ), so 2 of the 3 (--cap-cores), here and on the workers.
+    CHECK(field(launcher, "launcher_quota") == "2");
     CHECK(field(launcher, "members") == "1 2 3 ");
     CHECK(field(launcher, "connected") == "2 3 ");  // both workers found the launcher
     for (const char* worker : {"worker-2", "worker-3"}) {
         const std::string report = nodes.report(worker);
         CHECK(field(report, "job") == "65537");
-        CHECK(field(report, "quota") == "3");
+        CHECK(field(report, "quota") == "2");
         CHECK(field(report, "launcher").starts_with("127.0.0.1:"));
     }
 
@@ -1963,4 +1986,95 @@ TEST_CASE("credit rules: fixed counts give the expected balances, from this node
     CHECK(again.value().own() == ledger.own());
     CHECK(again.value().balance(NodeId{2}) == doctest::Approx(ledger.balance(NodeId{2})));
     std::filesystem::remove_all(dir);
+}
+
+namespace {
+
+// A ledger for the slot allocation's tests: balances set by hand.
+class FakeLedger final : public paramesh::LedgerView {
+public:
+    std::map<std::uint16_t, double> balances;
+    [[nodiscard]] double balance(NodeId peer) const override {
+        const auto found = balances.find(peer.value);
+        return found == balances.end() ? 0 : found->second;
+    }
+};
+
+paramesh::SlotDemand guest(double weight, std::uint16_t want = 16, double ram_share = 0) {
+    return paramesh::SlotDemand{false, want, ram_share, weight, 0};
+}
+
+}  // namespace
+
+TEST_CASE("slot weights come from this node's ledger, never below 0.25") {
+    FakeLedger ledger;
+    ledger.balances = {{2, 3600.0}, {3, -1800.0}, {4, -100000.0}};
+    CHECK(paramesh::slot_weight(ledger, NodeId{2}, 3600) == doctest::Approx(2.0));  // a core-hour
+    CHECK(paramesh::slot_weight(ledger, NodeId{3}, 3600) == doctest::Approx(0.5));
+    CHECK(paramesh::slot_weight(ledger, NodeId{4}, 3600) == doctest::Approx(0.25));  // the floor
+    CHECK(paramesh::slot_weight(ledger, NodeId{9}, 3600) == doctest::Approx(1.0));   // unknown: 0
+}
+
+TEST_CASE("slots follow weights; own jobs first; equal guests share evenly") {
+    using paramesh::allocate_slots;
+    using V = std::vector<std::uint16_t>;
+    CHECK(allocate_slots(6, {guest(2.0), guest(1.0)}) == V{4, 2});  // twice the weight
+    CHECK(allocate_slots(6, {guest(1.0), guest(1.0), guest(1.0)}) == V{2, 2, 2});
+    // The node's own job takes what it wants first; the guests share the rest.
+    CHECK(allocate_slots(6, {guest(1.0), {true, 2, 0, 1, 0}, guest(1.0)}) == V{2, 2, 2});
+    CHECK(allocate_slots(4, {{true, 8, 0, 1, 0}, guest(4.0)}) == V{4, 0});
+    // No more than a job wants; slots nobody wants stay free.
+    CHECK(allocate_slots(6, {guest(1.0, 1), guest(1.0, 2)}) == V{1, 2});
+    // A free-rider at the 0.25 floor gets less than an equal contributor, but some.
+    const V share = allocate_slots(10, {guest(1.0), guest(1.0), guest(0.25)});
+    CHECK(share[2] < share[0]);
+    CHECK(share[2] > 0);
+    CHECK(share[0] + share[1] + share[2] == 10);
+    // The home-store RAM a job holds counts in its dominant share.
+    // A guest holding three quarters of the RAM gets slots only once the other's share of the
+    // slots has caught up: 2 against 6.
+    CHECK(allocate_slots(8, {guest(1.0, 16, 0.75), guest(1.0, 16, 0.0)}) == V{2, 6});
+}
+
+TEST_CASE("a job with work never goes without a slot for more than one share-out") {
+    // One slot, three guests of different weight, each with work: at every task boundary the
+    // slots are shared out again, and one left out last time comes first.
+    std::vector<paramesh::SlotDemand> jobs = {guest(4.0), guest(1.0), guest(0.25)};
+    std::vector<int> rounds_without(jobs.size(), 0);
+    for (int boundary = 0; boundary < 30; boundary++) {
+        const std::vector<std::uint16_t> slots = paramesh::allocate_slots(1, jobs);
+        for (std::size_t i = 0; i < jobs.size(); i++) {
+            rounds_without[i] = slots[i] == 0 ? rounds_without[i] + 1 : 0;
+            CHECK(rounds_without[i] <= 2);  // with three jobs on one slot, at most two in a row
+            jobs[i].waited = slots[i] == 0 ? jobs[i].waited + 1 : 0;
+        }
+    }
+}
+
+TEST_CASE("pmd shares its slots among the jobs on it and pushes each new share") {
+    const Daemon daemon;  // --cap-cores 3
+    const std::string first = daemon.state_dir + "/first";
+    paramesh::SpawnReqPayload watching = daemon.request(first);
+    watching.argv.back() = "watch";
+    REQUIRE(send(daemon.control, daemon.platform, Opcode::kSpawnReq, 1, watching));
+    REQUIRE(daemon.reply().header.opcode == Opcode::kSpawnOk);
+    for (int tenths = 0; tenths < 50 && contents(first).empty(); tenths++) {
+        ::usleep(100000);
+    }
+    CHECK(field(contents(first), "quota") == "3");  // alone: every slot
+
+    // A second job, from the same peer, so of the same weight: the slots are shared, 2 and 1.
+    // When it ends, the first has all three again.
+    const std::string second = daemon.state_dir + "/second";
+    REQUIRE(send(daemon.control, daemon.platform, Opcode::kSpawnReq, 2, daemon.request(second),
+                 paramesh::JobId{78}));
+    REQUIRE(daemon.reply().header.opcode == Opcode::kSpawnOk);
+    for (int tenths = 0; tenths < 50 && contents(second).empty(); tenths++) {
+        ::usleep(100000);
+    }
+    CHECK(field(contents(second), "quota") == "1");
+    for (int tenths = 0; tenths < 50 && contents(first + ".pushed") != "2 3 "; tenths++) {
+        ::usleep(100000);
+    }
+    CHECK(contents(first + ".pushed") == "2 3 ");
 }
