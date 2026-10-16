@@ -67,6 +67,26 @@ and the next step.
 - One wrong expectation of mine in a unit case (the owner's own atomic operation is not
   held, as the table says); corrected in the test.
 - State: Done-when met.
+### 2026-10-16 — session (fix): the hold-window test made sure the page is shared
+
+- The test "the hold window: neighbours in one page cost far fewer page transfers with it"
+  failed in about six of nine Actions runs on recent pull requests (#53 to #56), each time
+  with one of its two runs at 1 transfer: one node had run every task, so page 0 never moved.
+  The person chose to look for a real fix (2026-10-16); docs/TODO.md had it as a timing
+  test to rerun.
+- Two causes, both in the test's set-up. Every task touches page 0, and data affinity, on by
+  default, sends such tasks to page 0's home; and the tasks are about a millisecond, so on a
+  loaded machine one node's threads can run them all before another asks.
+- Fix, test only: affinity is off in this test (it is about the hold window), and each task
+  of the neighbours program marks its node and waits, at most 20 s, until a second node has
+  begun one, so two nodes do write the page at once. The checks are unchanged.
+- Commands, `unit_lib_test -tc="the hold window*"`: before, on two processors, about half
+  failed; affinity off alone, 7 of 16 still failed. With both: 4 processors (`taskset -c
+  0-3`, as an Actions runner) 0 of 12, 24 to 37 transfers with the hold window against 993 to
+  2,409 without; all processors 0 of 12 (31 to 45 against 2,240 to 2,861, the scale the test
+  saw before); two processors 1 of 12 (36 against 25: with 6 threads on 2 processors two
+  nodes barely run at once).
+
 ## Files touched
 
 <!--
