@@ -270,6 +270,11 @@ Result<void> Pmd::open() {
         }
         ledger_ = std::move(ledger).value();
     }
+    // ledger.mem_rate: core-seconds of credit for one GB-hour of segments hosted.
+    if (const char* rate =
+            std::getenv("PARAMESH_CFG_LEDGER_MEM_RATE")) {  // NOLINT(concurrency-mt-unsafe)
+        rates_.core_seconds_per_gb_hour = std::strtod(rate, nullptr);
+    }
     instance_ = static_cast<std::uint32_t>(random());
     table_ = std::make_unique<PeerTable>(config_.node, instance_);
     socket_path_ = config_.state_dir + "/pmd.sock";
@@ -728,6 +733,9 @@ void Pmd::beacon(Nanos now) {
 // BYE, when the daemon stops.
 void Pmd::save_ledger() {
     last_save_ = platform_.clock->now();
+    if (ledger_) {
+        ledger_->apply_credits(rates_);
+    }
     if (ledger_ && ledger_->dirty()) {
         if (const Result<void> saved = ledger_->save(); !saved.ok()) {
             platform_.logger->log(
@@ -1177,6 +1185,13 @@ void Pmd::on_chunk(const Connection& connection, const FrameHeader& header,
         return;
     }
     const LChunkPayload& c = chunk.value();
+    const bool ours =
+        std::any_of(workers_.begin(), workers_.end(),
+                    [&](const Worker& w) { return w.local == connection.id; }) ||
+        (run_of(header.job) != nullptr && run_of(header.job)->launcher == connection.id);
+    if (ours && c.node == config_.node) {  // what a chunk of the task costs here (M5-2)
+        ledger_->add_own_chunk(c.task_id, c.indexes, Nanos{static_cast<std::int64_t>(c.cpu_ns)});
+    }
     const auto worker = std::find_if(workers_.begin(), workers_.end(), [&](const Worker& w) {
         return w.local == connection.id && w.job == header.job;
     });
