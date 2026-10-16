@@ -352,7 +352,23 @@ PM_TASK(lib_test_fill) {
 }
 
 // Neighbours in one page: chunk i of the first task writes number 2i, of the second 2i + 1.
-void write_many(const MarkArgs* args, std::uint64_t which) {
+// The neighbours program's tasks: two kinds that write next to each other in page 0.
+struct NeighbourArgs {
+    std::uint64_t* hits;
+    std::uint64_t* started;  // started[n] becomes 1 when node n has begun one of the tasks
+};
+
+void write_many(const NeighbourArgs* args, std::uint64_t which, std::uint16_t node) {
+    // The page is shared only if two nodes write it at once: each task waits (at most 20 s)
+    // until a second node has begun one. On a loaded machine one node could otherwise run
+    // them all and the page would never move.
+    volatile std::uint64_t* started = args->started;
+    if (started[node] == 0) {
+        started[node] = 1;
+    }
+    for (int waited = 0; waited < 20000 && started[1] + started[2] + started[3] < 2; waited++) {
+        ::usleep(1000);
+    }
     volatile std::uint64_t* number = &args->hits[which];
     *number = 0;
     for (int i = 0; i < 300000; i++) {
@@ -396,12 +412,12 @@ PM_TASK(lib_test_leave) {
 }
 
 PM_TASK(lib_test_left) {
-    write_many(static_cast<const MarkArgs*>(arg), 2 * lo);
+    write_many(static_cast<const NeighbourArgs*>(arg), 2 * lo, ctx->node);
     static_cast<void>(hi);
 }
 
 PM_TASK(lib_test_right) {
-    write_many(static_cast<const MarkArgs*>(arg), 2 * lo + 1);
+    write_many(static_cast<const NeighbourArgs*>(arg), 2 * lo + 1, ctx->node);
     static_cast<void>(hi);
 }
 
@@ -576,11 +592,12 @@ int neighbours_program() {
     if (pm_init(nullptr, nullptr, &config) != PM_OK) {
         return 2;
     }
-    auto* numbers = static_cast<std::uint64_t*>(pm_malloc(paramesh::kPageSize));
-    if (numbers == nullptr) {
+    auto* numbers = static_cast<std::uint64_t*>(pm_malloc(paramesh::kPageSize));  // page 0
+    auto* started = static_cast<std::uint64_t*>(pm_malloc(paramesh::kPageSize));
+    if (numbers == nullptr || started == nullptr) {
         return 3;
     }
-    const MarkArgs args{numbers, nullptr};
+    const NeighbourArgs args{numbers, started};
     for (std::uint64_t i = 0; i < 24; i++) {
         if (pm_parallel_for("lib_test_left", i, i + 1, 1, &args, sizeof args) != PM_OK ||
             pm_parallel_for("lib_test_right", i, i + 1, 1, &args, sizeof args) != PM_OK) {
@@ -842,6 +859,10 @@ TEST_CASE("with data affinity on, fewer page transfers are logged for the same r
 
 TEST_CASE("the hold window: neighbours in one page cost far fewer page transfers with it" *
           doctest::skip(!can_run())) {
+    // Data affinity off: every task touches page 0, and affinity would send them all to its
+    // home. This test is about the hold window.
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): no other thread of this process is running
+    ::setenv("PARAMESH_CFG_TASK_AFFINITY", "0", 1);
     std::string with_log;
     std::string without_log;
     const long with_hold =
@@ -858,6 +879,8 @@ TEST_CASE("the hold window: neighbours in one page cost far fewer page transfers
     CHECK(with_log.find("\"task\":\"lib_test_left\"") != std::string::npos);
     CHECK(with_log.find("\"task\":\"lib_test_right\"") != std::string::npos);
     CHECK(without_log.find("page_thrash") == std::string::npos);  // off: nothing is held
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): as above
+    ::unsetenv("PARAMESH_CFG_TASK_AFFINITY");
 }
 
 TEST_CASE("concurrent atomic adds from three processes sum exactly" * doctest::skip(!can_run())) {
