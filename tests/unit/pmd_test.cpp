@@ -9,6 +9,7 @@
 #include "net/frame_io.h"
 #include "platform/factory.h"
 #include "pmd/ledger.h"
+#include "pmd/ledger_status.h"
 #include "pmd/peers.h"
 #include "pmd/scheduler.h"
 #include "tools/pm.h"
@@ -1913,6 +1914,8 @@ TEST_CASE("after a job each daemon's ledger has the work both ways, and keeps it
     // own cost of the same task, measured on the chunks its own threads ran.
     CHECK(by_two.by_peer.credit > 0);
     CHECK(for_one.for_peer.credit > 0);
+    // What each daemon serves at GET /v1/ledger, and what they said to each other (M5-4) are
+    // checked in "after a job both daemons' /v1/ledger agree, and LEDGER_SYNC says so".
 
     // A daemon started again on node 2's state directory reads the same ledger, and leaves it so.
     {
@@ -2077,4 +2080,123 @@ TEST_CASE("pmd shares its slots among the jobs on it and pushes each new share")
         ::usleep(100000);
     }
     CHECK(contents(first + ".pushed") == "2 3 ");
+}
+
+TEST_CASE("raw counts disagree past 10% (and past rounding), and totals are this node's own") {
+    using paramesh::counts_disagree;
+    CHECK_FALSE(counts_disagree(100, 110));  // 10%: not past it
+    CHECK(counts_disagree(100, 112));
+    CHECK(counts_disagree(112, 100));
+    CHECK_FALSE(counts_disagree(3, 4));  // a gap of one is rounding
+    CHECK(counts_disagree(0, 5));
+    CHECK_FALSE(counts_disagree(0, 0));
+    // What this node did for peer 2 is compared with what peer 2 says it got, and so on.
+    const paramesh::LedgerTotal mine{NodeId{2}, 50, 80, 0, 0};
+    CHECK_FALSE(paramesh::totals_disagree(mine, {NodeId{1}, 80, 50, 0, 0}));
+    CHECK(paramesh::totals_disagree(mine, {NodeId{1}, 50, 80, 0, 0}));  // the two crossed
+
+    const paramesh::Platform platform = quiet_platform();
+    const std::string dir = ledger_dir();
+    auto opened = paramesh::Ledger::open(dir + "/ledger.json", *platform.json);
+    REQUIRE(opened.ok());
+    paramesh::Ledger ledger = std::move(opened).value();
+    using paramesh::Direction;
+    ledger.add_chunk(NodeId{2}, paramesh::JobId{9}, Direction::kForPeer, 1, 512,
+                     std::chrono::nanoseconds{1});
+    ledger.add_chunk(NodeId{2}, paramesh::JobId{9}, Direction::kForPeer, 1, 512,
+                     std::chrono::nanoseconds{1});
+    ledger.add_segment_seconds(NodeId{2}, paramesh::JobId{9}, Direction::kByPeer, 7.9);
+    const paramesh::LedgerTotal totals = paramesh::ledger_totals(ledger, NodeId{2});
+    CHECK(totals.chunks_for_peer == 2);
+    CHECK(totals.chunks_by_peer == 0);
+    CHECK(totals.segsec_by_peer == 7);  // rounded down
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("forged totals on HELLO are shown and flagged, and move no weight") {
+    const Daemon daemon;  // node 5, an empty ledger
+    const std::uint16_t port = daemon.pmd.http_port();
+    // Node 8 says it ran a billion chunks for node 5's jobs and hosted for them for years.
+    paramesh::HelloPayload forged = beacon(81);
+    forged.totals.push_back({NodeId{5}, 1000000000, 0, 999999999, 0});
+    const auto ledger_of_8 = [&]() -> std::string {
+        const auto body = paramesh::http_get(port, "/v1/ledger");
+        return body.ok() ? body.value() : std::string{};
+    };
+    for (int tries = 0; tries < 30 && ledger_of_8().find("\"announced\":{") == std::string::npos;
+         tries++) {
+        send_beacon(daemon.platform, Opcode::kHello, 8, forged, daemon.pmd.discovery_port());
+        ::usleep(100000);
+    }
+    const std::string said = ledger_of_8();
+    INFO(said);
+    CHECK(said.find("\"chunks_for_peer\":1000000000") != std::string::npos);  // shown
+    CHECK(said.find("\"disagree\":true") != std::string::npos);               // flagged
+    CHECK(said.find("\"balance\":0") != std::string::npos);                   // no credit
+    CHECK(said.find("\"weight\":1") != std::string::npos);                    // no weight
+    // pm status shows it too.
+    const std::string out = daemon.state_dir + "/pm";
+    REQUIRE(run_tool(tool("pm"), {"status", "--http-port", std::to_string(port)}, out) == 0);
+    INFO(contents(out));
+    CHECK(contents(out).find("DISAGREES by more than 10%") != std::string::npos);
+}
+
+namespace {
+
+// From a daemon's GET /v1/ledger: the entry of `peer`'s first job, or an empty object.
+paramesh::JsonObject ledger_job(const Daemon& daemon, std::uint16_t peer) {
+    const auto body = paramesh::http_get(daemon.pmd.http_port(), "/v1/ledger");
+    const auto parsed = body.ok() ? daemon.platform.json->decode(body.value())
+                                  : paramesh::Result<paramesh::JsonValue>{body.error()};
+    if (!parsed.ok()) {
+        return {};
+    }
+    const auto& top = std::get<paramesh::JsonObject>(parsed.value().v);
+    for (const auto& each : std::get<paramesh::JsonArray>(top.at("peers").v)) {
+        const auto& entry = std::get<paramesh::JsonObject>(each.v);
+        const auto& jobs = std::get<paramesh::JsonArray>(entry.at("jobs").v);
+        if (std::get<std::int64_t>(entry.at("peer").v) == peer && !jobs.empty()) {
+            return std::get<paramesh::JsonObject>(jobs.front().v);
+        }
+    }
+    return {};
+}
+
+std::int64_t count_in(const paramesh::JsonObject& job, const char* which, const char* key) {
+    const auto found = job.find(which);
+    const auto* counts =
+        found != job.end() ? std::get_if<paramesh::JsonObject>(&found->second.v) : nullptr;
+    return counts != nullptr ? std::get<std::int64_t>(counts->at(key).v) : -1;
+}
+
+}  // namespace
+
+TEST_CASE("after a job both daemons' /v1/ledger agree, and LEDGER_SYNC says so" *
+          doctest::skip(!region_can_be_mapped())) {
+    const ThreeNodes nodes;
+    const std::string report = nodes.reports + "/program";
+    REQUIRE(exit_status(start_pmrun({"-n", "3", "--state-dir", nodes.one.state_dir, own_path(),
+                                     "--as-program", report, "quick"}),
+                        180) == 0);
+    // Each side sends its counts for the job as its process there ends: the workers to node 1,
+    // node 1 to each worker. The counts are in /v1/ledger within a second of arriving.
+    paramesh::JsonObject by_two;
+    paramesh::JsonObject for_one;
+    for (int tenths = 0; tenths < 100; tenths++) {
+        by_two = ledger_job(nodes.one, 2);
+        for_one = ledger_job(nodes.two, 1);
+        if (count_in(by_two, "announced", "chunks_for_peer") >= 0 &&
+            count_in(for_one, "announced", "chunks_by_peer") >= 0) {
+            break;
+        }
+        ::usleep(100000);
+    }
+    // Node 1's count of node 2's chunks is node 2's own count, and node 2 announced the same.
+    const std::int64_t counted = count_in(by_two, "counts", "chunks_by_peer");
+    CHECK(counted > 0);
+    CHECK(counted == count_in(for_one, "counts", "chunks_for_peer"));
+    CHECK(count_in(by_two, "announced", "chunks_for_peer") == counted);
+    CHECK(count_in(for_one, "announced", "chunks_by_peer") == counted);
+    CHECK(std::get<bool>(by_two.at("disagree").v) == false);
+    CHECK(std::get<bool>(for_one.at("disagree").v) == false);
 }

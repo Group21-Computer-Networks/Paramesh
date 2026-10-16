@@ -269,6 +269,7 @@ Result<void> Pmd::open() {
             return ledger.error();
         }
         ledger_ = std::move(ledger).value();
+        refresh_ledger_status();
     }
     // ledger.scale: the balance, in core-seconds, that doubles a peer's weight; and
     // mem.cache_share, to know the home store's part of --cap-ram.
@@ -334,6 +335,10 @@ Result<void> Pmd::open() {
     if (const Result<void> discovery = open_discovery(); !discovery.ok()) {
         return discovery;
     }
+    platform_.http->get("/v1/ledger", [this](std::string_view /*path*/) {
+        const std::scoped_lock hold{status_mu_};
+        return HttpResponse{200, "application/json", ledger_json_};
+    });
     platform_.http->get("/v1/peers", [this](std::string_view /*path*/) {
         return HttpResponse{200, "application/json", peers_json()};
     });
@@ -486,6 +491,8 @@ void Pmd::handle(Connection& connection, const FrameHeader& header,
         on_chunk(connection, header, payload);
     } else if (connection.local && header.opcode == Opcode::kLSegments) {
         on_segments(connection, header, payload);
+    } else if (!connection.local && header.opcode == Opcode::kLedgerSync) {
+        on_ledger_sync(header, payload);
     } else if (!connection.local && header.opcode == Opcode::kLeaveIntent) {
         on_leave_intent(header, payload);
     } else {
@@ -737,6 +744,13 @@ void Pmd::beacon(Nanos now) {
     hello.free_spill = config_.spill_budget;
     hello.jobs = static_cast<std::uint16_t>(std::min<std::size_t>(runs_.size(), 65535));
     hello.flags = leaving_ ? kHelloLeaving : std::uint16_t{0};
+    if (ledger_) {  // this node's raw totals with up to 7 peers, for display and the alarm
+        for (const auto& [peer, jobs] : ledger_->data()) {
+            if (hello.totals.size() < 7) {
+                hello.totals.push_back(ledger_totals(*ledger_, NodeId{peer}));
+            }
+        }
+    }
     std::array<std::byte, 300> bytes{};
     if (const Result<std::size_t> size = wire_encode(hello, bytes); size.ok()) {
         announce(Opcode::kHello, std::span{bytes}.first(size.value()));
@@ -757,6 +771,7 @@ void Pmd::save_ledger() {
     last_save_ = platform_.clock->now();
     if (ledger_) {
         ledger_->apply_credits(rates_);
+        refresh_ledger_status();
     }
     if (ledger_ && ledger_->dirty()) {
         if (const Result<void> saved = ledger_->save(); !saved.ok()) {
@@ -822,6 +837,11 @@ void Pmd::hear() {
                 heard = PeerTable::Heard::kKnown;  // reported once already
             } else if (heard == PeerTable::Heard::kClash) {
                 clashes_.push_back(Peer{node, address, hello.value(), platform_.clock->now()});
+            }
+        }
+        for (const LedgerTotal& total : hello.value().totals) {
+            if (total.peer == config_.node) {  // what the peer says about this node, kept
+                announced_.totals[node.value] = total;
             }
         }
         if (heard == PeerTable::Heard::kNew && (hello.value().flags & kHelloLeaving) == 0) {
@@ -1104,6 +1124,7 @@ void Pmd::on_spawn_answer(const FrameHeader& header, std::span<const std::byte> 
         return;
     }
     if (header.opcode == Opcode::kSpawnOk && ok.ok()) {
+        run->links[ok.value().node.value] = ask.connection;  // for LEDGER_SYNC at the end
         run->members.push_back(SegMapMember{ok.value().node, Slot{0}, 0, ask.peer.ipv4,
                                             ok.value().data_port, ok.value().ram_commit});
         run->committed += ok.value().ram_commit + ok.value().spill_commit;
@@ -1268,6 +1289,62 @@ void Pmd::accrue(JobId job, NodeId launcher, std::vector<LSegmentsEntry>& segmen
     }
 }
 
+// ---- announcements and the alarm (M5-4)
+// ----------------------------------------------------------
+
+// LEDGER_SYNC to `peer`'s pmd on `connection`: this node's counts with it for the job just ended.
+void Pmd::send_ledger_sync(std::uint64_t connection, NodeId peer, JobId job) {
+    if (ledger_ && connection != 0) {
+        reply(connection, Opcode::kLedgerSync, job, peer, kNoReq,
+              LedgerSyncPayload{{ledger_job_counts(*ledger_, peer, job)}});
+    }
+}
+
+// LEDGER_SYNC from a peer: its counts with this node, kept for display and compared.
+void Pmd::on_ledger_sync(const FrameHeader& header, std::span<const std::byte> payload) {
+    const Result<LedgerSyncPayload> sync = wire_decode_ledger_sync(payload);
+    if (!sync.ok() || !ledger_) {
+        return;
+    }
+    for (const LedgerSyncEntry& theirs : sync.value().entries) {
+        announced_.jobs[{header.src.value, theirs.job.value}] = theirs;
+    }
+    // Compared at the next refresh, not here: the last L_CHUNKs of the job's process on this
+    // node may still be waiting to be read.
+}
+
+// The JSON GET /v1/ledger serves, made here on pmd's thread from the ledger and announcements.
+void Pmd::refresh_ledger_status() {
+    if (!ledger_) {
+        return;
+    }
+    // The alarm, logged once for each peer, or peer and job, that starts to differ.
+    std::set<std::pair<std::uint16_t, std::uint32_t>> off;  // (peer, job); job 0 for totals
+    for (const auto& [peer, theirs] : announced_.totals) {
+        if (totals_disagree(ledger_totals(*ledger_, NodeId{peer}), theirs)) {
+            off.insert({peer, 0});
+        }
+    }
+    for (const auto& [key, theirs] : announced_.jobs) {
+        if (job_disagrees(ledger_job_counts(*ledger_, NodeId{key.first}, JobId{key.second}),
+                          theirs)) {
+            off.insert(key);
+        }
+    }
+    for (const auto& [peer, job] : off) {
+        if (!disagreeing_.contains({peer, job})) {
+            platform_.logger->log(LogLevel::kWarn, "ledger_disagreement",
+                                  JsonObject{{"peer", JsonValue{std::int64_t{peer}}},
+                                             {"job", JsonValue{std::int64_t{job}}}});
+        }
+    }
+    disagreeing_ = std::move(off);
+    std::string json =
+        platform_.json->encode(ledger_status(*ledger_, announced_, config_.node, ledger_scale_));
+    const std::scoped_lock hold{status_mu_};
+    ledger_json_ = std::move(json);
+}
+
 // ---- worker slots (M5-3) ----------------------------------------------------------------------
 
 namespace {
@@ -1346,6 +1423,7 @@ void Pmd::on_closed(const Connection& connection) {
     std::erase_if(workers_, [&](Worker& w) {
         if (w.local == connection.id) {
             accrue(w.job, w.launcher, w.segments, w.since);  // its last segments, until now
+            send_ledger_sync(w.control, w.launcher, w.job);
         }
         return w.local == connection.id;
     });
@@ -1374,6 +1452,9 @@ void Pmd::on_closed(const Connection& connection) {
     std::erase_if(runs_, [&](Run& run) {
         if (run.launcher == connection.id) {
             accrue(run.job, config_.node, run.segments, run.since);
+            for (const auto& [peer, link] : run.links) {
+                send_ledger_sync(link, NodeId{peer}, run.job);
+            }
         }
         return run.launcher == connection.id || (run.launcher == 0 && run.pmrun == 0);
     });
