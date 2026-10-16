@@ -90,6 +90,9 @@ public:
     // has a chunk to run, is running one, or waits for an answer.
     void leave();
     [[nodiscard]] bool idle();
+    // The node's quota for this job (L_QUOTA, M5-3): only threads 0 to quota - 1 ask for new
+    // chunks. A thread above it runs what it already has, then waits for the quota to rise.
+    void set_quota(std::uint16_t threads);
 
 private:
     struct Call {
@@ -131,6 +134,7 @@ private:
     std::mutex mu_;
     std::condition_variable changed_;
     bool stopping_ = false;
+    std::uint16_t quota_;  // threads that may ask for chunks; all of them until set_quota
     // Launcher: the chunks nobody has taken, those taken and not reported done, and the calls
     // they belong to.
     std::deque<Chunk> queue_;
