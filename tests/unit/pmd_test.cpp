@@ -1608,7 +1608,7 @@ TEST_CASE(
     "a worker leaves during matrix multiply: the job finishes with the single-machine result" *
     doctest::skip(!region_can_be_mapped())) {
     const std::string plain_out = "/tmp/pmd-test-matmul-plain";
-    REQUIRE(run_tool(matmul_path(), {"--plain", "1024"}, plain_out, 120) == 0);
+    REQUIRE(run_tool(matmul_path(), {"--plain", "2048"}, plain_out, 120) == 0);
     const std::string plain = contents(plain_out);
     const std::string expected = plain.substr(plain.find("checksum "));
     std::filesystem::remove(plain_out);
@@ -1620,7 +1620,7 @@ TEST_CASE(
         const std::string said = nodes.reports + "/stderr";
         const std::string printed = nodes.reports + "/stdout";
         std::vector<std::string> all{pmrun_path(),        "-n",          "3",    "--state-dir",
-                                     nodes.one.state_dir, matmul_path(), "1024", "2"};
+                                     nodes.one.state_dir, matmul_path(), "2048", "1"};
         std::vector<char*> argv;
         argv.reserve(all.size() + 1);
         for (std::string& argument : all) {
@@ -1634,6 +1634,8 @@ TEST_CASE(
             ::execv(argv[0], argv.data());
             ::_exit(127);
         }
+        // matmul 2048 with one thread a node runs for seconds, long enough for the leave to
+        // end inside it; at 1024 a slow machine finished the job before the leave was done.
         // Node 3's worker is running chunks: node 3 leaves, as `pm leave` there asks.
         // In the job means connected to the launcher and to node 2 besides its pmd and its
         // listener: four sockets.
