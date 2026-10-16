@@ -792,6 +792,48 @@ Result<LSegmentsPayload> wire_decode_l_segments(std::span<const std::byte> in) {
     return payload;
 }
 
+Result<std::size_t> wire_encode(const LedgerSyncPayload& payload, std::span<std::byte> out) {
+    if (payload.entries.empty() || 4 + 40 * payload.entries.size() > 65536) {
+        return kUnsendable;
+    }
+    Writer w{out};
+    w.put(payload.entries.size(), 2);
+    w.put(0, 2);  // reserved
+    for (const LedgerSyncEntry& entry : payload.entries) {
+        w.put(entry.job.value, 4);
+        w.put(0, 4);  // reserved
+        w.put(entry.chunks_for_peer, 8);
+        w.put(entry.chunks_by_peer, 8);
+        w.put(entry.segsec_for_peer, 8);
+        w.put(entry.segsec_by_peer, 8);
+    }
+    return w.done();
+}
+
+Result<LedgerSyncPayload> wire_decode_ledger_sync(std::span<const std::byte> in) {
+    Reader r{in};
+    const std::size_t count = r.get(2);
+    r.take(2);
+    if (count == 0 || in.size() != 4 + 40 * count) {
+        return kMalformed;
+    }
+    LedgerSyncPayload payload;
+    for (std::size_t i = 0; i < count; i++) {
+        LedgerSyncEntry entry;
+        entry.job = JobId{static_cast<std::uint32_t>(r.get(4))};
+        r.take(4);
+        entry.chunks_for_peer = r.get(8);
+        entry.chunks_by_peer = r.get(8);
+        entry.segsec_for_peer = r.get(8);
+        entry.segsec_by_peer = r.get(8);
+        payload.entries.push_back(entry);
+    }
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
 Result<std::size_t> wire_encode(const LLeavePayload& payload, std::span<std::byte> out) {
     if (payload.reason != kLeaveAsked && payload.reason != kLeaveInterrupt) {
         return kUnsendable;

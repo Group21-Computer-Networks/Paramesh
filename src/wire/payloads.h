@@ -122,6 +122,19 @@ struct LedgerTotal {
     std::uint64_t segsec_by_peer = 0;
 };
 
+// LEDGER_SYNC: the sender's own raw counts with the receiver, one entry for each job, sent when
+// a job ends on the sender (M5-4). For display and the disagreement alarm only.
+struct LedgerSyncEntry {
+    JobId job;
+    std::uint64_t chunks_for_peer = 0;
+    std::uint64_t chunks_by_peer = 0;
+    std::uint64_t segsec_for_peer = 0;
+    std::uint64_t segsec_by_peer = 0;
+};
+struct LedgerSyncPayload {
+    std::vector<LedgerSyncEntry> entries;  // at least 1
+};
+
 inline constexpr std::uint16_t kHelloLeaving = 0x0001;
 
 // HELLO: a pmd's beacon, every second. Its address is the datagram's source address.
@@ -351,6 +364,8 @@ Result<std::size_t> wire_encode(const LLeaveReqPayload& payload, std::span<std::
 Result<RedirectPayload> wire_decode_redirect(std::span<const std::byte> in);
 Result<LeaveIntentPayload> wire_decode_leave_intent(std::span<const std::byte> in);
 Result<std::size_t> wire_encode(const LMemberPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const LedgerSyncPayload& payload, std::span<std::byte> out);
+Result<LedgerSyncPayload> wire_decode_ledger_sync(std::span<const std::byte> in);
 Result<std::size_t> wire_encode(const LChunkPayload& payload, std::span<std::byte> out);
 Result<LChunkPayload> wire_decode_l_chunk(std::span<const std::byte> in);
 Result<std::size_t> wire_encode(const LSegmentsPayload& payload, std::span<std::byte> out);

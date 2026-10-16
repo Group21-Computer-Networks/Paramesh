@@ -45,6 +45,61 @@ const JsonArray* array(const JsonObject& object, const char* key) {
     return found != object.end() ? std::get_if<JsonArray>(&found->second.v) : nullptr;
 }
 
+double real(const JsonObject& object, const char* key) {
+    const auto found = object.find(key);
+    if (found == object.end()) {
+        return 0;
+    }
+    if (const auto* value = std::get_if<double>(&found->second.v)) {
+        return *value;
+    }
+    const auto* whole = std::get_if<std::int64_t>(&found->second.v);
+    return whole != nullptr ? static_cast<double>(*whole) : 0;
+}
+
+const JsonObject* object_at(const JsonObject& object, const char* key) {
+    const auto found = object.find(key);
+    return found != object.end() ? std::get_if<JsonObject>(&found->second.v) : nullptr;
+}
+
+// The ledger (GET /v1/ledger, M5-4): this node's raw counts with each peer, the balance and
+// weight they give, and what the peer announced, flagged when they differ by more than 10%.
+void print_ledger(std::uint16_t port, const JsonCodec& json) {
+    const Result<std::string> body = http_get(port, "/v1/ledger");
+    const Result<JsonValue> parsed =
+        body.ok() ? json.decode(body.value()) : Result<JsonValue>{body.error()};
+    const auto* top = parsed.ok() ? std::get_if<JsonObject>(&parsed.value().v) : nullptr;
+    const JsonArray* peers = top != nullptr ? array(*top, "peers") : nullptr;
+    if (peers == nullptr || peers->empty()) {
+        return;
+    }
+    std::printf("\nledger: chunks and segment-seconds for each other, by this node's count\n");
+    std::printf("%-6s %-10s %-10s %-10s %-10s %-10s %-7s %s\n", "PEER", "CHUNKS_FOR", "CHUNKS_BY",
+                "SEGS_FOR", "SEGS_BY", "BALANCE", "WEIGHT", "ANNOUNCED");
+    for (const JsonValue& each : *peers) {
+        const auto* peer = std::get_if<JsonObject>(&each.v);
+        const JsonObject* totals = peer != nullptr ? object_at(*peer, "totals") : nullptr;
+        if (totals == nullptr) {
+            continue;
+        }
+        const JsonObject* said = object_at(*peer, "announced");
+        const auto* off = peer->find("disagree") != peer->end()
+                              ? std::get_if<bool>(&peer->find("disagree")->second.v)
+                              : nullptr;
+        const char* announced = "-";
+        if (said != nullptr) {
+            announced = off != nullptr && *off ? "DISAGREES by more than 10%" : "agrees";
+        }
+        std::printf("%-6lld %-10lld %-10lld %-10lld %-10lld %-10.1f %-7.2f %s\n",
+                    static_cast<long long>(number(*peer, "peer")),
+                    static_cast<long long>(number(*totals, "chunks_for_peer")),
+                    static_cast<long long>(number(*totals, "chunks_by_peer")),
+                    static_cast<long long>(number(*totals, "segsec_for_peer")),
+                    static_cast<long long>(number(*totals, "segsec_by_peer")),
+                    real(*peer, "balance"), real(*peer, "weight"), announced);
+    }
+}
+
 int status(std::uint16_t port) {
     const Result<std::string> body = http_get(port, "/v1/peers");
     if (!body.ok()) {
@@ -82,6 +137,7 @@ int status(std::uint16_t port) {
                 static_cast<double>(number(*peer, "silent_ms")) / 1000.0);
         }
     }
+    print_ledger(port, *platform.value().json);
     if (const JsonArray* clashes = array(*top, "clashes"); clashes != nullptr) {
         for (const JsonValue& each : *clashes) {
             if (const auto* clash = std::get_if<JsonObject>(&each.v); clash != nullptr) {

@@ -20,6 +20,7 @@
 #include "platform/ids.h"
 #include "platform/result.h"
 #include "pmd/ledger.h"
+#include "pmd/ledger_status.h"
 #include "pmd/peers.h"
 #include "pmd/scheduler.h"
 #include "wire/frame.h"
@@ -31,13 +32,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace paramesh {
@@ -146,6 +150,7 @@ private:
         std::uint16_t slots = 0;   // its share of this node's worker slots, as last told
         std::uint32_t waited = 0;  // share-outs in a row it had none at
         bool answered = false;     // L_ADMIT_OK is sent: quotas may be pushed to it
+        std::map<std::uint16_t, std::uint64_t> links;  // each member's pmd: its connection
     };
     // One SPAWN_REQ this daemon sent and has no answer to.
     struct Ask {
@@ -171,6 +176,9 @@ private:
     void accrue(JobId job, NodeId launcher, std::vector<LSegmentsEntry>& segments, Nanos& since);
     void save_ledger();
     void share_slots(std::uint64_t registering = 0);
+    void on_ledger_sync(const FrameHeader& header, std::span<const std::byte> payload);
+    void send_ledger_sync(std::uint64_t connection, NodeId peer, JobId job);
+    void refresh_ledger_status();
     void ask_peers(Run& run);
     void ask_next_peer(Run& run);
     void ask_peer(Run& run, Endpoint peer, std::uint16_t flags);
@@ -232,6 +240,10 @@ private:
     CreditRates rates_;                 // ledger.mem_rate
     double ledger_scale_ = 3600;        // ledger.scale, core-seconds
     std::uint64_t cache_share_ = 25;    // mem.cache_share, percent, as the job processes take it
+    Announced announced_;               // what peers said (M5-4): shown and compared only
+    std::set<std::pair<std::uint16_t, std::uint32_t>> disagreeing_;  // (peer, job); 0: totals
+    std::mutex status_mu_;  // ledger_json_, read by the status API's thread
+    std::string ledger_json_ = "{}";
     Nanos last_save_{};
 };
 
