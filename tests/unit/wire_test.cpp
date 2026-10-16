@@ -691,3 +691,20 @@ TEST_CASE("the ledger reports: L_CHUNK and L_SEGMENTS") {
     CHECK(paramesh::wire_decode_l_segments(hex("00 00 00 05 00 00 00 00")).error().code ==
           Errc::kProtocol);
 }
+
+TEST_CASE("the ledger announcement: LEDGER_SYNC") {
+    paramesh::LedgerSyncPayload sync;
+    sync.entries = {{paramesh::JobId{65537}, 10, 20, 30, 40}};
+    const auto bytes =
+        hex("00 01 00 00 00 01 00 01 00 00 00 00 00 00 00 00 00 00 00 0a 00 00 00 00 00 00 00 14 "
+            "00 00 00 00 00 00 00 1e 00 00 00 00 00 00 00 28");
+    CHECK(encoded(sync) == bytes);
+    const auto back = paramesh::wire_decode_ledger_sync(bytes);
+    REQUIRE(back.ok());
+    REQUIRE(back.value().entries.size() == 1);
+    CHECK(back.value().entries[0].job == paramesh::JobId{65537});
+    CHECK(back.value().entries[0].chunks_for_peer == 10);
+    CHECK(back.value().entries[0].segsec_by_peer == 40);
+    CHECK(paramesh::wire_decode_ledger_sync(hex("00 00 00 00")).error().code == Errc::kProtocol);
+    CHECK(paramesh::wire_decode_ledger_sync(hex("00 02 00 00")).error().code == Errc::kProtocol);
+}
