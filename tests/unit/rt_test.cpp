@@ -1057,3 +1057,24 @@ TEST_CASE("a process that leaves asks for no more chunks and is idle when the la
     CHECK(worker.net.take().empty());
     tasks.stop();
 }
+
+TEST_CASE("only threads below the quota ask for chunks, and a raised quota wakes the rest") {
+    Process worker{2};
+    paramesh::TasksConfig config;
+    config.threads = 2;
+    paramesh::Tasks tasks{worker.net, worker.host, worker.sync, config};
+    tasks.set_quota(1);
+    REQUIRE(tasks.start().ok());
+    // One chunk and one prefetched, for thread 0 only.
+    const std::string asked = worker.net.wait(2);
+    CHECK(asked.find("thread 0") != std::string::npos);
+    CHECK(asked.find("thread 1") == std::string::npos);
+    ::usleep(50000);
+    CHECK(worker.net.take().empty());  // thread 1 waits
+
+    tasks.set_quota(2);
+    const std::string more = worker.net.wait(2);
+    CHECK(more.find("thread 1") != std::string::npos);
+    CHECK(more.find("thread 0") == std::string::npos);
+    tasks.stop();
+}

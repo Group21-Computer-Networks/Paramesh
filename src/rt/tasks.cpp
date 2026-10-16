@@ -63,6 +63,7 @@ Tasks::Tasks(Transport& transport, RuntimeHost& host, Sync& sync, const TasksCon
       sync_(sync),
       config_(config),
       launcher_(host.self() == host.launcher()),
+      quota_(config.threads),
       workers_(config.threads) {}
 
 Tasks::~Tasks() {
@@ -143,14 +144,17 @@ void Tasks::work(std::uint16_t thread) {
     Nanos backoff = config_.backoff_initial;
     std::unique_lock hold{mu_};
     while (!stopping_) {
-        while (!me.refused && !me.no_more && me.have.size() + me.asking < 1 + config_.prefetch) {
+        while (thread < quota_ && !me.refused && !me.no_more &&
+               me.have.size() + me.asking < 1 + config_.prefetch) {
             ask(thread);
         }
         if (me.have.empty()) {
-            if (me.asking > 0) {
-                changed_.wait(hold);  // an answer is on its way
-            } else if (me.no_more) {
+            if (me.no_more && me.asking == 0) {
                 return;
+            }
+            if (me.asking > 0 || thread >= quota_) {
+                // An answer is on its way; or, above the quota, until it rises or the job ends.
+                changed_.wait(hold);
             } else {
                 // NO_TASK: the queue is empty for now. Ask again after the back-off; the
                 // launcher's own threads are also woken when chunks are queued.
@@ -165,7 +169,8 @@ void Tasks::work(std::uint16_t thread) {
         const TaskAssignPayload chunk = std::move(me.have.front());
         me.have.pop_front();
         // Ask for the next one now, so it is here when this one ends.
-        while (!me.refused && !me.no_more && me.have.size() + me.asking < config_.prefetch) {
+        while (thread < quota_ && !me.refused && !me.no_more &&
+               me.have.size() + me.asking < config_.prefetch) {
             ask(thread);
         }
         me.running = true;
@@ -280,6 +285,14 @@ void Tasks::leave() {
         worker.no_more = true;
     }
     changed_.notify_all();
+}
+
+void Tasks::set_quota(std::uint16_t threads) {
+    {
+        const std::scoped_lock hold{mu_};
+        quota_ = threads;
+    }
+    changed_.notify_all();  // threads below a raised quota ask again
 }
 
 bool Tasks::idle() {

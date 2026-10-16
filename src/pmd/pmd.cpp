@@ -270,6 +270,16 @@ Result<void> Pmd::open() {
         }
         ledger_ = std::move(ledger).value();
     }
+    // ledger.scale: the balance, in core-seconds, that doubles a peer's weight; and
+    // mem.cache_share, to know the home store's part of --cap-ram.
+    if (const char* scale =
+            std::getenv("PARAMESH_CFG_LEDGER_SCALE")) {  // NOLINT(concurrency-mt-unsafe)
+        ledger_scale_ = std::strtod(scale, nullptr);
+    }
+    if (const char* share =
+            std::getenv("PARAMESH_CFG_MEM_CACHE_SHARE")) {  // NOLINT(concurrency-mt-unsafe)
+        cache_share_ = std::min<std::uint64_t>(std::strtoul(share, nullptr, 10), 100);
+    }
     // ledger.mem_rate: core-seconds of credit for one GB-hour of segments hosted.
     if (const char* rate =
             std::getenv("PARAMESH_CFG_LEDGER_MEM_RATE")) {  // NOLINT(concurrency-mt-unsafe)
@@ -498,6 +508,7 @@ void Pmd::on_spawn_req(Connection& connection, const FrameHeader& header,
     }
     const SpawnReqPayload& request = decoded.value();
     spawn.hash = request.binary_hash;
+    spawn.want = request.threads_per_node;
     const std::string here = " on node " + std::to_string(config_.node.value);
     if (leaving_) {
         decline(spawn, Status::kLeaving,
@@ -594,7 +605,10 @@ void Pmd::on_register(Connection& connection, const FrameHeader& header,
                                       spawn->asked_on,
                                       spawn->asker,
                                       {},
-                                      platform_.clock->now()});
+                                      platform_.clock->now(),
+                                      spawn->want,
+                                      0,
+                                      0});
         }
         spawns_.erase(spawn);
     }
@@ -603,8 +617,16 @@ void Pmd::on_register(Connection& connection, const FrameHeader& header,
         run->members.assign(
             1, SegMapMember{config_.node, Slot{0}, kMemberLauncher, 0, process.data_port, 0});
     }
+    share_slots(connection.id);  // its share comes in this reply, the others' are pushed
+    std::uint16_t slots = config_.cap_cores;  // a process this node has no job for: all
+    for (const Worker& w : workers_) {
+        slots = w.local == connection.id ? w.slots : slots;
+    }
+    if (const Run* run = run_of(header.job); run != nullptr && run->launcher == connection.id) {
+        slots = run->slots;
+    }
     reply(connection.id, Opcode::kLQuota, header.job, kNoNode, kNoReq,
-          LQuotaPayload{config_.cap_cores, config_.cap_ram});
+          LQuotaPayload{slots, config_.cap_ram});
     platform_.logger->log(LogLevel::kInfo, "register",
                           JsonObject{{"job", JsonValue{std::int64_t{header.job.value}}},
                                      {"pid", JsonValue{std::int64_t{process.pid}}},
@@ -942,6 +964,7 @@ void Pmd::on_admit_req(Connection& connection, const FrameHeader& header,
     }
     run->wants = wants.value();
     run->admitting = true;
+    share_slots();  // its thread bound is known now; the share goes out in L_ADMIT_OK
     run->unlimited = config_.cap_ram == 0;
     run->committed = config_.cap_ram + config_.spill_budget;
 
@@ -1111,8 +1134,9 @@ void Pmd::finish_admission(Run& run) {
         return;
     }
     run.admitting = false;
+    run.answered = true;
     reply(run.launcher, Opcode::kLAdmitOk, run.job, kNoNode, kNoReq,
-          LAdmitOkPayload{config_.cap_cores, run.members});
+          LAdmitOkPayload{run.slots, run.members});
     platform_.logger->log(
         LogLevel::kInfo, "admitted",
         JsonObject{{"job", JsonValue{std::int64_t{run.job.value}}},
@@ -1185,6 +1209,7 @@ void Pmd::on_chunk(const Connection& connection, const FrameHeader& header,
         return;
     }
     const LChunkPayload& c = chunk.value();
+    share_slots();  // a chunk ended: a task boundary, where a slot may change hands
     const bool ours =
         std::any_of(workers_.begin(), workers_.end(),
                     [&](const Worker& w) { return w.local == connection.id; }) ||
@@ -1221,6 +1246,7 @@ void Pmd::on_segments(const Connection& connection, const FrameHeader& header,
         accrue(run->job, config_.node, run->segments, run->since);
         run->segments = std::move(segments).value().entries;
     }
+    share_slots();  // the home-store RAM a job holds here has changed
 }
 
 // Segment-seconds from `since` until now. On a worker's node, the segments this node hosts for
@@ -1238,6 +1264,65 @@ void Pmd::accrue(JobId job, NodeId launcher, std::vector<LSegmentsEntry>& segmen
             ledger_->add_segment_seconds(launcher, job, Direction::kForPeer, hosted);
         } else if (launcher == config_.node && entry.node != config_.node) {
             ledger_->add_segment_seconds(entry.node, job, Direction::kByPeer, hosted);
+        }
+    }
+}
+
+// ---- worker slots (M5-3) ----------------------------------------------------------------------
+
+namespace {
+
+// The part of `home` bytes of home-store RAM that the segments a job has homed on `self` take.
+double ram_share(const std::vector<LSegmentsEntry>& segments, NodeId self, std::uint64_t home) {
+    std::uint64_t held = 0;
+    for (const LSegmentsEntry& entry : segments) {
+        held += entry.node == self ? std::uint64_t{entry.segments} * kSegmentSize : 0;
+    }
+    return home == 0 ? 0 : std::min(1.0, static_cast<double>(held) / static_cast<double>(home));
+}
+
+}  // namespace
+
+// Shares this node's worker slots among its jobs (pmd/scheduler.h) and tells each process
+// whose share changed with L_QUOTA; a launcher only once its admission is answered. The process
+// `registering` gets its share in the reply to its L_REGISTER instead.
+void Pmd::share_slots(std::uint64_t registering) {
+    struct Holder {
+        std::uint64_t connection;
+        JobId job;
+        std::uint16_t* slots;
+        std::uint32_t* waited;
+        bool may_push;
+    };
+    const std::uint64_t home = config_.cap_ram - config_.cap_ram * cache_share_ / 100;
+    const auto want = [this](std::uint16_t bound) {
+        return bound == 0 ? config_.cap_cores : std::min(bound, config_.cap_cores);
+    };
+    std::vector<SlotDemand> demands;
+    std::vector<Holder> holders;
+    for (Run& run : runs_) {
+        if (run.launcher != 0) {
+            demands.push_back({true, want(run.wants.threads_per_node),
+                               ram_share(run.segments, config_.node, home), 1, run.waited});
+            holders.push_back({run.launcher, run.job, &run.slots, &run.waited, run.answered});
+        }
+    }
+    for (Worker& w : workers_) {
+        const double weight = ledger_ ? slot_weight(*ledger_, w.launcher, ledger_scale_) : 1.0;
+        demands.push_back(
+            {false, want(w.want), ram_share(w.segments, config_.node, home), weight, w.waited});
+        holders.push_back({w.local, w.job, &w.slots, &w.waited, true});
+    }
+    const std::vector<std::uint16_t> slots = allocate_slots(config_.cap_cores, demands);
+    for (std::size_t i = 0; i < holders.size(); i++) {
+        const Holder& h = holders[i];
+        *h.waited = slots[i] == 0 ? *h.waited + 1 : 0;
+        if (slots[i] != *h.slots) {
+            *h.slots = slots[i];
+            if (h.may_push && h.connection != registering) {
+                reply(h.connection, Opcode::kLQuota, h.job, kNoNode, kNoReq,
+                      LQuotaPayload{slots[i], config_.cap_ram});
+            }
         }
     }
 }
@@ -1292,6 +1377,7 @@ void Pmd::on_closed(const Connection& connection) {
         }
         return run.launcher == connection.id || (run.launcher == 0 && run.pmrun == 0);
     });
+    share_slots();  // a job may have ended here: its slots go to the others
 }
 
 // Collects the workers that have exited. One that never registered is reported to its asker.

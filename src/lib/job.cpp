@@ -318,22 +318,33 @@ public:
                 return PM_ERR_NETWORK;
             }
         }
-        // The job is up: start this process's worker threads. Their number is the program's
-        // own bound, never above the quota from pmd. Without pmd there is no quota, and a
-        // program with no bound gets one thread for each processor here.
+        // The job is up: start this process's worker threads, as many as it may ever use: the
+        // program's own bound, or one for each processor here. Of those, only as many as the
+        // quota from pmd take chunks, and pmd may change it while the job runs (M5-3). Without
+        // pmd there is no quota.
         // ponytail: the default grain takes every node to have as many threads as this one;
         // L_ADMIT_OK does not carry the other nodes' quotas.
-        std::uint32_t most = quota_ != 0 ? quota_ : std::thread::hardware_concurrency();
-        if (threads != 0) {
-            most = std::min(most, threads);
+        const std::uint32_t started = threads != 0 ? threads : std::thread::hardware_concurrency();
+        std::uint32_t quota = 0;
+        {
+            const std::lock_guard<std::mutex> lock{quota_mu_};
+            quota = quota_;
         }
         TasksConfig tasks;
         tasks.threads =
-            static_cast<std::uint16_t>(std::clamp<std::uint32_t>(most, 1, kHookThreads - 1));
-        tasks.total_slots = static_cast<std::uint32_t>(tasks.threads * s_.members.size());
+            static_cast<std::uint16_t>(std::clamp<std::uint32_t>(started, 1, kHookThreads - 1));
+        tasks.total_slots = static_cast<std::uint32_t>(
+            std::clamp<std::uint32_t>(pmd_fd_ < 0 ? started : std::min(started, quota), 1,
+                                      kHookThreads - 1) *
+            s_.members.size());
         tasks.region_bytes = region_bytes_;
         tasks.affinity = s_.affinity;
         tasks_.emplace(*net_, *this, *sync_, tasks);
+        if (pmd_fd_ >= 0) {  // before the threads start, or they would ask for chunks first
+            const std::lock_guard<std::mutex> lock{quota_mu_};
+            tasks_ready_ = true;
+            tasks_->set_quota(static_cast<std::uint16_t>(std::min<std::uint32_t>(quota_, 65535)));
+        }
         return tasks_->start().ok() ? PM_OK : PM_ERR_PLATFORM;
     }
 
@@ -924,7 +935,16 @@ private:
                 }
                 return;
             }
-            if (frame.value().header.opcode == Opcode::kLLeave) {
+            if (frame.value().header.opcode == Opcode::kLQuota) {  // a new share (M5-3)
+                const Result<LQuotaPayload> quota = wire_decode_l_quota(frame.value().payload);
+                const std::lock_guard<std::mutex> lock{quota_mu_};
+                if (quota.ok()) {
+                    quota_ = quota.value().threads;
+                    if (tasks_ready_ && tasks_.has_value()) {
+                        tasks_->set_quota(quota.value().threads);
+                    }
+                }
+            } else if (frame.value().header.opcode == Opcode::kLLeave) {
                 on_network_thread([this] { begin_leave(); });
             } else if (frame.value().header.opcode == Opcode::kLMember) {
                 const Result<LMemberPayload> joined = wire_decode_l_member(frame.value().payload);
@@ -2210,6 +2230,8 @@ private:
     bool reports_stop_ = false;
     std::thread report_thread_;  // write_reports()
     std::uint32_t quota_ = 0;    // the thread quota pmd gave; 0 without pmd
+    std::mutex quota_mu_;        // quota_ and tasks_ready_, between main() and watch_pmd()
+    bool tasks_ready_ = false;   // tasks_ is started: a new quota goes to it
     std::uint64_t ram_ = 0;      // the RAM cap pmd gave; 0 without pmd
     std::size_t segments_ = 0;
     RegionAllocator allocator_{0};
