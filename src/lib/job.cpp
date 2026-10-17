@@ -654,6 +654,8 @@ public:
             if (evicting_) {
                 continue;  // a leaving node serves no more faults (STATE_MACHINES.md, 1.6)
             }
+            faults_taken_++;  // for L_STATS (M6-1): counted, and timed until installed
+            fault_started_.try_emplace(fault.page.value, net_->now());
             node_event(fault.kind == FaultKind::kRead ? NodeEventKind::kNeedRead
                                                       : NodeEventKind::kNeedWrite,
                        fault.page, kNoReq, {}, false);
@@ -873,12 +875,67 @@ private:
         if (pmd_fd_ < 0 || !size.ok()) {
             return;
         }
+        queue_report(opcode, {bytes.begin(), bytes.begin() + static_cast<long>(size.value())});
+    }
+
+    void queue_report(Opcode opcode, std::vector<std::byte> payload) noexcept {
+        if (pmd_fd_ < 0) {
+            return;
+        }
         {
             const std::lock_guard<std::mutex> lock{report_mu_};
-            reports_.push_back(
-                Report{opcode, {bytes.begin(), bytes.begin() + static_cast<long>(size.value())}});
+            reports_.push_back(Report{opcode, std::move(payload)});
         }
         report_ready_.notify_one();
+    }
+
+    // ---- the status API's counts (M6-1) ---------------------------------------------------------
+
+    // A fault's page is installed or woken: how long that took, in its power-of-two bucket.
+    void fault_ended(PageId page) noexcept {
+        const auto started = fault_started_.find(page.value);
+        if (started == fault_started_.end()) {
+            return;
+        }
+        const auto us =
+            std::chrono::duration_cast<std::chrono::microseconds>(net_->now() - started->second);
+        fault_started_.erase(started);
+        std::size_t bucket = 0;
+        while (bucket + 1 < kLatencyBuckets && (std::int64_t{1} << bucket) <= us.count()) {
+            bucket++;
+        }
+        latency_.at(bucket)++;
+    }
+
+    // L_STATS, once a second while the job runs: the counts, and the pages held per segment.
+    // ponytail: every page of the region is looked at each second; fine for the regions tested
+    // (up to a few hundred MB), a count kept per segment if a region of GB makes it slow.
+    void send_stats() noexcept {
+        LStatsPayload stats;
+        stats.faults = faults_taken_;
+        stats.pages_in = pages_in_;
+        stats.pages_out = pages_out_;
+        stats.retries = sent_again_;
+        stats.latency = latency_;
+        for (std::size_t s = 0; s < homes_.size(); s++) {
+            LStatsSegment entry{SegmentId{static_cast<std::uint32_t>(s)},
+                                slot_node_.at(homes_[s].value), 0, 0};
+            for (std::size_t p = s * kPagesPerSegment;
+                 p < (s + 1) * kPagesPerSegment && p < states_.size(); p++) {
+                entry.shared = static_cast<std::uint16_t>(
+                    entry.shared + (states_[p] == PageState::kShared ? 1 : 0));
+                entry.modified = static_cast<std::uint16_t>(
+                    entry.modified + (states_[p] == PageState::kModified ? 1 : 0));
+            }
+            if (entry.home == s_.self || entry.shared != 0 || entry.modified != 0) {
+                stats.segments.push_back(entry);
+            }
+        }
+        std::vector<std::byte> bytes(100 + 12 * stats.segments.size());
+        if (const Result<std::size_t> size = wire_encode(stats, bytes); size.ok()) {
+            queue_report(Opcode::kLStats, std::move(bytes));
+        }
+        after(std::chrono::seconds{1}, [this] { send_stats(); });
     }
 
     // L_SEGMENTS: how many segments each member of `map` is home for.
@@ -1005,6 +1062,9 @@ private:
         }
         early_leavers_.clear();
         on_network_thread([this] { try_join(); });  // a node offered while the job started
+        if (pmd_fd_ >= 0) {
+            on_network_thread([this] { send_stats(); });  // and then once a second
+        }
     }
 
     // Launcher: places the segments, applies the map at the next epoch and sends it to every
@@ -1882,6 +1942,7 @@ private:
                     put_u64(buffer, 0, page.value);
                     if (a.with_page) {
                         ok = mem_->read(page, std::span{buffer}.last<kPageSize>()).ok();
+                        pages_out_++;
                     }
                     post(a.kind == NodeActionKind::kReply && from != kNoNode ? from : home_of(page),
                          a.opcode, std::span{buffer}.first(a.with_page ? buffer.size() : 8), a.req,
@@ -1901,6 +1962,7 @@ private:
                                            : PageProtection::kReadOnly)
                              .ok();
                     cache_->note_installed(page);
+                    fault_ended(page);
                     break;
                 }
                 case NodeActionKind::kWriteProtect:
@@ -1915,6 +1977,7 @@ private:
                     break;
                 case NodeActionKind::kWake:
                     ok = mem_->wake(page).ok();
+                    fault_ended(page);
                     break;
                 case NodeActionKind::kArmResend:  // BUSY_RETRY or REDIRECT: again, later
                     after(backoff(page.value), [this, page] {
@@ -2090,6 +2153,7 @@ private:
                    copied != Done::kYes) {
             return copied;
         }
+        pages_out_ += size == buffer.size() && a.to != s_.self ? 1U : 0U;
         post(a.to, a.opcode, std::span{buffer}.first(size), a.req, flags);
         return Done::kYes;
     }
@@ -2250,6 +2314,10 @@ private:
     std::unordered_map<std::uint64_t, ReqId> current_;
     std::deque<Local> local_;
     std::uint64_t pages_in_ = 0;
+    std::uint64_t pages_out_ = 0;                             // pages sent to other nodes (L_STATS)
+    std::uint64_t faults_taken_ = 0;                          // faults handled (L_STATS)
+    std::array<std::uint32_t, kLatencyBuckets> latency_{};    // fault to install, by bucket
+    std::unordered_map<std::uint64_t, Nanos> fault_started_;  // pages faulted, not yet served
     std::uint64_t sent_again_ = 0;  // requests answered BUSY_RETRY or REDIRECT
     // Events held back until the local cache has room (M4-2), in the order they came.
     struct Held {

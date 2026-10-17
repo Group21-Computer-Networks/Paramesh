@@ -2200,3 +2200,113 @@ TEST_CASE("after a job both daemons' /v1/ledger agree, and LEDGER_SYNC says so" 
     CHECK(std::get<bool>(by_two.at("disagree").v) == false);
     CHECK(std::get<bool>(for_one.at("disagree").v) == false);
 }
+
+namespace {
+
+// Reads a streamed reply from the status API for `seconds`: GET `path`, everything that came.
+std::string read_stream(std::uint16_t port, const char* path, double seconds) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    to.sin_port = htons(port);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API
+    if (fd < 0 || ::connect(fd, reinterpret_cast<const sockaddr*>(&to), sizeof to) != 0) {
+        return {};
+    }
+    const std::string request = std::string{"GET "} + path +
+                                " HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n\r\n";
+    static_cast<void>(::send(fd, request.data(), request.size(), MSG_NOSIGNAL));
+    std::string got;
+    const auto until = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds{static_cast<int>(seconds * 1000)};
+    while (std::chrono::steady_clock::now() < until) {
+        pollfd ready{fd, POLLIN, 0};
+        if (::poll(&ready, 1, 100) == 1) {
+            std::array<char, 4096> chunk{};
+            const ssize_t n = ::recv(fd, chunk.data(), chunk.size(), 0);
+            if (n <= 0) {
+                break;
+            }
+            got.append(chunk.data(), static_cast<std::size_t>(n));
+        }
+    }
+    ::close(fd);
+    return got;
+}
+
+bool wait_file_for(const std::string& path, int seconds) {
+    for (int tenths = 0; tenths < seconds * 10 && !std::filesystem::exists(path); tenths++) {
+        ::usleep(100000);
+    }
+    return std::filesystem::exists(path);
+}
+
+std::string status_get(const Daemon& daemon, const std::string& path) {
+    const auto body = paramesh::http_get(daemon.pmd.http_port(), path);
+    return body.ok() ? body.value() : std::string{};
+}
+
+}  // namespace
+
+TEST_CASE("the status API: jobs, their pages and a stream of events" *
+          doctest::skip(!region_can_be_mapped())) {
+    const ThreeNodes nodes;
+    const std::string report = nodes.reports + "/program";
+    const pid_t pmrun = start_pmrun({"-n", "3", "--state-dir", nodes.one.state_dir, own_path(),
+                                     "--as-program", report, "until-stop"});
+    REQUIRE(wait_file_for(report + ".three", 180));
+    // The launcher's daemon and a worker's each list the job, with counts that grow.
+    std::string launcher;
+    std::string worker;
+    for (int tenths = 0; tenths < 50; tenths++) {
+        launcher = status_get(nodes.one, "/v1/jobs");
+        worker = status_get(nodes.two, "/v1/jobs");
+        if (launcher.find("\"faults\":0") == std::string::npos &&
+            worker.find("\"faults\":0") == std::string::npos &&
+            launcher.find(R"("role":"launcher")") != std::string::npos &&
+            worker.find(R"("role":"worker")") != std::string::npos) {
+            break;
+        }
+        ::usleep(100000);
+    }
+    INFO(launcher);
+    INFO(worker);
+    CHECK(launcher.find("\"role\":\"launcher\"") != std::string::npos);
+    CHECK(worker.find("\"role\":\"worker\"") != std::string::npos);
+    CHECK(worker.find("\"launcher\":1") != std::string::npos);
+    CHECK(worker.find("\"faults\":0,") == std::string::npos);       // it has faulted, and says so
+    CHECK(worker.find("\"below_us\":32768") == std::string::npos);  // the last bucket has no bound
+    CHECK(worker.find("\"below_us\":-1") != std::string::npos);
+    CHECK(worker.find("\"p50_us\":") != std::string::npos);
+    CHECK(worker.find("\"mb_in_per_s\":") != std::string::npos);
+    const std::string job = "65537";
+    const std::string pages = status_get(nodes.two, "/v1/jobs/" + job + "/pages");
+    INFO(pages);
+    CHECK(pages.find("\"job\":" + job) != std::string::npos);
+    CHECK(pages.find("\"home_here\":true") != std::string::npos);  // node 2 is home for some
+    // A job not on this node: 404, which http_get reports as a failed request.
+    CHECK_FALSE(paramesh::http_get(nodes.two.pmd.http_port(), "/v1/jobs/12345/pages").ok());
+
+    // Events, in order: the rates of the job each second; then, after the job ends, its end,
+    // within about a second; and a node that comes, as a join.
+    const std::string before = read_stream(nodes.one.pmd.http_port(), "/v1/events", 2.5);
+    INFO(before);
+    CHECK(before.find("text/event-stream") != std::string::npos);
+    CHECK(before.find("event: stats\ndata: ") != std::string::npos);
+    CHECK(before.find("\"job\":" + job) != std::string::npos);
+    std::string after;
+    std::thread listen{[&] { after = read_stream(nodes.one.pmd.http_port(), "/v1/events", 5); }};
+    ::usleep(300000);
+    const std::ofstream stop{report + ".stop"};  // the program ends its rounds
+    REQUIRE(exit_status(pmrun, 120) == 0);
+    const Daemon four{4, {}, [&nodes](paramesh::PmdConfig& c) {
+                          c.peers.push_back(nodes.one.endpoint());
+                          c.peer_discovery_ports.push_back(nodes.one.pmd.discovery_port());
+                      }};
+    listen.join();
+    INFO(after);
+    CHECK(after.find("event: job_end\ndata: {\"job\":" + job + "}") != std::string::npos);
+    CHECK(after.find("event: join\ndata: {\"peer\":4}") != std::string::npos);
+    CHECK(status_get(nodes.one, "/v1/jobs").find("\"jobs\":[]") != std::string::npos);
+}

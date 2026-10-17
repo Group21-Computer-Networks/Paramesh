@@ -230,6 +230,11 @@ Pmd::~Pmd() {
     for (const Connection& connection : connections_) {
         ::close(connection.fd);
     }
+    {
+        const std::scoped_lock hold{status_mu_};
+        streams_end_ = true;  // event streams return, so the server can stop
+    }
+    events_changed_.notify_all();
     platform_.http->stop();
     for (const int fd : {control_listener_, local_listener_, stop_fd_, discovery_}) {
         if (fd >= 0) {
@@ -335,6 +340,22 @@ Result<void> Pmd::open() {
     if (const Result<void> discovery = open_discovery(); !discovery.ok()) {
         return discovery;
     }
+    platform_.http->get("/v1/jobs", [this](std::string_view /*path*/) {
+        const std::scoped_lock hold{status_mu_};
+        return HttpResponse{200, "application/json", jobs_json_};
+    });
+    platform_.http->get(R"(/v1/jobs/(\d+)/pages)", [this](std::string_view path) {
+        const std::uint32_t job = static_cast<std::uint32_t>(
+            std::strtoul(std::string{path.substr(9)}.c_str(), nullptr, 10));  // "/v1/jobs/"
+        const std::scoped_lock hold{status_mu_};
+        const auto found = pages_json_.find(job);
+        return found == pages_json_.end()
+                   ? HttpResponse{404, "application/json", R"({"error":"no such job here"})"}
+                   : HttpResponse{200, "application/json", found->second};
+    });
+    platform_.http->get_stream(
+        "/v1/events", "text/event-stream",
+        [this](std::string_view /*path*/, const HttpWrite& write) { stream_events(write); });
     platform_.http->get("/v1/ledger", [this](std::string_view /*path*/) {
         const std::scoped_lock hold{status_mu_};
         return HttpResponse{200, "application/json", ledger_json_};
@@ -428,6 +449,7 @@ void Pmd::run() {
         reap();
         if (platform_.clock->now() - last_save_ >= kLedgerSaveEvery) {
             save_ledger();
+            tick_status();
         }
     }
 }
@@ -491,6 +513,8 @@ void Pmd::handle(Connection& connection, const FrameHeader& header,
         on_chunk(connection, header, payload);
     } else if (connection.local && header.opcode == Opcode::kLSegments) {
         on_segments(connection, header, payload);
+    } else if (connection.local && header.opcode == Opcode::kLStats) {
+        on_stats(connection, header, payload);
     } else if (!connection.local && header.opcode == Opcode::kLedgerSync) {
         on_ledger_sync(header, payload);
     } else if (!connection.local && header.opcode == Opcode::kLeaveIntent) {
@@ -615,7 +639,8 @@ void Pmd::on_register(Connection& connection, const FrameHeader& header,
                                       platform_.clock->now(),
                                       spawn->want,
                                       0,
-                                      0});
+                                      0,
+                                      {}});
         }
         spawns_.erase(spawn);
     }
@@ -1343,6 +1368,135 @@ void Pmd::refresh_ledger_status() {
         platform_.json->encode(ledger_status(*ledger_, announced_, config_.node, ledger_scale_));
     const std::scoped_lock hold{status_mu_};
     ledger_json_ = std::move(json);
+}
+
+// ---- the status API: jobs, pages, events (M6-1)
+// --------------------------------------------------
+
+// L_STATS from a job process here: kept, two at a time, for counts and rates.
+void Pmd::on_stats(const Connection& connection, const FrameHeader& header,
+                   std::span<const std::byte> payload) {
+    Result<LStatsPayload> stats = wire_decode_l_stats(payload);
+    if (!stats.ok()) {
+        return;
+    }
+    const Nanos now = platform_.clock->now();
+    for (Worker& w : workers_) {
+        if (w.local == connection.id) {
+            w.stats.take(stats.value(), now);
+        }
+    }
+    if (Run* run = run_of(header.job); run != nullptr && run->launcher == connection.id) {
+        run->stats.take(std::move(stats).value(), now);
+    }
+}
+
+std::vector<JobView> Pmd::job_views() const {
+    std::vector<JobView> views;
+    for (const Run& run : runs_) {
+        if (run.launcher != 0) {
+            views.push_back({run.job, true, config_.node, run.slots, &run.stats});
+        }
+    }
+    for (const Worker& w : workers_) {
+        views.push_back({w.job, false, w.launcher, w.slots, &w.stats});
+    }
+    return views;
+}
+
+// Once a second: the JSON the status API serves, remade on pmd's thread; and the events of the
+// second: the rates of every job here, and peers and jobs that came or went since the last.
+void Pmd::tick_status() {
+    const std::vector<JobView> views = job_views();
+    JsonArray jobs;
+    JsonArray rates;
+    std::map<std::uint32_t, std::string> pages;
+    std::set<std::uint32_t> jobs_now;
+    for (const JobView& view : views) {
+        jobs.push_back(job_status(view));
+        rates.push_back(job_rates(view));
+        pages[view.job.value] = platform_.json->encode(pages_status(view, config_.node));
+        jobs_now.insert(view.job.value);
+    }
+    std::set<std::uint16_t> peers_now;
+    {
+        const std::scoped_lock hold{peers_mu_};
+        for (const Peer& peer : table_->peers()) {
+            peers_now.insert(peer.node.value);
+        }
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();  // wall-clock time, for the reader
+    std::vector<std::string> fresh;
+    const auto changes = [&](const auto& before, const auto& after, const char* came,
+                             const char* went, const char* key) {
+        for (const auto id : after) {
+            if (!before.contains(id)) {
+                fresh.push_back(sse_event(
+                    came, platform_.json->encode(JsonValue{
+                              JsonObject{{key, JsonValue{static_cast<std::int64_t>(id)}}}})));
+            }
+        }
+        for (const auto id : before) {
+            if (!after.contains(id)) {
+                fresh.push_back(sse_event(
+                    went, platform_.json->encode(JsonValue{
+                              JsonObject{{key, JsonValue{static_cast<std::int64_t>(id)}}}})));
+            }
+        }
+    };
+    changes(seen_peers_, peers_now, "join", "leave", "peer");
+    changes(seen_jobs_, jobs_now, "job_start", "job_end", "job");
+    seen_peers_ = std::move(peers_now);
+    seen_jobs_ = std::move(jobs_now);
+    fresh.push_back(sse_event("stats", platform_.json->encode(JsonValue{JsonObject{
+                                           {"node", JsonValue{std::int64_t{config_.node.value}}},
+                                           {"time_ms", JsonValue{static_cast<std::int64_t>(ms)}},
+                                           {"jobs", JsonValue{std::move(rates)}}}})));
+    std::string jobs_json = platform_.json->encode(
+        JsonValue{JsonObject{{"node", JsonValue{std::int64_t{config_.node.value}}},
+                             {"jobs", JsonValue{std::move(jobs)}}}});
+    {
+        const std::scoped_lock hold{status_mu_};
+        jobs_json_ = std::move(jobs_json);
+        pages_json_ = std::move(pages);
+        for (std::string& event : fresh) {
+            events_.push_back(std::move(event));
+        }
+        // ponytail: the last 600 events are kept (minutes of a quiet pool); a stream that
+        // falls further behind skips to the oldest kept.
+        while (events_.size() > 600) {
+            events_.erase(events_.begin());
+            events_before_++;
+        }
+    }
+    events_changed_.notify_all();
+}
+
+// GET /v1/events, on a server thread: every event from now on, until the client goes or pmd
+// stops.
+void Pmd::stream_events(const HttpWrite& write) {
+    std::unique_lock hold{status_mu_};
+    std::uint64_t next = events_before_ + events_.size();  // only what comes after
+    hold.unlock();
+    if (!write("retry: 1000\n\n")) {
+        return;
+    }
+    hold.lock();
+    while (!streams_end_) {
+        events_changed_.wait_for(hold, std::chrono::seconds{2});
+        next = std::max(next, events_before_);
+        std::string pending;
+        for (; next < events_before_ + events_.size(); next++) {
+            pending += events_[next - events_before_];
+        }
+        hold.unlock();
+        if (!pending.empty() && !write(pending)) {
+            return;  // the client has gone
+        }
+        hold.lock();
+    }
 }
 
 // ---- worker slots (M5-3) ----------------------------------------------------------------------
