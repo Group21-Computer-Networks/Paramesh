@@ -19,6 +19,7 @@
 #include "platform/factory.h"
 #include "platform/ids.h"
 #include "platform/result.h"
+#include "pmd/job_status.h"
 #include "pmd/ledger.h"
 #include "pmd/ledger_status.h"
 #include "pmd/peers.h"
@@ -29,6 +30,7 @@
 #include <sys/types.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -129,6 +131,7 @@ private:
         std::uint16_t want = 0;    // threads_per_node; 0 for no bound
         std::uint16_t slots = 0;   // its share of this node's worker slots, as last told
         std::uint32_t waited = 0;  // share-outs in a row it had none at
+        JobStats stats;            // its last two L_STATS (M6-1)
     };
 
     // A job launched on this node, from L_RUN_REQ until its launcher has gone.
@@ -151,6 +154,7 @@ private:
         std::uint32_t waited = 0;  // share-outs in a row it had none at
         bool answered = false;     // L_ADMIT_OK is sent: quotas may be pushed to it
         std::map<std::uint16_t, std::uint64_t> links;  // each member's pmd: its connection
+        JobStats stats;                                // its launcher's last two L_STATS (M6-1)
     };
     // One SPAWN_REQ this daemon sent and has no answer to.
     struct Ask {
@@ -179,6 +183,11 @@ private:
     void on_ledger_sync(const FrameHeader& header, std::span<const std::byte> payload);
     void send_ledger_sync(std::uint64_t connection, NodeId peer, JobId job);
     void refresh_ledger_status();
+    void on_stats(const Connection& connection, const FrameHeader& header,
+                  std::span<const std::byte> payload);
+    void tick_status();
+    std::vector<JobView> job_views() const;
+    void stream_events(const HttpWrite& write);
     void ask_peers(Run& run);
     void ask_next_peer(Run& run);
     void ask_peer(Run& run, Endpoint peer, std::uint16_t flags);
@@ -244,6 +253,14 @@ private:
     std::set<std::pair<std::uint16_t, std::uint32_t>> disagreeing_;  // (peer, job); 0: totals
     std::mutex status_mu_;  // ledger_json_, read by the status API's thread
     std::string ledger_json_ = "{}";
+    std::string jobs_json_ = "{\"jobs\":[]}";          // GET /v1/jobs (M6-1)
+    std::map<std::uint32_t, std::string> pages_json_;  // GET /v1/jobs/{id}/pages, by job
+    std::vector<std::string> events_;                  // /v1/events, the newest last
+    std::uint64_t events_before_ = 0;                  // events dropped from the front
+    std::condition_variable events_changed_;
+    bool streams_end_ = false;            // pmd is stopping: streams return
+    std::set<std::uint16_t> seen_peers_;  // at the last tick: for join/leave
+    std::set<std::uint32_t> seen_jobs_;
     Nanos last_save_{};
 };
 

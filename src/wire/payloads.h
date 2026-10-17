@@ -259,6 +259,23 @@ struct LSegmentsPayload {
     std::vector<LSegmentsEntry> entries;  // 1 to 8
 };
 
+// L_STATS: a job process's counts and the pages it holds, once a second (M6-1).
+inline constexpr std::size_t kLatencyBuckets = 16;  // count i: below 2^i us; the last: the rest
+struct LStatsSegment {
+    SegmentId segment;
+    NodeId home;
+    std::uint16_t shared = 0;
+    std::uint16_t modified = 0;
+};
+struct LStatsPayload {
+    std::uint64_t faults = 0;
+    std::uint64_t pages_in = 0;
+    std::uint64_t pages_out = 0;
+    std::uint64_t retries = 0;
+    std::array<std::uint32_t, kLatencyBuckets> latency{};
+    std::vector<LStatsSegment> segments;  // 0 to 2,048
+};
+
 // L_MEMBER: a node spawned for a running job (M4-7), one member entry with slot 0.
 struct LMemberPayload {
     SegMapMember member;
@@ -364,6 +381,8 @@ Result<std::size_t> wire_encode(const LLeaveReqPayload& payload, std::span<std::
 Result<RedirectPayload> wire_decode_redirect(std::span<const std::byte> in);
 Result<LeaveIntentPayload> wire_decode_leave_intent(std::span<const std::byte> in);
 Result<std::size_t> wire_encode(const LMemberPayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const LStatsPayload& payload, std::span<std::byte> out);
+Result<LStatsPayload> wire_decode_l_stats(std::span<const std::byte> in);
 Result<std::size_t> wire_encode(const LedgerSyncPayload& payload, std::span<std::byte> out);
 Result<LedgerSyncPayload> wire_decode_ledger_sync(std::span<const std::byte> in);
 Result<std::size_t> wire_encode(const LChunkPayload& payload, std::span<std::byte> out);

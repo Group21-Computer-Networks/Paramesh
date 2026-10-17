@@ -70,6 +70,7 @@ enum class Opcode : std::uint8_t {
     kLChunk = 0x84,
     kLSegments = 0x85,
     kLJobEnd = 0x86,
+    kLStats = 0x87,
     kLQuota = 0x90,
     kLLeave = 0x91,
     kLAbort = 0x92,

@@ -140,7 +140,7 @@ The High-Level Design lists 39 opcodes and all of them are here. `SPAWN_DECLINE`
 | `0x70` | `SEG_MIGRATE` | Data | leaver → new home | `SEG_MIGRATE_DONE` after the last batch |
 | `0x71` | `SEG_MIGRATE_DONE` | Data | new home → leaver | is a reply |
 | `0x72` | `LEAVE_DONE` | Data | leaver → launcher | `JOB_END` with status `LEFT` |
-| `0x80`–`0x86` | `L_REGISTER` … `L_JOB_END` | Local | job process → `pmd`, and its replies | section 9 |
+| `0x80`–`0x87` | `L_REGISTER` … `L_STATS` | Local | job process → `pmd`, and its replies | section 9 |
 | `0x90`–`0x94` | `L_QUOTA` … `L_MEMBER` | Local | `pmd` → job process | section 9 |
 | `0xA0`–`0xA4` | `L_RUN_REQ` … `L_LEAVE_REPLY` | Local | tool ↔ `pmd` | section 9 |
 
@@ -839,6 +839,34 @@ The job has ended on this node. The process exits afterwards.
 | 4 | var | `message` | `str16`. |
 
 Fixed part: 4 bytes. Size: 6 to 518 bytes.
+
+### `L_STATS` — 0x87
+
+Sent once a second by a job process, for the status API (M6-1): its counts since it started,
+and the pages it holds.
+
+| Offset | Size | Field | Meaning |
+| --- | --- | --- | --- |
+| 0 | 8 | `faults` | Page faults taken. |
+| 8 | 8 | `pages_in` | Pages, or rights to pages, received from other nodes. |
+| 16 | 8 | `pages_out` | Pages sent to other nodes. |
+| 24 | 8 | `retries` | Requests sent again after `BUSY_RETRY` or `REDIRECT`. |
+| 32 | 64 | `latency` | 16 `u32` counts of faults by the time from the fault to its page being installed or woken: count *i* is for times below 2^*i* µs and at least 2^(*i*-1) µs (count 0: below 1 µs); count 15 also holds every longer time. |
+| 96 | 2 | `segment_count` | Number of entries that follow, 0 to 2,048. |
+| 98 | 2 | reserved | |
+| 100 | var | `segments` | `segment_count` entries of 12 bytes, below: the segments this process is home for or holds a page of. |
+
+One segment entry:
+
+| Offset | Size | Field | Meaning |
+| --- | --- | --- | --- |
+| 0 | 4 | `segment` | Segment number. |
+| 4 | 2 | `home` | Node ID of its home under the current map. |
+| 6 | 2 | `shared` | Pages of it this process holds read-only (S). |
+| 8 | 2 | `modified` | Pages of it this process holds writable (M). |
+| 10 | 2 | reserved | |
+
+Fixed part: 100 bytes. Size: 100 + 12 × `segment_count`, at most 24,676 bytes.
 
 ### `pmd` → job process
 

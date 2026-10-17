@@ -40,7 +40,7 @@ constexpr std::array kOpcodes = {
     Opcode::kLAdmitRefused, Opcode::kLChunk,       Opcode::kLSegments,    Opcode::kLJobEnd,
     Opcode::kLQuota,        Opcode::kLLeave,       Opcode::kLAbort,       Opcode::kLLeaveIntent,
     Opcode::kLMember,       Opcode::kLRunReq,      Opcode::kLRunOk,       Opcode::kLRunRefused,
-    Opcode::kLLeaveReq,     Opcode::kLLeaveReply,
+    Opcode::kLLeaveReq,     Opcode::kLLeaveReply,  Opcode::kLStats,
 };
 
 // Appends big-endian values to a buffer. Writing past the end is remembered, not done.
@@ -827,6 +827,60 @@ Result<LedgerSyncPayload> wire_decode_ledger_sync(std::span<const std::byte> in)
         entry.segsec_for_peer = r.get(8);
         entry.segsec_by_peer = r.get(8);
         payload.entries.push_back(entry);
+    }
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const LStatsPayload& payload, std::span<std::byte> out) {
+    if (payload.segments.size() > kMaxSegments) {
+        return kUnsendable;
+    }
+    Writer w{out};
+    w.put(payload.faults, 8);
+    w.put(payload.pages_in, 8);
+    w.put(payload.pages_out, 8);
+    w.put(payload.retries, 8);
+    for (const std::uint32_t count : payload.latency) {
+        w.put(count, 4);
+    }
+    w.put(payload.segments.size(), 2);
+    w.put(0, 2);  // reserved
+    for (const LStatsSegment& s : payload.segments) {
+        w.put(s.segment.value, 4);
+        w.put(s.home.value, 2);
+        w.put(s.shared, 2);
+        w.put(s.modified, 2);
+        w.put(0, 2);  // reserved
+    }
+    return w.done();
+}
+
+Result<LStatsPayload> wire_decode_l_stats(std::span<const std::byte> in) {
+    Reader r{in};
+    LStatsPayload payload;
+    payload.faults = r.get(8);
+    payload.pages_in = r.get(8);
+    payload.pages_out = r.get(8);
+    payload.retries = r.get(8);
+    for (std::uint32_t& count : payload.latency) {
+        count = static_cast<std::uint32_t>(r.get(4));
+    }
+    const std::size_t count = r.get(2);
+    r.take(2);
+    if (count > kMaxSegments || in.size() != 100 + 12 * count) {
+        return kMalformed;
+    }
+    for (std::size_t i = 0; i < count; i++) {
+        LStatsSegment s;
+        s.segment = SegmentId{static_cast<std::uint32_t>(r.get(4))};
+        s.home = NodeId{static_cast<std::uint16_t>(r.get(2))};
+        s.shared = static_cast<std::uint16_t>(r.get(2));
+        s.modified = static_cast<std::uint16_t>(r.get(2));
+        r.take(2);
+        payload.segments.push_back(s);
     }
     if (!r.exact()) {
         return kMalformed;

@@ -708,3 +708,29 @@ TEST_CASE("the ledger announcement: LEDGER_SYNC") {
     CHECK(paramesh::wire_decode_ledger_sync(hex("00 00 00 00")).error().code == Errc::kProtocol);
     CHECK(paramesh::wire_decode_ledger_sync(hex("00 02 00 00")).error().code == Errc::kProtocol);
 }
+
+TEST_CASE("the status report: L_STATS") {
+    paramesh::LStatsPayload stats;
+    stats.faults = 7;
+    stats.pages_in = 6;
+    stats.pages_out = 5;
+    stats.retries = 1;
+    stats.latency[9] = 3;  // three faults of 256 to 511 us
+    stats.segments = {{paramesh::SegmentId{2}, paramesh::NodeId{3}, 4, 1}};
+    std::array<std::byte, 200> out{};
+    const auto size = paramesh::wire_encode(stats, out);
+    REQUIRE(size.ok());
+    CHECK(size.value() == 112);
+    const auto back = paramesh::wire_decode_l_stats(std::span{out}.first(size.value()));
+    REQUIRE(back.ok());
+    CHECK(back.value().faults == 7);
+    CHECK(back.value().pages_out == 5);
+    CHECK(back.value().latency[9] == 3);
+    REQUIRE(back.value().segments.size() == 1);
+    CHECK(back.value().segments[0].segment == paramesh::SegmentId{2});
+    CHECK(back.value().segments[0].home == paramesh::NodeId{3});
+    CHECK(back.value().segments[0].shared == 4);
+    CHECK(back.value().segments[0].modified == 1);
+    CHECK(paramesh::wire_decode_l_stats(std::span{out}.first(size.value() - 1)).error().code ==
+          Errc::kProtocol);
+}

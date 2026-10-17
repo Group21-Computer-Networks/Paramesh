@@ -9,7 +9,6 @@
 namespace paramesh {
 namespace {
 
-// ponytail: GET with a whole-body reply only; server-sent events for /v1/events come with M6-1.
 class HttplibServer final : public HttpServer {
 public:
     HttplibServer() = default;
@@ -25,6 +24,22 @@ public:
             const HttpResponse reply = handler(request.path);
             response.status = reply.status;
             response.set_content(reply.body, reply.content_type);
+        });
+    }
+
+    void get_stream(const std::string& pattern, const std::string& content_type,
+                    HttpStreamHandler handler) override {
+        server_.Get(pattern, [content_type, handler = std::move(handler)](
+                                 const httplib::Request& request, httplib::Response& response) {
+            response.set_chunked_content_provider(
+                content_type,
+                [handler, path = request.path](std::size_t /*offset*/, httplib::DataSink& sink) {
+                    handler(path, [&sink](std::string_view piece) {
+                        return sink.is_writable() && sink.write(piece.data(), piece.size());
+                    });
+                    sink.done();
+                    return true;
+                });
         });
     }
 
