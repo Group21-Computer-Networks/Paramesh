@@ -400,7 +400,9 @@ PM_TASK(lib_test_leave) {
         for (int waited = 0; ctx->node != 3 && waited < 20000 && told[0] == 0; waited++) {
             ::usleep(1000);
         }
-        ::usleep(4000);  // long enough for the leave to happen while chunks are running
+        // Round 2 lasts long enough for the leave to end inside it: at 4 ms a chunk a slow
+        // machine finished the round, and the job, before node 3 had left (member_left).
+        ::usleep(20000);
     }
     if (args->round == 2) {
         // An atomic add of nothing: the number's home must answer, wherever the page now lives.
