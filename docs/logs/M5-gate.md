@@ -1,9 +1,9 @@
 # M5 gate
 
 - Milestone: M5
-- Status: open
-- Closed by:
-- Closed on:
+- Status: closed
+- Closed by: Amirishetty Sai Vignesh
+- Closed on: 2026-10-17
 
 <!--
 Only the person closes a gate. An agent may prepare this file and fill in checks it ran,
@@ -44,9 +44,9 @@ Each "Still open" point or flagged question the person answered at this gate:
 the point's number, the answer, and where it is now recorded (the frozen file, AGENTS.md, docs/TODO.md).
 "None" if none.
 -->
-None yet.
+None.
 
 ## Follow-ups
 
 <!-- Items for docs/TODO.md or for the next milestone that came out of the review. "None" if none. -->
-None yet.
+None.
