@@ -61,6 +61,7 @@ struct PmdConfig {
     bool multicast = true;                          // --no-multicast: seeds only
     std::string iface;               // --iface: the one interface for multicast; else every one
     std::string state_dir;           // --state-dir; pmd.sock and node_id are kept in it
+    std::string dashboard;           // --dashboard: the page served at / (M6-3)
     std::uint16_t cap_cores = 0;     // --cap-cores: the thread quota of every job
     std::uint64_t cap_ram = 0;       // --cap-ram, bytes: the page data each job may hold here
     std::uint64_t spill_budget = 0;  // spill.budget, bytes: what a job may spill here
