@@ -831,6 +831,33 @@ TEST_CASE("requests that meet a segment on the move are sent again and answered 
     CHECK(again > 0);
 }
 
+TEST_CASE("a page sent after the reply timeout: the request sent again with RETRY is dropped" *
+          doctest::skip(!can_run())) {
+    // Each home sends its first page to another node 2.5 s late. The requester's transport
+    // sends the request again with RETRY at 2 s; the home already has it and must not run it
+    // a second time, or its machine meets an impossible event.
+    const Started job = start_job("0", program, "PARAMESH_TEST_REPLY_DELAY_MS=2500");
+    CHECK(wait_for(job.pids[0], 60) == 0);
+    CHECK(wait_for(job.pids[1], 10) == 0);
+    CHECK(wait_for(job.pids[2], 10) == 0);
+    const std::string log = read_all(job.launcher_stderr);
+    INFO(log);
+    CHECK(log.find("aborted") == std::string::npos);
+}
+
+TEST_CASE("TASK_REQs that come before the launcher has its task queue are answered NO_TASK" *
+          doctest::skip(!can_run())) {
+    // The launcher starts its queue 2.5 s late: the workers' first TASK_REQs, and the copies sent
+    // with RETRY at 2 s, come before it. Each must get an answer, or the worker gives up at 4 s.
+    const Started job = start_job("0", task_program, "PARAMESH_TEST_TASKS_DELAY_MS=2500");
+    CHECK(wait_for(job.pids[0], 120) == 0);
+    CHECK(wait_for(job.pids[1], 10) == 0);
+    CHECK(wait_for(job.pids[2], 10) == 0);
+    const std::string log = read_all(job.launcher_stderr);
+    INFO(log);
+    CHECK(log.find("aborted") == std::string::npos);
+}
+
 // Runs a program with one more setting and returns the page transfers its three processes
 // logged, summed, or -1 if the run failed or a process logged none. `log`, if given, gets
 // everything the processes logged.
