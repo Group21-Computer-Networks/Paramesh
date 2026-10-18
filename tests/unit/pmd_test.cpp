@@ -737,6 +737,7 @@ TEST_CASE("the command line: defaults, every flag, and what is refused") {
     REQUIRE(all.ok());
     CHECK(all.value().node == NodeId{7});
     CHECK(all.value().cap_cores == 4);
+    CHECK(parse({"--dashboard", "/srv/page.html"}).value().dashboard == "/srv/page.html");
     CHECK(parse({"--cap-ram", "512M"}).value().cap_ram == 512ULL << 20U);
     CHECK(parse({"--cap-ram", "2G"}).value().cap_ram == 2ULL << 30U);
     CHECK(parse({"--cap-ram", "8K"}).value().cap_ram == 8192);
@@ -2353,4 +2354,19 @@ TEST_CASE("pm top redraws once a second during a run and gives the terminal back
     CHECK(shown.ends_with("\x1b[?25h\x1b[?1049l"));  // the cursor and the screen given back
     const std::ofstream stop{report + ".stop"};
     CHECK(exit_status(pmrun, 120) == 0);
+}
+
+TEST_CASE("pmd serves the dashboard at / of its status port, a page that reads the API") {
+    const Daemon daemon;  // the default: tools/dashboard/index.html of this source tree
+    const auto page = paramesh::http_get(daemon.pmd.http_port(), "/");
+    REQUIRE(page.ok());
+    CHECK(page.value().starts_with("<!doctype html>"));
+    CHECK(page.value().find(R"(new EventSource("/v1/events"))") != std::string::npos);
+    for (const char* path : {"/v1/peers", "/v1/jobs", "/v1/jobs/"}) {
+        CHECK(page.value().find(path) != std::string::npos);
+    }
+    CHECK(page.value().find("<script src=") == std::string::npos);  // no library from elsewhere
+
+    const Daemon elsewhere{6, {}, [](paramesh::PmdConfig& c) { c.dashboard = "/nonexistent"; }};
+    CHECK_FALSE(paramesh::http_get(elsewhere.pmd.http_port(), "/").ok());  // 404
 }

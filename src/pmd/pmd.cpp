@@ -112,6 +112,7 @@ std::string_view pmd_usage() noexcept {
            "           [--peers address[:port[:port]],...]\n"
            "           [--state-dir DIRECTORY] [--iface NAME] [--no-multicast]\n"
            "           [--control-port N] [--discovery-port N] [--http-port N]\n"
+           "           [--dashboard FILE]\n"
            "  --node-id       this node's ID, 1 to 65534 (default: a random ID, made on the first\n"
            "                  run and kept in the state directory)\n"
            "  --cap-cores     the most worker threads a job may run here (default: all "
@@ -126,7 +127,9 @@ std::string_view pmd_usage() noexcept {
            "  --no-multicast  send beacons to the seeds only\n"
            "  --control-port  the TCP port for other daemons (default 47001)\n"
            "  --discovery-port the UDP port for beacons, the same on every node (default 47000)\n"
-           "  --http-port     the status API on 127.0.0.1 (default 47002)\n";
+           "  --http-port     the status API on 127.0.0.1 (default 47002); the dashboard is at /\n"
+           "  --dashboard     the dashboard page (default: tools/dashboard/index.html of the\n"
+           "                  source tree pmd was built in)\n";
 }
 
 namespace {
@@ -198,6 +201,8 @@ Result<PmdConfig> pmd_parse_args(std::span<const std::string_view> args) {
             config.iface = value;
         } else if (flag == "--state-dir") {
             config.state_dir = value;
+        } else if (flag == "--dashboard") {
+            config.dashboard = value;
         } else if (flag == "--peers") {
             if (!to_peers(value, config)) {
                 return bad_flag(
@@ -253,6 +258,18 @@ Result<void> Pmd::open() {
             std::getenv("PARAMESH_CFG_SPILL_BUDGET");  // NOLINT(concurrency-mt-unsafe)
         config_.spill_budget =
             budget != nullptr ? std::strtoull(budget, nullptr, 10) : config_.cap_ram;
+    }
+    if (config_.dashboard.empty()) {
+        // The source tree's copy: the nearest tools/dashboard/index.html above the executable
+        // (build/<preset>/src/pmd/pmd, build/src/pmd/pmd, ...).
+        std::error_code ignored;
+        std::filesystem::path dir = std::filesystem::read_symlink("/proc/self/exe", ignored);
+        for (int up = 0; up < 6 && !dir.empty() && config_.dashboard.empty(); up++) {
+            dir = dir.parent_path();
+            if (std::filesystem::exists(dir / "tools/dashboard/index.html", ignored)) {
+                config_.dashboard = (dir / "tools/dashboard/index.html").string();
+            }
+        }
     }
     std::error_code failed;
     std::filesystem::create_directories(config_.state_dir, failed);
@@ -340,6 +357,17 @@ Result<void> Pmd::open() {
     if (const Result<void> discovery = open_discovery(); !discovery.ok()) {
         return discovery;
     }
+    // The dashboard (M6-3), read at each request: one static page that reads this API.
+    platform_.http->get("/", [this](std::string_view /*path*/) {
+        std::ifstream file{config_.dashboard, std::ios::binary};
+        if (!file) {
+            return HttpResponse{
+                404, "text/plain",
+                "no dashboard at " + config_.dashboard + "; pmd --dashboard FILE\n"};
+        }
+        return HttpResponse{200, "text/html; charset=utf-8",
+                            std::string{std::istreambuf_iterator<char>{file}, {}}};
+    });
     platform_.http->get("/v1/jobs", [this](std::string_view /*path*/) {
         const std::scoped_lock hold{status_mu_};
         return HttpResponse{200, "application/json", jobs_json_};

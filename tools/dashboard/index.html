@@ -1,0 +1,135 @@
+<!doctype html>
+<!-- The ParaMesh dashboard (M6-3): one page, no library. pmd serves it at / on its status port;
+     it reads that pmd's status API (docs/STATUS_API.md): the event stream for live rates, and
+     the peers, jobs and pages once a second. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ParaMesh</title>
+<style>
+  :root { --bg: #fff; --fg: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7; --accent: #0071e3;
+          --home: #0071e3; --shared: #34c759; --modified: #ff9500; --empty: #f2f2f4; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111113; --fg: #f5f5f7; --muted: #a1a1a6; --line: #38383d; --accent: #2997ff;
+            --home: #2997ff; --shared: #30d158; --modified: #ff9f0a; --empty: #232326; }
+  }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 24px 0 8px; }
+  .muted { color: var(--muted); }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); }
+  th { font-weight: 600; color: var(--muted); }
+  td.n, th.n { text-align: right; }
+  .grid { display: flex; flex-wrap: wrap; gap: 2px; margin: 6px 0 12px; }
+  .cell { width: 12px; height: 12px; border-radius: 2px; background: var(--empty); }
+  .legend span { display: inline-block; margin-right: 14px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+              margin-right: 4px; vertical-align: -1px; }
+  .bar { height: 8px; background: var(--empty); border-radius: 4px; overflow: hidden; }
+  .bar div { height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+  #status { font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>ParaMesh <span id="node" class="muted"></span></h1>
+<div id="status" class="muted">connecting</div>
+
+<h2>Peers</h2>
+<table><thead><tr><th>Node</th><th>Address</th><th>State</th><th class="n">Cores</th>
+  <th class="n">Jobs</th><th class="n">Silent</th></tr></thead><tbody id="peers"></tbody></table>
+<div id="migration"></div>
+
+<h2>Jobs on this node</h2>
+<table><thead><tr><th>Job</th><th>Role</th><th class="n">Launcher</th><th class="n">Slots</th>
+  <th class="n">Faults/s</th><th class="n">MB in/s</th><th class="n">MB out/s</th>
+  <th class="n">p50 µs</th><th class="n">p99 µs</th></tr></thead><tbody id="jobs"></tbody></table>
+
+<h2>Page ownership</h2>
+<div class="legend muted"><span><i style="background:var(--home)"></i>home here</span>
+  <span><i style="background:var(--modified)"></i>held modified (M)</span>
+  <span><i style="background:var(--shared)"></i>held shared (S)</span>
+  <span><i style="background:var(--empty)"></i>neither</span></div>
+<div id="pages"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const text = (s) => String(s).replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;"}[c]));
+const fixed = (x, d) => Number(x || 0).toFixed(d);
+let rates = {};          // by job, from the newest stats event
+const leaving = {};      // peer -> the segments homed on it when it began to leave
+
+async function json(path) {
+  const r = await fetch(path, {cache: "no-store"});
+  if (!r.ok) throw new Error(path + ": " + r.status);
+  return r.json();
+}
+
+function drawPeers(p) {
+  $("node").textContent = "node " + p.node + ", " + p.cap_cores + " cores";
+  $("peers").innerHTML = (p.peers || []).map((q) =>
+    `<tr><td>${q.node}</td><td>${text(q.address)}</td><td>${text(q.state)}${q.leaving ? ", leaving" : ""}</td>` +
+    `<td class="n">${q.cap_cores}</td><td class="n">${q.jobs}</td><td class="n">${fixed(q.silent_ms / 1000, 1)} s</td></tr>`
+  ).join("") || `<tr><td colspan="6" class="muted">no peer heard</td></tr>`;
+}
+
+function drawJobs(j) {
+  $("jobs").innerHTML = (j.jobs || []).map((x) => {
+    const r = rates[x.job] || x;   // the stream's newest second, else the snapshot
+    return `<tr><td>${x.job}</td><td>${text(x.role)}</td><td class="n">${x.launcher}</td>` +
+      `<td class="n">${r.slots}</td><td class="n">${fixed(r.faults_per_s, 1)}</td>` +
+      `<td class="n">${fixed(r.mb_in_per_s, 2)}</td><td class="n">${fixed(r.mb_out_per_s, 2)}</td>` +
+      `<td class="n">${x.fault_latency.p50_us}</td><td class="n">${x.fault_latency.p99_us}</td></tr>`;
+  }).join("") || `<tr><td colspan="9" class="muted">no job on this node</td></tr>`;
+}
+
+function drawPages(all) {
+  $("pages").innerHTML = all.map(({job, segments}) => {
+    const cells = segments.map((s) => {
+      const color = s.home_here ? "var(--home)" : s.modified ? "var(--modified)" : s.shared ? "var(--shared)" : "var(--empty)";
+      return `<div class="cell" style="background:${color}" title="segment ${s.segment}: home ${s.home}, ${s.shared} S, ${s.modified} M"></div>`;
+    }).join("");
+    return `<div>job ${job}: ${segments.length} segments</div><div class="grid">${cells}</div>`;
+  }).join("") || `<div class="muted">nothing held</div>`;
+}
+
+// While a peer is leaving, its segments move to other homes: the bar is the share that has gone,
+// as far as this node sees them (the segments it is home for or holds a page of).
+function drawMigration(peers, all) {
+  const homedOn = (node) => all.reduce((n, {segments}) => n + segments.filter((s) => s.home === node).length, 0);
+  const now = (peers.peers || []).filter((q) => q.leaving).map((q) => q.node);
+  for (const node of Object.keys(leaving)) if (!now.includes(Number(node))) delete leaving[node];
+  for (const node of now) if (!(node in leaving)) leaving[node] = homedOn(node);
+  $("migration").innerHTML = now.map((node) => {
+    const from = leaving[node], left = homedOn(node);
+    const done = from === 0 ? 1 : (from - left) / from;
+    return `<h2>Node ${node} is leaving: segments moved ${from - left} of ${from}</h2>` +
+      `<div class="bar"><div style="width:${(100 * done).toFixed(0)}%"></div></div>`;
+  }).join("");
+}
+
+async function refresh() {
+  try {
+    const [peers, jobs] = await Promise.all([json("/v1/peers"), json("/v1/jobs")]);
+    const pages = await Promise.all((jobs.jobs || []).map((x) => json(`/v1/jobs/${x.job}/pages`).catch(() => ({job: x.job, segments: []}))));
+    drawPeers(peers); drawJobs(jobs); drawPages(pages); drawMigration(peers, pages);
+    $("status").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    $("status").textContent = "no answer from pmd: " + e.message;
+  }
+}
+
+const events = new EventSource("/v1/events");
+events.addEventListener("stats", (e) => {
+  rates = {};
+  for (const r of JSON.parse(e.data).jobs) rates[r.job] = r;
+});
+for (const kind of ["join", "leave", "job_start", "job_end"]) events.addEventListener(kind, refresh);
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
