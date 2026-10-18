@@ -260,12 +260,16 @@ Result<void> Pmd::open() {
             budget != nullptr ? std::strtoull(budget, nullptr, 10) : config_.cap_ram;
     }
     if (config_.dashboard.empty()) {
-        // Built as build/<preset>/src/pmd/pmd: the source tree is four directories up.
+        // The source tree's copy: the nearest tools/dashboard/index.html above the executable
+        // (build/<preset>/src/pmd/pmd, build/src/pmd/pmd, ...).
         std::error_code ignored;
-        const std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", ignored);
-        config_.dashboard = (self.parent_path() / "../../../../tools/dashboard/index.html")
-                                .lexically_normal()
-                                .string();
+        std::filesystem::path dir = std::filesystem::read_symlink("/proc/self/exe", ignored);
+        for (int up = 0; up < 6 && !dir.empty() && config_.dashboard.empty(); up++) {
+            dir = dir.parent_path();
+            if (std::filesystem::exists(dir / "tools/dashboard/index.html", ignored)) {
+                config_.dashboard = (dir / "tools/dashboard/index.html").string();
+            }
+        }
     }
     std::error_code failed;
     std::filesystem::create_directories(config_.state_dir, failed);
