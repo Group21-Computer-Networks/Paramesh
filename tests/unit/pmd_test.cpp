@@ -2312,6 +2312,50 @@ TEST_CASE("the status API: jobs, their pages and a stream of events" *
     CHECK(status_get(nodes.one, "/v1/jobs").find("\"jobs\":[]") != std::string::npos);
 }
 
+TEST_CASE("pm top redraws once a second during a run and gives the terminal back on Ctrl+C" *
+          doctest::skip(!region_can_be_mapped())) {
+    const ThreeNodes nodes;
+    const std::string report = nodes.reports + "/program";
+    const pid_t pmrun = start_pmrun({"-n", "3", "--state-dir", nodes.one.state_dir, own_path(),
+                                     "--as-program", report, "until-stop"});
+    REQUIRE(wait_file_for(report + ".three", 180));
+    for (int tenths = 0;
+         tenths < 30 && status_get(nodes.one, "/v1/jobs").find("65537") == std::string::npos;
+         tenths++) {
+        ::usleep(100000);
+    }
+    const std::string out = nodes.reports + "/top";
+    std::string port = std::to_string(nodes.one.pmd.http_port());
+    std::string pm = tool("pm");
+    std::string command = "top";
+    std::string flag = "--http-port";
+    std::array<char*, 5> argv{pm.data(), command.data(), flag.data(), port.data(), nullptr};
+    const pid_t top = ::fork();
+    if (top == 0) {
+        ::dup2(::open(out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600), STDOUT_FILENO);
+        ::execv(argv[0], argv.data());
+        ::_exit(127);
+    }
+    ::usleep(3500000);
+    ::kill(top, SIGINT);
+    CHECK(exit_status(top, 10) == 0);
+    const std::string shown = contents(out);
+    INFO(shown);
+    CHECK(shown.starts_with("\x1b[?1049h\x1b[?25l"));  // its own screen, no cursor
+    std::size_t frames = 0;
+    for (auto at = shown.find("pm top  node 1"); at != std::string::npos;
+         at = shown.find("pm top  node 1", at + 1)) {
+        frames++;
+    }
+    CHECK(frames >= 3);  // once a second
+    CHECK(frames <= 5);
+    CHECK(shown.find("65537    launcher") != std::string::npos);
+    CHECK(shown.find("pages: home for ") != std::string::npos);
+    CHECK(shown.ends_with("\x1b[?25h\x1b[?1049l"));  // the cursor and the screen given back
+    const std::ofstream stop{report + ".stop"};
+    CHECK(exit_status(pmrun, 120) == 0);
+}
+
 TEST_CASE("pmd serves the dashboard at / of its status port, a page that reads the API") {
     const Daemon daemon;  // the default: tools/dashboard/index.html of this source tree
     const auto page = paramesh::http_get(daemon.pmd.http_port(), "/");

@@ -24,6 +24,7 @@ namespace {
 constexpr std::uint16_t kStatusPort = 47002;  // pmd's --http-port default
 constexpr const char* kUsage =
     "usage: pm status [--http-port N]\n"
+    "       pm top [--http-port N]\n"
     "       pm leave [--force] [--state-dir DIRECTORY]\n";
 
 std::int64_t number(const JsonObject& object, const char* key) {
@@ -253,11 +254,11 @@ int pm(std::span<const std::string_view> args) {
         }
         port = static_cast<std::uint16_t>(value);
     }
-    if ((args.size() != 1 && args.size() != 3) || args[0] != "status") {
+    if ((args.size() != 1 && args.size() != 3) || (args[0] != "status" && args[0] != "top")) {
         static_cast<void>(std::fputs(kUsage, stderr));
         return 2;
     }
-    return status(port);
+    return args[0] == "top" ? top(port) : status(port);
 }
 
 }  // namespace paramesh
