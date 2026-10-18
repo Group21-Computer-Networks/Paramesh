@@ -823,6 +823,11 @@ TEST_CASE("requests that meet a segment on the move are sent again and answered 
         again += std::strtol(log.c_str() + at + key.size(), nullptr, 10);
     }
     MESSAGE("requests sent again: " << again);
+    // Each process's job_pages line has its whole counts (M6-5 reads them): faults taken, pages
+    // sent and the 16 latency buckets.
+    CHECK(log.find(R"("faults":)") != std::string::npos);
+    CHECK(log.find(R"("sent":)") != std::string::npos);
+    CHECK(log.find(R"("latency":[)") != std::string::npos);
     CHECK(again > 0);
 }
 

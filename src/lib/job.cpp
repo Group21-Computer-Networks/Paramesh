@@ -1575,11 +1575,20 @@ private:
 
     // What this process has to say when the job ends in order: how many pages, or rights to
     // pages, reached it from other nodes.
+    // With this process's whole counts, as L_STATS has them (M6-5 reads them from here, since a
+    // short job ends before its first report).
     void log_pages() const noexcept {
+        JsonArray latency;
+        for (const std::uint32_t count : latency_) {
+            latency.push_back(JsonValue{std::int64_t{count}});
+        }
         platform_.logger->log(
             LogLevel::kInfo, "job_pages",
             JsonObject{{"received", JsonValue{static_cast<std::int64_t>(pages_in_)}},
-                       {"sent_again", JsonValue{static_cast<std::int64_t>(sent_again_)}}});
+                       {"sent_again", JsonValue{static_cast<std::int64_t>(sent_again_)}},
+                       {"faults", JsonValue{static_cast<std::int64_t>(faults_taken_)}},
+                       {"sent", JsonValue{static_cast<std::int64_t>(pages_out_)}},
+                       {"latency", JsonValue{std::move(latency)}}});
     }
 
     // The frames of maps, of segments on the move and of leaving. True if it was one of them.
