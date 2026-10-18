@@ -51,6 +51,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace paramesh {
@@ -90,6 +91,12 @@ struct Settings {
     // Tests only (PARAMESH_TEST_MOVE_DELAY_MS): a frozen segment is sent this much later, so
     // that requests are sure to meet a segment on the move.
     Nanos move_delay{};
+    // Tests only (PARAMESH_TEST_REPLY_DELAY_MS): the first page this home sends to another node
+    // goes this much later, so that the request is sent again with RETRY.
+    Nanos reply_delay{};
+    // Tests only (PARAMESH_TEST_TASKS_DELAY_MS): the launcher starts its task queue this much
+    // later, so that the workers' first TASK_REQs come before it.
+    Nanos tasks_delay{};
     // The hold window against thrashing (AT-1), with the plan's proposed defaults.
     // PARAMESH_CFG_THRASH_THRESHOLD sets the count; 0 turns the window off.
     HomeConfig thrash{8, std::chrono::milliseconds{100}, std::chrono::milliseconds{1},
@@ -167,6 +174,12 @@ bool read_settings(Settings& s) {
     }
     if (const char* delay = env("PARAMESH_TEST_MOVE_DELAY_MS")) {
         s.move_delay = std::chrono::milliseconds{std::strtol(delay, nullptr, 10)};
+    }
+    if (const char* delay = env("PARAMESH_TEST_TASKS_DELAY_MS")) {
+        s.tasks_delay = std::chrono::milliseconds{std::strtol(delay, nullptr, 10)};
+    }
+    if (const char* delay = env("PARAMESH_TEST_REPLY_DELAY_MS")) {
+        s.reply_delay = std::chrono::milliseconds{std::strtol(delay, nullptr, 10)};
     }
     if (const char* budget = env("PARAMESH_CFG_SPILL_BUDGET")) {
         s.spill_budget = std::strtoull(budget, nullptr, 10);
@@ -339,7 +352,11 @@ public:
             s_.members.size());
         tasks.region_bytes = region_bytes_;
         tasks.affinity = s_.affinity;
+        if (is_launcher()) {
+            std::this_thread::sleep_for(s_.tasks_delay);
+        }
         tasks_.emplace(*net_, *this, *sync_, tasks);
+        tasks_up_.store(true, std::memory_order_release);
         if (pmd_fd_ >= 0) {  // before the threads start, or they would ask for chunks first
             const std::lock_guard<std::mutex> lock{quota_mu_};
             tasks_ready_ = true;
@@ -572,6 +589,9 @@ public:
     }
 
     void on_frame(const FrameHeader& header, std::span<const std::byte> payload) noexcept override {
+        if ((header.flags & kFlagRetry) != 0) {
+            return;  // a request this process already has: TCP lost nothing (PROTOCOL.md 8)
+        }
         handle(header, payload);
         pump();
     }
@@ -1823,8 +1843,13 @@ private:
             (header.opcode == Opcode::kTaskAssign || header.opcode == Opcode::kTaskDone) &&
             (get_u64(payload) & kHookChunk) != 0;
         if (!hook) {
-            if (Tasks* queue = tasks(); queue != nullptr) {
+            if (Tasks* queue = tasks_up_.load(std::memory_order_acquire) ? tasks() : nullptr;
+                queue != nullptr) {
                 queue->on_frame(header, payload);
+            } else if (header.opcode == Opcode::kTaskReq) {  // the queue is not up yet: ask later
+                std::array<std::byte, 4> none{};
+                static_cast<void>(wire_encode(NoTaskPayload{1}, none));
+                post(header.src, Opcode::kNoTask, none, header.req);
             }
             return;
         }
@@ -2163,6 +2188,14 @@ private:
             return copied;
         }
         pages_out_ += size == buffer.size() && a.to != s_.self ? 1U : 0U;
+        if (s_.reply_delay > Nanos{} && a.to != s_.self) {
+            std::vector<std::byte> later{buffer.begin(), buffer.begin() + size};
+            after(std::exchange(s_.reply_delay, Nanos{}),
+                  [this, a, later = std::move(later), flags] {
+                      post(a.to, a.opcode, later, a.req, flags);
+                  });
+            return Done::kYes;
+        }
         post(a.to, a.opcode, std::span{buffer}.first(size), a.req, flags);
         return Done::kYes;
     }
@@ -2289,7 +2322,8 @@ private:
     std::unique_ptr<LocalCache> cache_;
     std::unique_ptr<Transport> net_;
     std::optional<Sync> sync_;
-    std::optional<Tasks> tasks_;  // after what it uses, so it goes first
+    std::optional<Tasks> tasks_;         // after what it uses, so it goes first
+    std::atomic<bool> tasks_up_{false};  // tasks_ is made, for the network thread
     std::thread thread_;
     int pmd_fd_ = -1;         // the local socket to pmd, or -1 without pmd
     std::thread pmd_thread_;  // watch_pmd()
