@@ -19,6 +19,7 @@
 #include "platform/factory.h"
 #include "platform/ids.h"
 #include "platform/result.h"
+#include "pmd/commit.h"
 #include "pmd/job_status.h"
 #include "pmd/ledger.h"
 #include "pmd/ledger_status.h"
@@ -63,8 +64,8 @@ struct PmdConfig {
     std::string state_dir;           // --state-dir; pmd.sock and node_id are kept in it
     std::string dashboard;           // --dashboard: the page served at / (M6-3)
     std::uint16_t cap_cores = 0;     // --cap-cores: the thread quota of every job
-    std::uint64_t cap_ram = 0;       // --cap-ram, bytes: the page data each job may hold here
-    std::uint64_t spill_budget = 0;  // spill.budget, bytes: what a job may spill here
+    std::uint64_t cap_ram = 0;       // --cap-ram, bytes: the page data its jobs hold here
+    std::uint64_t spill_budget = 0;  // spill.budget, bytes: what its jobs may spill here
     // --peers address[:control_port[:discovery_port]],...: the seed list. A daemon sends its
     // HELLO to each seed too, and asks them for workers (M3-5).
     std::vector<Endpoint> peers;
@@ -119,6 +120,7 @@ private:
         ReqId req;
         std::array<std::byte, 32> hash{};
         std::uint16_t want = 0;  // the job's threads_per_node; 0 for no bound
+        JobCommit commit;        // what this node commits to the job
     };
 
     // A worker that has registered, until its local connection closes.
@@ -133,6 +135,7 @@ private:
         std::uint16_t slots = 0;   // its share of this node's worker slots, as last told
         std::uint32_t waited = 0;  // share-outs in a row it had none at
         JobStats stats;            // its last two L_STATS (M6-1)
+        JobCommit commit;          // what this node commits to the job
     };
 
     // A job launched on this node, from L_RUN_REQ until its launcher has gone.
@@ -156,6 +159,7 @@ private:
         bool answered = false;     // L_ADMIT_OK is sent: quotas may be pushed to it
         std::map<std::uint16_t, std::uint64_t> links;  // each member's pmd: its connection
         JobStats stats;                                // its launcher's last two L_STATS (M6-1)
+        JobCommit commit;                              // what this node commits to the job
     };
     // One SPAWN_REQ this daemon sent and has no answer to.
     struct Ask {
@@ -195,7 +199,9 @@ private:
     void refill(NodeId node, Endpoint peer);
     void finish_admission(Run& run);
     void refuse(Run& run, std::uint64_t available, std::size_t nodes);
+    void refuse(Run& run, std::uint64_t available, const std::string& message);
     std::uint32_t next_job_number();
+    JobCommit free_now() const;
     Run* run_of(JobId job);
 
     Result<void> open_discovery();

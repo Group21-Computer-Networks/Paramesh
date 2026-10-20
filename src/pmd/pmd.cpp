@@ -97,6 +97,15 @@ bool to_peer(std::string_view text, Endpoint& out, std::uint16_t& discovery) {
            (second == std::string_view::npos || to_u16(ports.substr(second + 1), 1, discovery));
 }
 
+std::string mb(std::uint64_t bytes) {
+    return std::to_string(bytes >> 20U) + " MB";
+}
+
+// L_QUOTA: a share of the slots and what this node committed to the job.
+LQuotaPayload quota_of(std::uint16_t slots, const JobCommit& commit) {
+    return {slots, commit.ram, commit.spill, commit.no_homes ? kQuotaNoHomes : std::uint16_t{0}};
+}
+
 std::string dotted(std::uint32_t ipv4) {
     in_addr address{};
     address.s_addr = htonl(ipv4);
@@ -117,7 +126,7 @@ std::string_view pmd_usage() noexcept {
            "                  run and kept in the state directory)\n"
            "  --cap-cores     the most worker threads a job may run here (default: all "
            "processors)\n"
-           "  --cap-ram       the most RAM a job may hold shared pages in here, as bytes or with\n"
+           "  --cap-ram       the most RAM the jobs here hold shared pages in, together; bytes or\n"
            "                  K, M or G (default: all of this machine's RAM)\n"
            "  --peers         seeds: daemons to send beacons to and ask for workers; the ports\n"
            "                  default to 47001 (control) and 47000 (discovery)\n"
@@ -559,7 +568,7 @@ void Pmd::handle(Connection& connection, const FrameHeader& header,
 // SPAWN_REQ: check the executable against the launcher's hash, then start one worker.
 void Pmd::on_spawn_req(Connection& connection, const FrameHeader& header,
                        std::span<const std::byte> payload) {
-    Spawn spawn{header.job, 0, connection.id, header.src, header.req, {}};
+    Spawn spawn{header.job, 0, connection.id, header.src, header.req, {}, 0, {}};
     const Result<SpawnReqPayload> decoded = wire_decode_spawn_req(payload);
     if (!decoded.ok()) {
         decline(spawn, Status::kProtocol, "a malformed SPAWN_REQ");
@@ -573,6 +582,22 @@ void Pmd::on_spawn_req(Connection& connection, const FrameHeader& header,
         decline(spawn, Status::kLeaving,
                 "node " + std::to_string(config_.node.value) + " is leaving");
         return;
+    }
+    if (config_.cap_ram != 0) {  // a node with no RAM cap commits nothing and takes any job
+        const JobCommit free = free_now();
+        const bool joining = (request.flags & kSpawnMidRun) != 0;  // home for nothing: a cache
+        const std::optional<JobCommit> commit =
+            joining ? joiner_commit(request.region_bytes, request.nodes, free.ram, cache_share_)
+                    : job_commit(request.region_bytes, request.nodes, free.ram, free.spill,
+                                 cache_share_);
+        if (!commit) {
+            decline(spawn, Status::kNoCapacity,
+                    "node " + std::to_string(config_.node.value) + " cannot commit " +
+                        mb(job_need(request.region_bytes, request.nodes)) + " to the job: " +
+                        mb(free.ram) + " of RAM and " + mb(free.spill) + " of spill free");
+            return;
+        }
+        spawn.commit = *commit;
     }
 
     std::ifstream file{request.path, std::ios::binary};
@@ -639,7 +664,8 @@ void Pmd::on_spawn_req(Connection& connection, const FrameHeader& header,
 }
 
 // L_REGISTER: a job process is up. If this daemon started it, the peer that asked is told;
-// either way the process is told its quota: --cap-cores and --cap-ram, the same for every job.
+// either way the process is told its quota: its share of the slots, and what this node
+// committed to its job. A launcher learns its commitment after admission.
 void Pmd::on_register(Connection& connection, const FrameHeader& header,
                       std::span<const std::byte> payload) {
     const Result<LRegisterPayload> decoded = wire_decode_l_register(payload);
@@ -658,7 +684,7 @@ void Pmd::on_register(Connection& connection, const FrameHeader& header,
         } else {
             reply(spawn->asked_on, Opcode::kSpawnOk, spawn->job, spawn->asker, spawn->req,
                   SpawnOkPayload{config_.node, process.data_port, config_.cap_cores,
-                                 config_.cap_ram, config_.spill_budget});
+                                 spawn->commit.ram, spawn->commit.spill});
             workers_.push_back(Worker{spawn->job,
                                       connection.id,
                                       spawn->asked_on,
@@ -668,7 +694,8 @@ void Pmd::on_register(Connection& connection, const FrameHeader& header,
                                       spawn->want,
                                       0,
                                       0,
-                                      {}});
+                                      {},
+                                      spawn->commit});
         }
         spawns_.erase(spawn);
     }
@@ -679,14 +706,15 @@ void Pmd::on_register(Connection& connection, const FrameHeader& header,
     }
     share_slots(connection.id);  // its share comes in this reply, the others' are pushed
     std::uint16_t slots = config_.cap_cores;  // a process this node has no job for: all
+    JobCommit commit{config_.cap_ram, config_.spill_budget, 0, false};
     for (const Worker& w : workers_) {
         slots = w.local == connection.id ? w.slots : slots;
+        commit = w.local == connection.id ? w.commit : commit;
     }
     if (const Run* run = run_of(header.job); run != nullptr && run->launcher == connection.id) {
         slots = run->slots;
     }
-    reply(connection.id, Opcode::kLQuota, header.job, kNoNode, kNoReq,
-          LQuotaPayload{slots, config_.cap_ram});
+    reply(connection.id, Opcode::kLQuota, header.job, kNoNode, kNoReq, quota_of(slots, commit));
     platform_.logger->log(LogLevel::kInfo, "register",
                           JsonObject{{"job", JsonValue{std::int64_t{header.job.value}}},
                                      {"pid", JsonValue{std::int64_t{process.pid}}},
@@ -789,12 +817,12 @@ void Pmd::beacon(Nanos now) {
     hello.control_port = config_.control_port;
     hello.cap_cores = config_.cap_cores;
     hello.cap_ram = config_.cap_ram;
-    // ponytail: every job is given the whole of both caps, so nothing is counted as taken;
-    // admission (M4-4) commits RAM to each job and the slot allocation (M5-3) divides cores.
+    // ponytail: the slot allocation (M5-3) shares the cores among the jobs, so none is taken.
+    const JobCommit free = free_now();
     hello.free_cores = config_.cap_cores;
-    hello.free_ram = config_.cap_ram;
+    hello.free_ram = free.ram;
     hello.spill_budget = config_.spill_budget;
-    hello.free_spill = config_.spill_budget;
+    hello.free_spill = free.spill;
     hello.jobs = static_cast<std::uint16_t>(std::min<std::size_t>(runs_.size(), 65535));
     hello.flags = leaving_ ? kHelloLeaving : std::uint16_t{0};
     if (ledger_) {  // this node's raw totals with up to 7 peers, for display and the alarm
@@ -1005,15 +1033,32 @@ std::uint64_t admissible(std::uint64_t capacity) {
 
 }  // namespace
 
+// RAM and spill not committed to a job: the caps less the commitments of the workers starting
+// and running here and of the jobs launched here.
+JobCommit Pmd::free_now() const {
+    JobCommit taken;
+    const auto add = [&taken](const JobCommit& c) {
+        taken.ram += c.ram;
+        taken.spill += c.spill;
+    };
+    std::for_each(spawns_.begin(), spawns_.end(), [&](const Spawn& s) { add(s.commit); });
+    std::for_each(workers_.begin(), workers_.end(), [&](const Worker& w) { add(w.commit); });
+    std::for_each(runs_.begin(), runs_.end(), [&](const Run& r) { add(r.commit); });
+    return {config_.cap_ram - std::min(taken.ram, config_.cap_ram),
+            config_.spill_budget - std::min(taken.spill, config_.spill_budget), 0, false};
+}
+
 // L_ADMIT_REFUSED: the region does not fit the nodes chosen.
 void Pmd::refuse(Run& run, std::uint64_t available, std::size_t nodes) {
-    const auto mb = [](std::uint64_t bytes) { return std::to_string(bytes >> 20U) + " MB"; };
+    refuse(run, available,
+           "the region needs " + mb(run.wants.region_bytes) + " and the " + std::to_string(nodes) +
+               (nodes == 1 ? " node chosen gives " : " nodes chosen give ") + mb(available) +
+               " (90% of their RAM caps and spill budgets)");
+}
+
+void Pmd::refuse(Run& run, std::uint64_t available, const std::string& message) {
     const std::uint64_t needed = run.wants.region_bytes;
     run.admitting = false;
-    const std::string message = "the region needs " + mb(needed) + " and the " +
-                                std::to_string(nodes) +
-                                (nodes == 1 ? " node chosen gives " : " nodes chosen give ") +
-                                mb(available) + " (90% of their RAM caps and spill budgets)";
     reply(run.launcher, Opcode::kLAdmitRefused, run.job, kNoNode, kNoReq,
           LAdmitRefusedPayload{needed, available, Status::kNoCapacity, message});
     platform_.logger->log(
@@ -1039,7 +1084,7 @@ void Pmd::on_admit_req(Connection& connection, const FrameHeader& header,
     run->admitting = true;
     share_slots();  // its thread bound is known now; the share goes out in L_ADMIT_OK
     run->unlimited = config_.cap_ram == 0;
-    run->committed = config_.cap_ram + config_.spill_budget;
+    const JobCommit free = free_now();
 
     std::vector<Peer> heard;
     {
@@ -1051,7 +1096,7 @@ void Pmd::on_admit_req(Connection& connection, const FrameHeader& header,
     std::stable_sort(heard.begin(), heard.end(),
                      [&](const Peer& a, const Peer& b) { return free_of(a) > free_of(b); });
     const std::size_t others = run->request.nodes - 1U;
-    std::uint64_t known = run->committed;
+    std::uint64_t known = free.ram + free.spill;
     bool limited = !run->unlimited;
     for (std::size_t i = 0; i < heard.size(); i++) {
         run->candidates.push_back(Endpoint{heard[i].address, heard[i].hello.control_port});
@@ -1072,6 +1117,19 @@ void Pmd::on_admit_req(Connection& connection, const FrameHeader& header,
         refuse(*run, admissible(known), 1 + std::min(others, heard.size()));
         return;
     }
+    if (!run->unlimited) {  // this node's own share, as each peer commits its own
+        const std::optional<JobCommit> commit = job_commit(
+            run->wants.region_bytes, run->request.nodes, free.ram, free.spill, cache_share_);
+        if (!commit) {
+            refuse(*run, free.ram + free.spill,
+                   "node " + std::to_string(config_.node.value) + " cannot commit its share, " +
+                       mb(job_need(run->wants.region_bytes, run->request.nodes)) + ": " +
+                       mb(free.ram) + " of RAM and " + mb(free.spill) + " of spill free");
+            return;
+        }
+        run->commit = *commit;
+    }
+    run->committed = run->commit.ram + run->commit.spill;
     ask_peers(*run);
     finish_admission(*run);
 }
@@ -1137,6 +1195,7 @@ void Pmd::ask_peer(Run& run, Endpoint peer, std::uint16_t flags) {
     request.threads_per_node = run.wants.threads_per_node;
     request.region_bytes = run.wants.region_bytes;
     request.binary_hash = run.request.binary_hash;
+    request.nodes = run.request.nodes;
     request.path = run.request.path;
     request.cwd = run.request.cwd;
     request.argv = run.request.argv;
@@ -1200,17 +1259,32 @@ void Pmd::finish_admission(Run& run) {
     if (!run.admitting || run.asked != 0) {
         return;
     }
-    // The members' own commitments decide ([GATE P8]): fewer may have accepted than were
-    // counted on, or a seed not heard before may give less than the job needs. The launcher
-    // then ends, and the workers already started end with it.
-    if (!run.unlimited && run.wants.region_bytes > admissible(run.committed)) {
-        refuse(run, admissible(run.committed), run.members.size());
+    // The members' own commitments decide ([GATE P8]), with what they have free when fewer
+    // accepted than were asked: each committed its share of N, and grows when the map makes it
+    // home for more (L_SEGMENTS). A seed not heard before may give less than the job needs. The
+    // launcher then ends, and the workers already started end with it.
+    std::uint64_t capacity = run.committed;
+    if (run.members.size() < run.request.nodes) {
+        const JobCommit free = free_now();
+        capacity += free.ram + free.spill;
+        const std::scoped_lock hold{peers_mu_};
+        for (const Peer& peer : table_->peers()) {
+            const bool member =
+                std::any_of(run.members.begin(), run.members.end(),
+                            [&peer](const SegMapMember& m) { return m.node == peer.node; });
+            capacity += member ? peer.hello.free_ram + peer.hello.free_spill : 0;
+        }
+    }
+    if (!run.unlimited && run.wants.region_bytes > admissible(capacity)) {
+        refuse(run, admissible(capacity), run.members.size());
         return;
     }
     run.admitting = false;
     run.answered = true;
     reply(run.launcher, Opcode::kLAdmitOk, run.job, kNoNode, kNoReq,
           LAdmitOkPayload{run.slots, run.members});
+    reply(run.launcher, Opcode::kLQuota, run.job, kNoNode, kNoReq,  // what this node committed
+          quota_of(run.slots, run.commit));
     platform_.logger->log(
         LogLevel::kInfo, "admitted",
         JsonObject{{"job", JsonValue{std::int64_t{run.job.value}}},
@@ -1310,15 +1384,49 @@ void Pmd::on_segments(const Connection& connection, const FrameHeader& header,
     if (!segments.ok()) {
         return;
     }
+    JobCommit* commit = nullptr;
+    std::uint16_t slots = 0;
     for (Worker& w : workers_) {
         if (w.local == connection.id && w.job == header.job) {
             accrue(w.job, w.launcher, w.segments, w.since);
             w.segments = segments.value().entries;
+            commit = &w.commit;
+            slots = w.slots;
         }
     }
     if (Run* run = run_of(header.job); run != nullptr && run->launcher == connection.id) {
         accrue(run->job, config_.node, run->segments, run->since);
-        run->segments = std::move(segments).value().entries;
+        run->segments = segments.value().entries;
+        commit = &run->commit;
+        slots = run->slots;
+    }
+    std::uint64_t home = 0;  // what the new map makes this node home for
+    for (const LSegmentsEntry& entry : segments.value().entries) {
+        home += entry.node == config_.node ? std::uint64_t{entry.segments} * kSegmentSize : 0;
+    }
+    // More than its commitment holds, after a leave or on fewer nodes than asked for: grow it,
+    // or end the job (docs/PROTOCOL.md, L_SEGMENTS).
+    if (commit != nullptr && config_.cap_ram != 0 &&
+        home > commit->ram - commit->cache + commit->spill) {
+        const JobCommit free = free_now();
+        const bool grown = grow_commit(*commit, home, free.ram, free.spill);
+        if (grown) {
+            reply(connection.id, Opcode::kLQuota, header.job, kNoNode, kNoReq,
+                  quota_of(slots, *commit));
+        } else {
+            reply(connection.id, Opcode::kLAbort, header.job, kNoNode, kNoReq,
+                  StatusTextPayload{Status::kNoCapacity,
+                                    "node " + std::to_string(config_.node.value) +
+                                        " cannot hold the " + mb(home) +
+                                        " it is made home for: " + mb(free.ram) + " of RAM and " +
+                                        mb(free.spill) + " of spill free"});
+        }
+        platform_.logger->log(
+            grown ? LogLevel::kInfo : LogLevel::kWarn, grown ? "commit_grown" : "commit_short",
+            JsonObject{{"job", JsonValue{std::int64_t{header.job.value}}},
+                       {"home", JsonValue{static_cast<std::int64_t>(home)}},
+                       {"ram", JsonValue{static_cast<std::int64_t>(commit->ram)}},
+                       {"spill", JsonValue{static_cast<std::int64_t>(commit->spill)}}});
     }
     share_slots();  // the home-store RAM a job holds here has changed
 }
@@ -1552,6 +1660,7 @@ void Pmd::share_slots(std::uint64_t registering) {
         std::uint16_t* slots;
         std::uint32_t* waited;
         bool may_push;
+        JobCommit commit;
     };
     const std::uint64_t home = config_.cap_ram - config_.cap_ram * cache_share_ / 100;
     const auto want = [this](std::uint16_t bound) {
@@ -1563,14 +1672,15 @@ void Pmd::share_slots(std::uint64_t registering) {
         if (run.launcher != 0) {
             demands.push_back({true, want(run.wants.threads_per_node),
                                ram_share(run.segments, config_.node, home), 1, run.waited});
-            holders.push_back({run.launcher, run.job, &run.slots, &run.waited, run.answered});
+            holders.push_back(
+                {run.launcher, run.job, &run.slots, &run.waited, run.answered, run.commit});
         }
     }
     for (Worker& w : workers_) {
         const double weight = ledger_ ? slot_weight(*ledger_, w.launcher, ledger_scale_) : 1.0;
         demands.push_back(
             {false, want(w.want), ram_share(w.segments, config_.node, home), weight, w.waited});
-        holders.push_back({w.local, w.job, &w.slots, &w.waited, true});
+        holders.push_back({w.local, w.job, &w.slots, &w.waited, true, w.commit});
     }
     const std::vector<std::uint16_t> slots = allocate_slots(config_.cap_cores, demands);
     for (std::size_t i = 0; i < holders.size(); i++) {
@@ -1580,7 +1690,7 @@ void Pmd::share_slots(std::uint64_t registering) {
             *h.slots = slots[i];
             if (h.may_push && h.connection != registering) {
                 reply(h.connection, Opcode::kLQuota, h.job, kNoNode, kNoReq,
-                      LQuotaPayload{slots[i], config_.cap_ram});
+                      quota_of(slots[i], h.commit));
             }
         }
     }

@@ -167,6 +167,7 @@ struct SpawnReqPayload {
     std::uint16_t threads_per_node = 0;
     std::uint64_t region_bytes = 0;
     std::array<std::byte, 32> binary_hash{};
+    std::uint16_t nodes = 0;        // the N the job asked for: each node commits region / N
     std::string path;               // absolute, the same on every node
     std::string cwd;                // the launcher's working directory
     std::vector<std::string> argv;  // without the program name
@@ -320,11 +321,16 @@ struct LRegisterPayload {
     std::array<std::byte, 32> binary_hash{};
 };
 
-// L_QUOTA: the most worker threads that may run chunks, and the RAM the process may use.
+// L_QUOTA: the most worker threads that may run chunks, and the RAM and spill the process may
+// use: what its node committed to the job.
 struct LQuotaPayload {
     std::uint16_t threads = 0;
-    std::uint64_t ram_bytes = 0;  // home store and local cache together; 0 for no cap
+    std::uint64_t ram_bytes = 0;    // home store and local cache together; 0 for no cap
+    std::uint64_t spill_bytes = 0;  // its spill file's budget
+    std::uint16_t flags = 0;        // kQuotaNoHomes
 };
+// L_QUOTA flags: all of ram_bytes is the local cache, the process being home for nothing.
+inline constexpr std::uint16_t kQuotaNoHomes = 0x0001;
 
 Result<std::size_t> wire_encode(const PageIdPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const PagePayload& payload, std::span<std::byte> out);

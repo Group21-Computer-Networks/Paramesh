@@ -8,6 +8,7 @@
 
 #include "net/frame_io.h"
 #include "platform/factory.h"
+#include "pmd/commit.h"
 #include "pmd/ledger.h"
 #include "pmd/ledger_status.h"
 #include "pmd/peers.h"
@@ -169,6 +170,7 @@ struct Daemon {
         r.launcher_port = 5000;
         r.threads_per_node = 8;
         r.region_bytes = paramesh::kSegmentSize;
+        r.nodes = 1;
         r.binary_hash = own_hash(platform);
         r.path = own_path();
         r.cwd = state_dir;
@@ -241,9 +243,10 @@ int job_process(const std::string& report, const std::string& last_argument) {
     }
     std::ofstream out{report};
     out << "quota=" << quota.value().threads << "\nram=" << quota.value().ram_bytes
-        << "\njob=" << frame.value().header.job.value << "\nrole=" << env("PARAMESH_ROLE")
-        << "\njob_id=" << env("PARAMESH_JOB_ID") << "\nnode_id=" << env("PARAMESH_NODE_ID")
-        << "\nlauncher=" << env("PARAMESH_LAUNCHER") << "\nlisten=" << env("PARAMESH_LISTEN")
+        << "\nspill=" << quota.value().spill_bytes << "\njob=" << frame.value().header.job.value
+        << "\nrole=" << env("PARAMESH_ROLE") << "\njob_id=" << env("PARAMESH_JOB_ID")
+        << "\nnode_id=" << env("PARAMESH_NODE_ID") << "\nlauncher=" << env("PARAMESH_LAUNCHER")
+        << "\nlisten=" << env("PARAMESH_LISTEN")
         << "\ncwd=" << std::filesystem::current_path().string()
         << "\nlast_argument=" << last_argument << "\n";
     if (!out.good()) {
@@ -381,6 +384,10 @@ int stand_in(const std::string& dir, bool stay) {
     const auto members = paramesh::wire_decode_l_admit_ok(admitted.value().payload);
     if (!members.ok() || members.value().members.front().port != hello.data_port) {
         return 27;
+    }
+    const paramesh::Result<Frame> committed = paramesh::frame_read(pmd, *platform.checksum);
+    if (!committed.ok() || committed.value().header.opcode != Opcode::kLQuota) {
+        return 27;  // L_ADMIT_OK is followed by what the launcher's node committed
     }
     // The launcher is first; the workers follow in the order their daemons answered, which is
     // not fixed, so they are reported sorted.
@@ -655,11 +662,12 @@ int rounds_program(const std::string& report, const SquareArgs& args, std::uint6
 // number of the step that failed.
 int program(const std::string& report, std::string_view mode) {
     const bool slow = mode == "slow";
-    const bool join = mode == "join";
+    const bool join = mode == "join" || mode == "huge-join";
     const bool rounds = join || mode == "until-stop" || mode == "big-until-stop";
     // squares over many more pages than a node may cache
     const bool big = mode == "big" || mode == "big-until-stop";
-    const bool huge = mode == "huge";  // and over more than the nodes' home stores hold in RAM
+    // and over more than the nodes' home stores hold in RAM
+    const bool huge = mode == "huge" || mode == "huge-join";
     std::uint64_t count = kSquares;
     if (big || huge) {
         count = huge ? kHugeSquares : kManySquares;
@@ -825,8 +833,10 @@ TEST_CASE("a job process started by pmd receives its quota, and the peer that as
     for (int tenths = 0; tenths < 50 && contents(report).empty(); tenths++) {
         ::usleep(100000);
     }
+    // What node 5 commits to a job of one segment on one node: the segment divided by the 90%
+    // headroom, in RAM, and spill for the part of the segment the cache's 25% leaves out.
     CHECK(contents(report) ==
-          "quota=3\nram=67108864\njob=77\nrole=worker\njob_id=77\nnode_id=5\n"
+          "quota=3\nram=2330624\nspill=352256\njob=77\nrole=worker\njob_id=77\nnode_id=5\n"
           "launcher=10.1.2.3:5000\nlisten=(unset)\ncwd=" +
               daemon.state_dir + "\nlast_argument=an argument with spaces\n");
 }
@@ -2369,4 +2379,274 @@ TEST_CASE("pmd serves the dashboard at / of its status port, a page that reads t
 
     const Daemon elsewhere{6, {}, [](paramesh::PmdConfig& c) { c.dashboard = "/nonexistent"; }};
     CHECK_FALSE(paramesh::http_get(elsewhere.pmd.http_port(), "/").ok());  // 404
+}
+
+// ---- per-node commitments (X-node-commit)
+// ---------------------------------------------------------------
+
+TEST_CASE(
+    "a node commits its even share of a region: RAM first, spill so the home store holds it") {
+    constexpr std::uint64_t kMb = 1ULL << 20U;
+    // The share: the region's segments over the nodes, rounded up to whole segments.
+    CHECK(paramesh::job_share(1, 3) == paramesh::kSegmentSize);
+    CHECK(paramesh::job_share(48 * kMb, 3) == 16 * kMb);
+    CHECK(paramesh::job_share(50 * kMb, 3) == 18 * kMb);  // 25 segments: 9 on the busiest node
+    CHECK(paramesh::job_share(4 * kMb, 0) == 4 * kMb);    // no N given: all of it
+    // The need: the share over 90%, in whole pages.
+    CHECK(paramesh::job_need(2 * kMb, 1) == 2330624);
+    CHECK(paramesh::job_need(2 * kMb, 1) % paramesh::kPageSize == 0);
+
+    // A commitment that must be there.
+    const auto commit = [](std::uint64_t region, std::uint16_t nodes, std::uint64_t free_ram,
+                           std::uint64_t free_spill) {
+        const auto made = paramesh::job_commit(region, nodes, free_ram, free_spill, 25);
+        REQUIRE(made.has_value());
+        return made.value_or(paramesh::JobCommit{});
+    };
+    // Plenty free: all of the need in RAM; the home store gets 75% of it, and spill the rest of
+    // the share.
+    paramesh::JobCommit made = commit(2 * kMb, 1, 64 * kMb, 64 * kMb);
+    CHECK(made.ram == 2330624);
+    CHECK(made.spill == 352256);
+    // The spill test's nodes (M4-3): 8 MB of RAM, 16 MB of spill, 48 MB on three nodes.
+    made = commit(48 * kMb, 3, 8 * kMb, 16 * kMb);
+    CHECK(made.ram == 8 * kMb);
+    CHECK(made.spill == 10 * kMb);  // 16 MB of share less the 6 MB home store
+    for (const std::uint64_t free_ram : {1 * kMb, 3 * kMb, 8 * kMb, 40 * kMb}) {
+        made = commit(48 * kMb, 3, free_ram, 64 * kMb);
+        const std::uint64_t home = made.ram - made.ram * 25 / 100;
+        CHECK(made.ram <= free_ram);
+        CHECK(home + made.spill >= paramesh::job_share(48 * kMb, 3));
+        CHECK(made.ram + made.spill >= paramesh::job_need(48 * kMb, 3));
+    }
+    // Not enough spill, or no RAM at all: no commitment.
+    CHECK_FALSE(paramesh::job_commit(48 * kMb, 3, 8 * kMb, 8 * kMb, 25).has_value());
+    CHECK_FALSE(paramesh::job_commit(2 * kMb, 1, 0, 64 * kMb, 25).has_value());
+
+    // A node joining a running job: the cache of a member whose share is all in RAM, all of its
+    // RAM, no spill.
+    const std::uint64_t cache = commit(48 * kMb, 3, 64 * kMb, 64 * kMb).cache;
+    const auto joining = paramesh::joiner_commit(48 * kMb, 3, 8 * kMb, 25);
+    REQUIRE(joining.has_value());
+    CHECK(joining.value_or(paramesh::JobCommit{}).ram == cache);
+    CHECK(joining.value_or(paramesh::JobCommit{}).cache == cache);
+    CHECK(joining.value_or(paramesh::JobCommit{}).spill == 0);
+    CHECK(joining.value_or(paramesh::JobCommit{}).no_homes);
+    CHECK_FALSE(paramesh::joiner_commit(48 * kMb, 3, kMb, 25).has_value());
+
+    // Growing: made home for 24 MB, after a leave, with 1 MB of RAM and 20 MB of spill free.
+    made = commit(48 * kMb, 3, 8 * kMb, 16 * kMb);
+    paramesh::JobCommit grown = made;  // 8 MB of RAM (2 MB of it cache), 10 MB of spill
+    REQUIRE(paramesh::grow_commit(grown, 24 * kMb, kMb, 20 * kMb));
+    CHECK(grown.ram == 9 * kMb);     // RAM first
+    CHECK(grown.spill == 17 * kMb);  // then spill: 7 + 17 = 24 MB of home store
+    CHECK(grown.cache == made.cache);
+    REQUIRE(paramesh::grow_commit(grown, 20 * kMb, 0, 0));  // it holds that already
+    CHECK(grown.ram == 9 * kMb);
+    paramesh::JobCommit short_of = made;
+    CHECK_FALSE(paramesh::grow_commit(short_of, 40 * kMb, kMb, 20 * kMb));
+    CHECK(short_of.ram == made.ram);  // as it was
+    CHECK(short_of.spill == made.spill);
+}
+
+TEST_CASE("a node that joins a running job commits a cache, and no spill") {
+    constexpr std::uint64_t kMb = 1ULL << 20U;
+    const Daemon daemon{5, {}, [](paramesh::PmdConfig& c) {
+                            c.cap_ram = 8 * kMb;
+                            c.spill_budget = 16 * kMb;
+                        }};
+    paramesh::SpawnReqPayload joining = daemon.request(daemon.state_dir + "/report");
+    joining.flags = paramesh::kSpawnMidRun;
+    joining.region_bytes = 48 * kMb;
+    joining.nodes = 3;
+    REQUIRE(send(daemon.control, daemon.platform, Opcode::kSpawnReq, 1, joining));
+    const Frame reply = daemon.reply();
+    REQUIRE(reply.header.opcode == Opcode::kSpawnOk);
+    const auto ok = paramesh::wire_decode_spawn_ok(reply.payload);
+    REQUIRE(ok.ok());
+    // The cache of a member of the job with its share all in RAM: 25% of 16 MB over 90%, in
+    // pages. A member would commit 8 MB of RAM and 10 MB of spill here.
+    CHECK(ok.value().ram_commit == 4661248);
+    CHECK(ok.value().spill_commit == 0);
+}
+
+TEST_CASE(
+    "each job takes its commitment from what is free: one that does not fit is declined "
+    "until the first has gone") {
+    constexpr std::uint64_t kMb = 1ULL << 20U;
+    const Daemon daemon{5, {}, [](paramesh::PmdConfig& c) {
+                            c.cap_ram = 8 * kMb;
+                            c.spill_budget = 8 * kMb;
+                        }};
+    // A region of 10 MB on this one node: 8 MB of RAM, whose home store holds 6 MB, and 4 MB
+    // of spill. It stays until it is killed.
+    const std::string first = daemon.state_dir + "/first";
+    paramesh::SpawnReqPayload big = daemon.request(first);
+    big.region_bytes = 10 * kMb;
+    big.argv.back() = "watch";
+    REQUIRE(send(daemon.control, daemon.platform, Opcode::kSpawnReq, 1, big));
+    Frame reply = daemon.reply();
+    REQUIRE(reply.header.opcode == Opcode::kSpawnOk);
+    auto ok = paramesh::wire_decode_spawn_ok(reply.payload);
+    REQUIRE(ok.ok());
+    CHECK(ok.value().ram_commit == 8 * kMb);
+    CHECK(ok.value().spill_commit == 4 * kMb);
+    for (int tenths = 0; tenths < 50 && contents(first).empty(); tenths++) {
+        ::usleep(100000);
+    }
+    CHECK(field(contents(first), "ram") == std::to_string(8 * kMb));  // its quota is that
+    CHECK(field(contents(first), "spill") == std::to_string(4 * kMb));
+
+    // The same job again, as another: no RAM is left, so it is declined and nothing starts.
+    const std::string second = daemon.state_dir + "/second";
+    paramesh::SpawnReqPayload again = daemon.request(second);
+    again.region_bytes = 10 * kMb;
+    REQUIRE(
+        send(daemon.control, daemon.platform, Opcode::kSpawnReq, 2, again, paramesh::JobId{78}));
+    reply = daemon.reply();
+    REQUIRE(reply.header.opcode == Opcode::kSpawnDecline);
+    const auto declined = paramesh::wire_decode_spawn_decline(reply.payload);
+    REQUIRE(declined.ok());
+    CHECK(declined.value().status == Status::kNoCapacity);
+    CHECK(declined.value().message ==
+          "node 5 cannot commit 11 MB to the job: 0 MB of RAM and 4 MB of spill free");
+    ::usleep(300000);
+    CHECK(contents(second).empty());
+
+    // Once the first has gone, its commitment is free again.
+    pid_t watcher = 0;
+    for (const auto& entry : std::filesystem::directory_iterator{"/proc"}) {
+        if (contents(entry.path().string() + "/cmdline").find(first) != std::string::npos) {
+            watcher = static_cast<pid_t>(std::stol(entry.path().filename().string()));
+        }
+    }
+    REQUIRE(watcher > 0);
+    ::kill(watcher, SIGKILL);
+    for (int tenths = 0; tenths < 50 && processes_naming(first) != 0; tenths++) {
+        ::usleep(100000);
+    }
+    ::usleep(300000);  // for pmd to see its connection close
+    REQUIRE(
+        send(daemon.control, daemon.platform, Opcode::kSpawnReq, 3, again, paramesh::JobId{79}));
+    reply = daemon.reply();
+    if (reply.header.opcode == Opcode::kLedgerSync) {  // the first job's end, for the ledger
+        reply = daemon.reply();
+    }
+    REQUIRE(reply.header.opcode == Opcode::kSpawnOk);
+    ok = paramesh::wire_decode_spawn_ok(reply.payload);
+    REQUIRE(ok.ok());
+    CHECK(ok.value().ram_commit == 8 * kMb);
+}
+
+TEST_CASE("a node busy with one job refuses the next that does not fit, and admits it after" *
+          doctest::skip(!region_can_be_mapped())) {
+    const Daemon alone{1, {}, [](paramesh::PmdConfig& c) {
+                           c.cap_ram = 4ULL << 20U;
+                           c.spill_budget = 4ULL << 20U;
+                       }};
+    // A job of a 4 MB region whose chunks sleep: its node commits all 4 MB of RAM and 1 MB of
+    // spill, so 3 MB of spill are left, 2.7 MB of it admissible.
+    const std::string first = alone.state_dir + "/first";
+    const pid_t busy = start_pmrun(
+        {"-n", "1", "--state-dir", alone.state_dir, own_path(), "--as-program", first, "slow"});
+    for (int tenths = 0; tenths < 1800 && contents(first + ".up").empty(); tenths++) {
+        ::usleep(100000);
+    }
+    REQUIRE_FALSE(contents(first + ".up").empty());
+
+    const std::string second = alone.state_dir + "/second";
+    const std::string said = alone.state_dir + "/stderr";
+    CHECK(exit_status(start_pmrun({"-n", "1", "--state-dir", alone.state_dir, own_path(),
+                                   "--as-program", second, "quick"},
+                                  said),
+                      60) == 34);  // pm_init() returned PM_ERR_REFUSED
+    CHECK(contents(said).find("the region needs 4 MB and the 1 node chosen gives 2 MB") !=
+          std::string::npos);
+
+    REQUIRE(::kill(busy, SIGINT) == 0);
+    CHECK(exit_status(busy, 30) == 130);
+    for (int tenths = 0; tenths < 100 && processes_naming(first) != 0; tenths++) {
+        ::usleep(100000);
+    }
+    // Admitted now: pm_init() returns and the program goes on. (Its chunks wait for nodes 2 and
+    // 3, which a job of one node does not have, so it is ended here.)
+    const pid_t admitted = start_pmrun(
+        {"-n", "1", "--state-dir", alone.state_dir, own_path(), "--as-program", second, "slow"});
+    for (int tenths = 0; tenths < 1800 && contents(second + ".up").empty(); tenths++) {
+        ::usleep(100000);
+    }
+    CHECK_FALSE(contents(second + ".up").empty());
+    ::kill(admitted, SIGINT);
+    CHECK(exit_status(admitted, 30) == 130);
+}
+
+TEST_CASE("with RAM caps, the nodes left take over a leaver's segments, and a node joins" *
+          doctest::skip(!region_can_be_mapped())) {
+    // Three nodes of 8 MB of RAM and 32 MB of spill and a 48 MB region, nearly all written.
+    // Each commits 8 MB of RAM and 10 MB of spill: a home store of 16 MB, for its 8 segments.
+    // When node 3 leaves, nodes 1 and 2 are home for 12 segments, 24 MB: their commitments
+    // grow, or the store would be full and the job end. Node 4 then joins with a cache only.
+    constexpr std::uint64_t kMb = 1ULL << 20U;
+    const auto capped = [](paramesh::PmdConfig& c) {
+        c.cap_ram = 8 * kMb;
+        c.spill_budget = 32 * kMb;
+    };
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): no other thread of this process is running
+    ::setenv("PARAMESH_CFG_LOG_LEVEL", "info", 1);
+    {
+        const ThreeNodes nodes{capped};
+        const std::string report = nodes.reports + "/program";
+        const std::string said = nodes.reports + "/stderr";
+        const pid_t pmrun = start_pmrun({"-n", "3", "--state-dir", nodes.one.state_dir, own_path(),
+                                         "--as-program", report, "huge-join"},
+                                        said);
+        for (int tenths = 0; tenths < 1800 && !std::filesystem::exists(report + ".three");
+             tenths++) {
+            ::usleep(100000);
+        }
+        REQUIRE(std::filesystem::exists(report + ".three"));  // node 3 is running a chunk
+        CHECK(run_tool(tool("pm"), {"leave", "--state-dir", nodes.three.state_dir},
+                       nodes.reports + "/pm") == 0);
+        CHECK(stops_within(nodes.three, 60));
+
+        const Daemon four{4, {}, [&nodes, &capped](paramesh::PmdConfig& c) {
+                              capped(c);
+                              c.peers.push_back(nodes.one.endpoint());
+                              c.peer_discovery_ports.push_back(nodes.one.pmd.discovery_port());
+                          }};
+        CHECK(exit_status(pmrun, 240) == 0);
+        const std::string result = contents(report);
+        INFO(result);
+        INFO(contents(said));
+        CHECK(field(result, "wrong") == "0");
+        CHECK(std::strtoull(field(result, "node4").c_str(), nullptr, 10) > 0);  // node 4 ran chunks
+        CHECK(contents(said).find("\"event\":\"member_left\"") != std::string::npos);
+        CHECK(contents(said).find("\"event\":\"member_joined\"") != std::string::npos);
+    }
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): as above
+    ::unsetenv("PARAMESH_CFG_LOG_LEVEL");
+}
+
+TEST_CASE("with RAM caps, a job that fewer nodes accept than it asked for still runs" *
+          doctest::skip(!region_can_be_mapped())) {
+    // Four nodes asked for, three there: each committed its share of four, 12 MB of the 48 MB
+    // region, and is home for 16 MB once the job runs on three. Their commitments grow at the
+    // start; before, the job was refused.
+    constexpr std::uint64_t kMb = 1ULL << 20U;
+    const ThreeNodes nodes{[](paramesh::PmdConfig& c) {
+        c.cap_ram = 8 * kMb;
+        c.spill_budget = 32 * kMb;
+    }};
+    const std::string report = nodes.reports + "/program";
+    const std::string said = nodes.reports + "/stderr";
+    CHECK(exit_status(start_pmrun({"-n", "4", "--state-dir", nodes.one.state_dir, own_path(),
+                                   "--as-program", report, "huge"},
+                                  said),
+                      300) == 0);
+    const std::string result = contents(report);
+    INFO(result);
+    INFO(contents(said));
+    CHECK(field(result, "wrong") == "0");
+    CHECK(field(result, "indexes") == std::to_string(kHugeSquares));
+    CHECK(field(result, "every_node") == "yes");
 }
