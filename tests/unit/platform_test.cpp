@@ -12,6 +12,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <numeric>
 #include <span>
@@ -126,6 +129,34 @@ TEST_CASE("the configuration loader reads key = value lines and rejects anything
     CHECK(loader->parse("no equals sign\n").error().code == Errc::kInvalidArgument);
     CHECK(loader->parse("= value without a key\n").error().code == Errc::kInvalidArgument);
     CHECK(loader->parse("").value().empty());
+}
+
+TEST_CASE("paramesh.conf in the state directory becomes PARAMESH_CFG_ variables; set ones win") {
+    std::array<char, 32> dir = {"/tmp/pm-settings-XXXXXX"};
+    REQUIRE(::mkdtemp(dir.data()) != nullptr);
+    const std::string state_dir = dir.data();
+    // NOLINTBEGIN(concurrency-mt-unsafe): no other thread of this process is running
+    CHECK(paramesh::platform_load_settings(state_dir).ok());  // no file: nothing to do
+    ::setenv("PARAMESH_CFG_LOG_LEVEL", "error", 1);
+    ::unsetenv("PARAMESH_CFG_TASK_PREFETCH");
+    ::unsetenv("PARAMESH_CFG_THRASH_HOLD_MAX");
+    std::ofstream{state_dir + "/paramesh.conf"}
+        << "# tunables\ntask.prefetch = 3\nthrash.hold_max=32\nlog.level = debug\n";
+    REQUIRE(paramesh::platform_load_settings(state_dir).ok());
+    const auto set = [](const char* name) {
+        const char* value = std::getenv(name);
+        return std::string{value != nullptr ? value : "(unset)"};
+    };
+    CHECK(set("PARAMESH_CFG_TASK_PREFETCH") == "3");
+    CHECK(set("PARAMESH_CFG_THRASH_HOLD_MAX") == "32");
+    CHECK(set("PARAMESH_CFG_LOG_LEVEL") == "error");  // already set
+    std::ofstream{state_dir + "/paramesh.conf"} << "no equals sign\n";
+    CHECK(paramesh::platform_load_settings(state_dir).error().code == Errc::kInvalidArgument);
+    ::unsetenv("PARAMESH_CFG_LOG_LEVEL");
+    ::unsetenv("PARAMESH_CFG_TASK_PREFETCH");
+    ::unsetenv("PARAMESH_CFG_THRASH_HOLD_MAX");
+    // NOLINTEND(concurrency-mt-unsafe)
+    std::filesystem::remove_all(state_dir);
 }
 
 TEST_CASE("the JSON codec round-trips a nested value and rejects text that is not JSON") {

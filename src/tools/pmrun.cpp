@@ -158,6 +158,11 @@ int pmrun(std::span<const std::string_view> args) {
     request.argv.assign(args.begin() + static_cast<std::ptrdiff_t>(at) + 1, args.end());
 
     const std::string socket = socket_path(state_dir);
+    // The launcher's tunables, from the file beside the socket, as pmd gives its workers theirs.
+    if (const Result<void> loaded = platform_load_settings(socket.substr(0, socket.rfind('/')));
+        !loaded.ok()) {
+        return fail(2, std::string{"cannot "} + loaded.error().what);
+    }
     sockaddr_un to{};
     to.sun_family = AF_UNIX;
     const int pmd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);

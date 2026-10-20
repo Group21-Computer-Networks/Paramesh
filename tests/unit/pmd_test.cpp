@@ -2650,3 +2650,42 @@ TEST_CASE("with RAM caps, a job that fewer nodes accept than it asked for still 
     CHECK(field(result, "indexes") == std::to_string(kHugeSquares));
     CHECK(field(result, "every_node") == "yes");
 }
+
+// ---- tunables from the state directory (X-config)
+// --------------------------------------------------------------
+
+TEST_CASE("pmrun gives the launcher the tunables of paramesh.conf; a variable already set wins" *
+          doctest::skip(!region_can_be_mapped())) {
+    const Daemon alone;
+    const std::string out = alone.state_dir + "/out";
+    // matmul asks for the default grain: range / (task.default_grain x worker slots). The
+    // daemon is node 5.
+    const auto chunks = [&] {
+        REQUIRE(run_tool(pmrun_path(),
+                         {"-n", "1", "--state-dir", alone.state_dir, matmul_path(), "256"}, out,
+                         120) == 0);
+        const std::string printed = contents(out);
+        const auto at = printed.find("chunks by node: 5:");
+        INFO(printed);
+        REQUIRE(at != std::string::npos);
+        return std::stoul(printed.substr(at + 18));
+    };
+    const unsigned long plain = chunks();  // 4 chunks a slot, the plan's default
+
+    std::ofstream{alone.state_dir + "/paramesh.conf"}
+        << "# twice the default\ntask.default_grain = 8\n";
+    const unsigned long eight = chunks();
+    MESSAGE("chunks: " << plain << " by default, " << eight << " with task.default_grain = 8");
+    CHECK(eight > plain);
+
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): no other thread of this process is running
+    ::setenv("PARAMESH_CFG_TASK_DEFAULT_GRAIN", "4", 1);
+    CHECK(chunks() == plain);
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): as above
+    ::unsetenv("PARAMESH_CFG_TASK_DEFAULT_GRAIN");
+
+    std::ofstream{alone.state_dir + "/paramesh.conf"} << "not a setting\n";
+    CHECK(run_tool(pmrun_path(), {"-n", "1", "--state-dir", alone.state_dir, matmul_path(), "256"},
+                   out, 60) == 2);
+    CHECK(contents(out).find("cannot parse configuration") != std::string::npos);
+}

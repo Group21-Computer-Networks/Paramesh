@@ -1,5 +1,6 @@
 // pmd: the ParaMesh daemon of one node. See pmd.h for what this first form of it does.
 
+#include "platform/factory.h"
 #include "pmd/pmd.h"
 
 #include <pthread.h>
@@ -7,6 +8,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <string>
 #include <string_view>
@@ -41,6 +43,19 @@ sigset_t stop_signals() {
     return set;
 }
 
+// log.level, as the job processes take it: info unless set.
+paramesh::LogLevel log_level() {
+    const char* set = std::getenv("PARAMESH_CFG_LOG_LEVEL");  // NOLINT(concurrency-mt-unsafe)
+    const std::string_view name = set != nullptr ? set : "info";
+    if (name == "debug") {
+        return paramesh::LogLevel::kDebug;
+    }
+    if (name == "warn") {
+        return paramesh::LogLevel::kWarn;
+    }
+    return name == "error" ? paramesh::LogLevel::kError : paramesh::LogLevel::kInfo;
+}
+
 int serve(const std::vector<std::string_view>& args) {
     if (args.size() == 1 && (args[0] == "--help" || args[0] == "-h")) {
         static_cast<void>(std::fputs(paramesh::pmd_usage().data(), stdout));
@@ -56,9 +71,15 @@ int serve(const std::vector<std::string_view>& args) {
             std::fprintf(stderr, "pmd: %s\n%s", config.error().what, paramesh::pmd_usage().data()));
         return 2;
     }
+    // The tunables, for this daemon and the workers it starts (docs/PLAN.md, Configuration).
+    if (const paramesh::Result<void> loaded =
+            paramesh::platform_load_settings(config.value().state_dir);
+        !loaded.ok()) {
+        static_cast<void>(std::fprintf(stderr, "pmd: cannot %s\n", loaded.error().what));
+        return 2;
+    }
     paramesh::Result<paramesh::Platform> platform = paramesh::platform_open(
-        {}, paramesh::PlatformOptions{config.value().node, paramesh::JobId{0}, 2,
-                                      paramesh::LogLevel::kInfo});
+        {}, paramesh::PlatformOptions{config.value().node, paramesh::JobId{0}, 2, log_level()});
     if (!platform.ok()) {
         static_cast<void>(std::fprintf(stderr, "pmd: %s\n", platform.error().what));
         return 1;

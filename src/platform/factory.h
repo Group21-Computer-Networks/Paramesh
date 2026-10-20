@@ -61,6 +61,13 @@ Result<Platform> platform_open(const ConfigMap& config, const PlatformOptions& o
 // name.
 std::unique_ptr<ConfigLoader> platform_config_loader();
 
+// The tunables in `<state_dir>/paramesh.conf`, each as PARAMESH_CFG_<KEY> (upper case, `.` as
+// `_`), the way they reach job processes (docs/PROTOCOL.md, section 10). A variable already set
+// wins over the file. No file, nothing to do. Call before any thread starts: it sets the
+// environment. Errc::kInvalidArgument for a line the loader refuses, Errc::kIo for a file it
+// cannot read.
+Result<void> platform_load_settings(const std::string& state_dir);
+
 }  // namespace paramesh
 
 #endif  // PARAMESH_PLATFORM_FACTORY_H
