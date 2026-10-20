@@ -18,11 +18,16 @@ struct PlacementMember {
     std::uint64_t ram_weight = 0;  // bytes of RAM contributed; 0 means it hosts no segment
 };
 
-// RAM-weighted rendezvous hashing. For each segment i, homes[i] becomes the slot of its home.
-// The result depends only on the members' node IDs and weights and on the segment number, so
-// it is the same on every node, and removing a member moves only that member's segments.
+// Bounded RAM-weighted rendezvous hashing. For each segment i, homes[i] becomes the slot of its
+// home. No member is home for more than ceil(segments x its weight / all the weights), the
+// even share its node commits to (docs/PROTOCOL.md, SPAWN_REQ). A segment whose `keep` entry
+// names a member with room stays there; the others go, in segment order, to the member with
+// room that scores highest. The result depends only on the members' node IDs and weights, the
+// segment number and `keep`, so it is the same on every node. With `keep` the current homes,
+// removing a member moves only that member's segments.
 // Errc::kInvalidArgument if no member has a weight above 0.
-Result<void> store_place_segments(std::span<const PlacementMember> members, std::span<Slot> homes);
+Result<void> store_place_segments(std::span<const PlacementMember> members, std::span<Slot> homes,
+                                  std::span<const NodeId> keep = {});
 
 }  // namespace paramesh
 

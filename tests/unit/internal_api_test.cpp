@@ -129,6 +129,8 @@ public:
     [[nodiscard]] std::uint64_t ram_bytes() const noexcept override {
         return pages_.size() * paramesh::kPageSize;
     }
+    void grow(std::uint64_t /*ram_cap_bytes*/,
+              std::uint64_t /*spill_budget_bytes*/) noexcept override {}
 
 private:
     std::map<std::uint64_t, PageArray> pages_;
