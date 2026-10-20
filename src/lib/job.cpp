@@ -81,10 +81,9 @@ struct Settings {
     std::vector<Member> members;  // launcher first; slots in this order
     Nanos start_timeout = std::chrono::seconds{10};
     std::string pmd_socket;  // PARAMESH_PMD_SOCKET; empty when the job runs without pmd
-    LogLevel log_level = LogLevel::kWarn;       // log.level
-    bool affinity = true;                       // PARAMESH_CFG_TASK_AFFINITY=0 turns M3-3 off
-    std::uint64_t cache_share = 25;             // mem.cache_share: percent of the RAM cap
-    std::optional<std::uint64_t> spill_budget;  // spill.budget, bytes; else the RAM cap
+    LogLevel log_level = LogLevel::kWarn;  // log.level
+    bool affinity = true;                  // PARAMESH_CFG_TASK_AFFINITY=0 turns M3-3 off
+    std::uint64_t cache_share = 25;        // mem.cache_share: percent of the RAM cap
     // coh.busy_retry_backoff: PARAMESH_CFG_COH_BUSY_RETRY_BACKOFF sets the first wait, in ms.
     Nanos busy_initial = std::chrono::milliseconds{5};
     Nanos busy_max = std::chrono::milliseconds{100};
@@ -180,9 +179,6 @@ bool read_settings(Settings& s) {
     }
     if (const char* delay = env("PARAMESH_TEST_REPLY_DELAY_MS")) {
         s.reply_delay = std::chrono::milliseconds{std::strtol(delay, nullptr, 10)};
-    }
-    if (const char* budget = env("PARAMESH_CFG_SPILL_BUDGET")) {
-        s.spill_budget = std::strtoull(budget, nullptr, 10);
     }
     if (const char* affinity = env("PARAMESH_CFG_TASK_AFFINITY")) {
         s.affinity = std::string_view{affinity} != "0";
@@ -298,12 +294,14 @@ public:
         }
         // The RAM cap from pmd, split between the local cache and the home store
         // (mem.cache_share). Without pmd there is no cap.
-        const std::uint64_t cache_bytes = ram_ * s_.cache_share / 100;
-        // The spill file (M4-3): spill.budget is the RAM cap unless set, so no cap, no file.
-        // It is made beside pmd's socket, in the daemon's state directory.
+        // A node that joined mid-run is home for nothing: all of it is the cache.
+        cache_bytes_ = (quota_flags_ & kQuotaNoHomes) != 0 ? ram_ : ram_ * s_.cache_share / 100;
+        const std::uint64_t cache_bytes = cache_bytes_;
+        // The spill file (M4-3), of the spill pmd committed: no cap, no file. It is made beside
+        // pmd's socket, in the daemon's state directory.
         StoreConfig home;
         home.ram_cap_bytes = ram_ - cache_bytes;
-        home.spill_budget_bytes = ram_ == 0 ? 0 : s_.spill_budget.value_or(ram_);
+        home.spill_budget_bytes = ram_ == 0 ? 0 : spill_;
         home.job = s_.job;
         const char* tmp = env("TMPDIR");
         home.spill_dir = !s_.pmd_socket.empty() ? s_.pmd_socket.substr(0, s_.pmd_socket.rfind('/'))
@@ -849,6 +847,8 @@ private:
         }
         quota_ = quota.value().threads;
         ram_ = quota.value().ram_bytes;
+        spill_ = quota.value().spill_bytes;
+        quota_flags_ = quota.value().flags;
 
         if (is_launcher()) {
             const auto bound = static_cast<std::uint16_t>(std::min<std::uint32_t>(threads, 65535));
@@ -870,7 +870,18 @@ private:
                 admitted.value().members.size() > kMaxNodes) {
                 return PM_ERR_NETWORK;
             }
-            quota_ = admitted.value().quota;
+            // Then L_QUOTA: what this node committed to the job.
+            const Result<Frame> committed = frame_read(pmd_fd_, *platform_.checksum);
+            const Result<LQuotaPayload> own = committed.ok()
+                                                  ? wire_decode_l_quota(committed.value().payload)
+                                                  : Result<LQuotaPayload>{committed.error()};
+            if (!own.ok() || committed.value().header.opcode != Opcode::kLQuota) {
+                return PM_ERR_NETWORK;
+            }
+            quota_ = own.value().threads;
+            ram_ = own.value().ram_bytes;
+            spill_ = own.value().spill_bytes;
+            quota_flags_ = own.value().flags;
             for (const SegMapMember& member : admitted.value().members) {
                 if (member.node != s_.self) {
                     s_.members.push_back(Member{member.node,
@@ -958,6 +969,42 @@ private:
         after(std::chrono::seconds{1}, [this] { send_stats(); });
     }
 
+    // True when the newest map makes this node home for more than what pmd committed holds:
+    // the home store's RAM, the commitment less the cache, and the spill.
+    [[nodiscard]] bool room_short() const noexcept {
+        const auto homed =
+            static_cast<std::uint64_t>(std::count(homes_.begin(), homes_.end(), my_slot_));
+        return ram_ != 0 && homed * kSegmentSize > ram_ - cache_bytes_ + spill_;
+    }
+
+    // L_QUOTA: pmd's commitment, grown when this node was made home for more. The store takes
+    // the new caps; the start or the segments on their way go on once they hold its homes.
+    void grant_room(std::uint64_t ram, std::uint64_t spill) noexcept {
+        if (ram_ == 0 || (ram <= ram_ && spill <= spill_)) {
+            return;
+        }
+        ram_ = std::max(ram_, ram);
+        spill_ = std::max(spill_, spill);
+        store_->grow(ram_ - cache_bytes_, spill_);
+        if (!room_wanted_ || room_short()) {
+            return;
+        }
+        room_wanted_ = false;
+        if (is_launcher()) {
+            up_if_room();
+        } else {
+            advance_start();
+        }
+        take_segments();
+    }
+
+    // Launcher: up once every member has the first map and this node has room for its homes.
+    void up_if_room() noexcept {
+        if (!up_ && start_acked_ && !room_wanted_) {
+            set_up();
+        }
+    }
+
     // L_SEGMENTS: how many segments each member of `map` is home for.
     void report_segments(const SegMapPayload& map) noexcept {
         LSegmentsPayload counts{epoch_, {}};
@@ -1020,6 +1067,10 @@ private:
                     if (tasks_ready_ && tasks_.has_value()) {
                         tasks_->set_quota(quota.value().threads);
                     }
+                    on_network_thread(
+                        [this, ram = quota.value().ram_bytes, spill = quota.value().spill_bytes] {
+                            grant_room(ram, spill);
+                        });
                 }
             } else if (frame.value().header.opcode == Opcode::kLLeave) {
                 on_network_thread([this] { begin_leave(); });
@@ -1056,9 +1107,10 @@ private:
             map_sent_ = true;
             send_map(kNoNode, false);
             if (s_.members.size() == 1) {
-                set_up();
+                start_acked_ = true;
+                up_if_room();
             }
-        } else if (!is_launcher() && have_map_ && !up_sent_) {
+        } else if (!is_launcher() && have_map_ && !up_sent_ && !room_wanted_) {
             up_sent_ = true;
             std::array<std::byte, 4> ack{};
             static_cast<void>(wire_encode(SegMapAckPayload{epoch_}, ack));
@@ -1110,7 +1162,13 @@ private:
             placement.push_back({member.node, member.slot, weight});
         }
         map.homes.resize(segments_);
-        if (!store_place_segments(placement, map.homes).ok()) {
+        // The current homes stay where they are, so a leave moves only the leaver's segments.
+        std::vector<NodeId> keep;
+        keep.reserve(homes_.size());
+        for (const Slot home : homes_) {
+            keep.push_back(slot_node_.at(home.value));
+        }
+        if (!store_place_segments(placement, map.homes, keep).ok()) {
             abort_job(Status::kInternal, kNoNode, "cannot place the segments");
             return;
         }
@@ -1132,7 +1190,8 @@ private:
     // Launcher: every member has applied the newest map.
     void map_acked() noexcept {
         if (!up_) {
-            set_up();
+            start_acked_ = true;
+            up_if_room();
             return;
         }
         if (join_sent_) {  // the newest map names the node that joined: it may take chunks
@@ -1455,7 +1514,7 @@ private:
     // page into the store, which may be making room. After the last frame of a segment this
     // node serves it and says SEG_MIGRATE_DONE.
     void take_segments() noexcept {
-        while (!incoming_.empty() && !aborting_) {
+        while (!incoming_.empty() && !aborting_ && !room_wanted_) {  // room first
             const Incoming& frame = incoming_.front();
             const Result<SegMigratePayload> batch = wire_decode_seg_migrate(frame.bytes);
             if (batch.ok() && frame.epoch.value > epoch_.value) {
@@ -1576,7 +1635,8 @@ private:
             }
         }
         have_map_ = true;
-        report_segments(map);
+        room_wanted_ = room_short();
+        report_segments(map);  // which asks pmd for more room when room_wanted_
         if (!first) {
             continue_moves();
             leave_if_done();
@@ -2335,11 +2395,14 @@ private:
     std::condition_variable report_ready_;
     std::deque<Report> reports_;
     bool reports_stop_ = false;
-    std::thread report_thread_;  // write_reports()
-    std::uint32_t quota_ = 0;    // the thread quota pmd gave; 0 without pmd
-    std::mutex quota_mu_;        // quota_ and tasks_ready_, between main() and watch_pmd()
-    bool tasks_ready_ = false;   // tasks_ is started: a new quota goes to it
-    std::uint64_t ram_ = 0;      // the RAM cap pmd gave; 0 without pmd
+    std::thread report_thread_;      // write_reports()
+    std::uint32_t quota_ = 0;        // the thread quota pmd gave; 0 without pmd
+    std::mutex quota_mu_;            // quota_ and tasks_ready_, between main() and watch_pmd()
+    bool tasks_ready_ = false;       // tasks_ is started: a new quota goes to it
+    std::uint64_t ram_ = 0;          // the RAM cap pmd gave; 0 without pmd
+    std::uint64_t spill_ = 0;        // the spill budget pmd gave
+    std::uint64_t cache_bytes_ = 0;  // the part of ram_ that is the local cache
+    std::uint16_t quota_flags_ = 0;  // L_QUOTA's flags
     std::size_t segments_ = 0;
     RegionAllocator allocator_{0};
 
@@ -2347,6 +2410,8 @@ private:
     std::unordered_set<std::uint16_t> joined_;
     bool map_sent_ = false;
     bool have_map_ = false;
+    bool start_acked_ = false;  // launcher: every member has the first map
+    bool room_wanted_ = false;  // the newest map needs more than pmd's commitment holds
     bool up_sent_ = false;
     std::size_t acks_ = 0;
     Epoch epoch_;

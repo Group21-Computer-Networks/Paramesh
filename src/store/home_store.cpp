@@ -155,6 +155,16 @@ public:
         return ram_pages_ * kPageSize;
     }
 
+    void grow(std::uint64_t ram_cap_bytes, std::uint64_t spill_budget_bytes) noexcept override {
+        const std::lock_guard<std::mutex> lock{mu_};
+        if (cap_pages_ != 0) {  // no cap stays no cap
+            cap_pages_ = std::max(cap_pages_, pages_of(ram_cap_bytes));
+        }
+        if (fd_ >= 0) {
+            budget_slots_ = std::max(budget_slots_, spill_budget_bytes / kPageSize);
+        }
+    }
+
 private:
     struct Entry {
         std::unique_ptr<Page> data;  // set while the page is in RAM
@@ -372,9 +382,9 @@ private:
         told(lock, true, page);
     }
 
-    const std::uint64_t cap_pages_;  // 0 means no cap
-    std::uint64_t budget_slots_;     // most pages in the spill file
-    StoreEvents& events_;            // NOLINT(cppcoreguidelines-avoid-const-or-ref-data-members)
+    std::uint64_t cap_pages_;     // 0 means no cap
+    std::uint64_t budget_slots_;  // most pages in the spill file
+    StoreEvents& events_;         // NOLINT(cppcoreguidelines-avoid-const-or-ref-data-members)
     const int fd_;
 
     mutable std::mutex mu_;  // never held across a read or write of the file

@@ -204,6 +204,29 @@ TEST_CASE("the store refuses a page only when RAM and the spill budget are both 
     REQUIRE(store->put(PageId{3}, filled(3)).ok());
 }
 
+TEST_CASE("a store grown by its node's commitment takes the pages it refused, and never shrinks") {
+    Told told;
+    const auto store = spilling_store(1, 1, told);
+    REQUIRE(store->put(PageId{1}, filled(1)).ok());
+    REQUIRE(told.spilled(1).size() == 1);
+    REQUIRE(store->put(PageId{2}, filled(2)).ok());
+    CHECK(store->put(PageId{3}, filled(3)).error().code == Errc::kNoSpace);  // both full
+
+    store->grow(2 * paramesh::kPageSize, 1 * paramesh::kPageSize);  // one more page of RAM
+    REQUIRE(store->put(PageId{3}, filled(3)).ok());
+    CHECK(store->ram_bytes() == 2 * paramesh::kPageSize);
+    store->grow(paramesh::kPageSize, 3 * paramesh::kPageSize);  // more spill; RAM does not fall
+    CHECK(store->ram_bytes() == 2 * paramesh::kPageSize);
+    CHECK(store->put(PageId{4}, filled(4)).error().code == Errc::kState);  // it spills to take it
+    REQUIRE(told.spilled(2).size() == 2);
+    REQUIRE(store->put(PageId{4}, filled(4)).ok());
+    for (std::uint64_t page = 1; page <= 4; page++) {
+        const auto found = store->get(PageId{page}, out_of_use());
+        REQUIRE(found.ok());
+        CHECK(found.value() != paramesh::StoreLookup::kAbsent);
+    }
+}
+
 TEST_CASE("forty pages through four places in RAM: every page comes back as it was put") {
     Told told;
     constexpr std::uint64_t kPages = 40;
@@ -250,7 +273,14 @@ TEST_CASE("placement is the same on every node: it does not depend on the order 
 
 TEST_CASE("removing one node moves only that node's segments") {
     const std::vector<Slot> before = place(three());
-    const std::vector<Slot> after = place({three()[0], three()[2]});  // node 5, slot 1, has left
+    std::vector<NodeId> keep;  // the current homes, by node
+    keep.reserve(before.size());
+    for (const Slot home : before) {
+        keep.push_back(three()[home.value].node);
+    }
+    std::vector<Slot> after(kSegments);
+    const std::vector<PlacementMember> left = {three()[0], three()[2]};  // node 5, slot 1, left
+    REQUIRE(paramesh::store_place_segments(left, after, keep).ok());
     std::size_t moved = 0;
     for (std::size_t s = 0; s < kSegments; s++) {
         if (before[s] == Slot{1}) {
@@ -275,6 +305,23 @@ TEST_CASE(
     std::vector<PlacementMember> with_guest = three();
     with_guest.push_back({NodeId{12}, Slot{3}, 0});  // joined mid-run: hosts no segment
     CHECK(place(with_guest) == homes);
+
+    // No member is home for more than its weighted part, rounded up: what its node commits.
+    CHECK(count(homes, 0) == 512);
+    CHECK(count(homes, 1) == 1024);
+    CHECK(count(homes, 2) == 512);
+    std::vector<Slot> six(6);
+    const std::vector<PlacementMember> equal = {
+        {NodeId{1}, Slot{0}, 1}, {NodeId{2}, Slot{1}, 1}, {NodeId{3}, Slot{2}, 1}};
+    REQUIRE(paramesh::store_place_segments(equal, six).ok());
+    CHECK(count(six, 0) == 2);
+    CHECK(count(six, 1) == 2);
+    CHECK(count(six, 2) == 2);
+    std::vector<Slot> seven(7);  // 7 over 3: at most 3 on one
+    REQUIRE(paramesh::store_place_segments(equal, seven).ok());
+    for (std::uint8_t slot = 0; slot < 3; slot++) {
+        CHECK(count(seven, slot) <= 3);
+    }
 
     std::vector<Slot> none(4);
     const std::vector<PlacementMember> no_ram = {{NodeId{3}, Slot{0}, 0}};

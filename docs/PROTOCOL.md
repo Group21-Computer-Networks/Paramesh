@@ -227,16 +227,41 @@ Asks a peer to start one worker process for a job.
 | 10 | 2 | `threads_per_node` | The job's own upper bound on worker threads per node; 0 for none. |
 | 12 | 8 | `region_bytes` | Size of the job's shared region. |
 | 20 | 32 | `binary_hash` | SHA-256 of the launcher's executable. |
-| 52 | var | `path` | `str16`: absolute path of the executable, the same on every node. |
+| 52 | 2 | `nodes` | The number of nodes N the job asked for, the launcher included. Added by X-node-commit, with the person's approval. |
+| 54 | 2 | reserved | |
+| 56 | var | `path` | `str16`: absolute path of the executable, the same on every node. |
 | var | var | `cwd` | `str16`: the launcher's working directory. |
 | var | 2 | `argc` | Number of arguments that follow, not counting the program name. |
 | var | var | `argv` | `argc` values of `str16`. |
 
-Fixed part: 52 bytes. Size: 52 bytes plus the variable part, at most 65,536 bytes.
+Fixed part: 56 bytes. Size: 56 bytes plus the variable part, at most 65,536 bytes.
 
 The peer hashes the file at `path`. If the hash differs it replies `SPAWN_DECLINE` with status
 `BINARY_MISMATCH`. If it accepts, it starts the process with the environment of section 10,
 waits for the process's `L_REGISTER`, and replies `SPAWN_OK`.
+
+**Commitment.** A node with a RAM cap commits to each job its even share of the region: the
+region's 2 MB segments divided by `nodes`, rounded up, then divided by the 90% admission
+headroom and rounded up to whole pages. RAM comes first, from what no other job has
+committed. Spill covers the rest of the need, and at least what the home store, which gets
+the RAM less `mem.cache_share`, leaves of the share. A node that cannot commit that much
+replies `SPAWN_DECLINE` with `NO_CAPACITY`. The launcher's node commits its own share the
+same way when it admits the job. The job process gets the commitment as its `L_QUOTA`, and
+`HELLO`'s `free_ram` and `free_spill` fall by it until the job's process on that node has
+gone. A node with no RAM cap commits nothing and takes any job.
+
+A node asked with `MID_RUN` is home for nothing (section 8.3). It commits only a local cache,
+`mem.cache_share` of the need above, in whole pages, and no spill, and its `L_QUOTA` says so
+with `NO_HOMES`.
+
+A commitment grows when a map makes the node home for more than it holds: the RAM less the
+cache, plus the spill. That happens after a leave, or when the job runs on fewer nodes than it
+asked for. The job's `L_SEGMENTS` tells the node's `pmd`, which commits the difference from
+what is free, RAM first and then spill, and answers with `L_QUOTA`. If what is free falls short
+it answers with `L_ABORT` and `NO_CAPACITY`, and the job ends. Until the room comes, the job
+process takes no segment that `SEG_MIGRATE` brings, a worker holds the `SEG_MAP_ACK` of its
+first map, and a launcher does not finish starting. Added by X-node-commit, with the person's
+approval.
 
 ### `SPAWN_OK` — 0x11
 
@@ -266,7 +291,9 @@ only `SPAWN_OK`.
 **[GATE P8]** Still open #10. Proposal: when fewer than N nodes accept, the job runs on those
 that did, provided their commitments still pass the capacity check, and `pmrun` prints how
 many it got. The plan's automatic refill (M4-7) then offers the job to peers seen later.
-Otherwise the job is refused.
+Otherwise the job is refused. Since X-node-commit each member commits its share of N, so the
+check counts what the members have free beside their commitments, and the commitments grow
+when the job starts on fewer.
 
 **[GATE P16]** The capacity check sums `ram_commit` and `spill_commit` from other nodes, and
 node choice ranks peers by the free capacity in their `HELLO`. Both are values received from
@@ -684,7 +711,8 @@ These fix the order of messages. The transitions inside each node are in `STATE_
    replies `L_ADMIT_REFUSED`, and `pm_init()` returns `PM_ERR_REFUSED`. No worker has started.
 5. Otherwise it sends `SPAWN_REQ` to the N-1 peers with the most free capacity. Each starts a
    worker and replies `SPAWN_OK`, or replies `SPAWN_DECLINE` and is replaced by the next peer.
-6. The `pmd` replies `L_ADMIT_OK` with the members.
+6. The `pmd` replies `L_ADMIT_OK` with the members, then `L_QUOTA` with what it committed to
+   the job.
 7. The processes connect, lower node ID to higher, and exchange `JOIN_JOB`. A worker knows the
    launcher's address from its environment; the launcher knows each worker's from `L_ADMIT_OK`.
 8. With a connection to every member, the launcher sends `SEG_MAP` at epoch 1. Workers connect
@@ -709,7 +737,8 @@ spawns every process when `pmrun` runs, and M4-4's "refused before any process s
    drops its read copies.
 4. The launcher sends `SEG_MAP` at the next epoch, in which the leaver hosts no segment.
 5. For each segment it was home for, the leaver stops taking new requests, lets requests in
-   progress finish, and sends the segment to its new home with `SEG_MIGRATE`. Until the new
+   progress finish, and sends the segment to its new home with `SEG_MIGRATE`. A new home whose
+   commitment must grow first takes the segment once it has (section 6, `SPAWN_REQ`). Until the new
    home has the segment, it answers requests for it with `BUSY_RETRY`. A request that still
    reaches the leaver gets `REDIRECT`.
 6. When every `SEG_MIGRATE_DONE` has arrived, the leaver sends `LEAVE_DONE`.
@@ -817,7 +846,8 @@ Fixed size: 28 bytes.
 ### `L_SEGMENTS` — 0x85
 
 How many of the job's segments each member is home for, sent on every new epoch, so that
-`pmd` can compute segment-seconds from its own node's map.
+`pmd` can compute segment-seconds from its own node's map, and grow its commitment when the
+map makes its node home for more than it holds (section 6, `SPAWN_REQ`).
 
 | Offset | Size | Field | Meaning |
 | --- | --- | --- | --- |
@@ -872,16 +902,19 @@ Fixed part: 100 bytes. Size: 100 + 12 × `segment_count`, at most 24,676 bytes.
 
 ### `L_QUOTA` — 0x90
 
-Sent after `L_REGISTER` and whenever the quota changes. A thread over the quota parks at its
-next task boundary.
+Sent after `L_REGISTER`, to a launcher after `L_ADMIT_OK`, whenever the quota changes, and in
+answer to an `L_SEGMENTS` that makes the node home for more than its commitment holds. A
+thread over the quota parks at its next task boundary. The RAM and spill are what the node
+committed to the job (section 6, `SPAWN_REQ`); they only ever grow.
 
 | Offset | Size | Field | Meaning |
 | --- | --- | --- | --- |
 | 0 | 2 | `threads` | The most worker threads that may run chunks. |
-| 2 | 2 | reserved | |
+| 2 | 2 | `flags` | `0x0001` `NO_HOMES`: all of `ram_bytes` is the local cache; the process joined mid-run and is home for nothing. Added by X-node-commit, with the person's approval. |
 | 4 | 8 | `ram_bytes` | The most RAM the process may hold page data in: its home store and its local cache together, split by `mem.cache_share`. 0 for no cap. Added by M4-2, with the person's approval. |
+| 12 | 8 | `spill_bytes` | The most its spill file may hold. Added by X-node-commit, with the person's approval. |
 
-Fixed size: 12 bytes.
+Fixed size: 20 bytes.
 
 ### `L_LEAVE` — 0x91
 
@@ -896,7 +929,10 @@ Fixed size: 4 bytes.
 
 ### `L_ABORT` — 0x92
 
-To a launcher: end the job now.
+To a job process: end the job now. A launcher's `pmd` sends it for Ctrl+C on `pmrun` or
+`pm leave --force`; any node's `pmd` sends it, with `NO_CAPACITY`, when it cannot grow its
+commitment (section 6, `SPAWN_REQ`). A worker ends the job as for any fatal condition.
+Widened from launchers only by X-node-commit, with the person's approval.
 
 | Offset | Size | Field | Meaning |
 | --- | --- | --- | --- |

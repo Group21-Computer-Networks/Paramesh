@@ -366,14 +366,16 @@ TEST_CASE("the daemon payloads: SPAWN_REQ, SPAWN_OK, SPAWN_DECLINE, L_REGISTER a
     spawn.threads_per_node = 4;
     spawn.region_bytes = 0x10000000;
     spawn.binary_hash.fill(std::byte{0xAB});
+    spawn.nodes = 3;
     spawn.path = "/a";
     spawn.cwd = "/b";
     spawn.argv = {"x", ""};
     const Bytes bytes = encoded(spawn);
-    // The fixed part, then str16 "/a", str16 "/b", argc 2, str16 "x", str16 "".
+    // The fixed part, nodes 3 and two reserved bytes, then str16 "/a", str16 "/b", argc 2,
+    // str16 "x", str16 "".
     Bytes expected = hex("00 03 00 01 0A 00 00 01 13 88 00 04 00 00 00 00 10 00 00 00");
     expected.insert(expected.end(), 32, std::byte{0xAB});
-    const Bytes tail = hex("00 02 2F 61 00 02 2F 62 00 02 00 01 78 00 00");
+    const Bytes tail = hex("00 03 00 00 00 02 2F 61 00 02 2F 62 00 02 00 01 78 00 00");
     expected.insert(expected.end(), tail.begin(), tail.end());
     CHECK(bytes == expected);
     const auto back = paramesh::wire_decode_spawn_req(bytes);
@@ -384,6 +386,7 @@ TEST_CASE("the daemon payloads: SPAWN_REQ, SPAWN_OK, SPAWN_DECLINE, L_REGISTER a
     CHECK(back.value().threads_per_node == 4);
     CHECK(back.value().region_bytes == 0x10000000);
     CHECK(back.value().binary_hash == spawn.binary_hash);
+    CHECK(back.value().nodes == 3);
     CHECK(back.value().path == "/a");
     CHECK(back.value().cwd == "/b");
     CHECK(back.value().argv == spawn.argv);
@@ -447,11 +450,14 @@ TEST_CASE("the daemon payloads: SPAWN_REQ, SPAWN_OK, SPAWN_DECLINE, L_REGISTER a
     registered[4] = std::byte{3};  // neither launcher nor worker
     CHECK(paramesh::wire_decode_l_register(registered).error().code == Errc::kProtocol);
 
-    CHECK(encoded(paramesh::LQuotaPayload{3, 0x40000000}) ==
-          hex("00 03 00 00 00 00 00 00 40 00 00 00"));
-    const auto quota = paramesh::wire_decode_l_quota(hex("00 03 00 00 00 00 00 00 40 00 00 00"));
+    const Bytes quota_bytes = hex("00 03 00 01 00 00 00 00 40 00 00 00 00 00 00 00 00 20 00 00");
+    CHECK(encoded(paramesh::LQuotaPayload{3, 0x40000000, 0x200000, paramesh::kQuotaNoHomes}) ==
+          quota_bytes);
+    const auto quota = paramesh::wire_decode_l_quota(quota_bytes);
     CHECK(quota.value().threads == 3);
     CHECK(quota.value().ram_bytes == 0x40000000);
+    CHECK(quota.value().spill_bytes == 0x200000);
+    CHECK(quota.value().flags == paramesh::kQuotaNoHomes);
     CHECK(paramesh::wire_decode_l_quota(hex("00 03 00 00")).error().code == Errc::kProtocol);
 }
 

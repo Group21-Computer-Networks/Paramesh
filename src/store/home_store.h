@@ -64,6 +64,10 @@ public:
 
     // Bytes of page data held in RAM now, for the cap and for the status API.
     [[nodiscard]] virtual std::uint64_t ram_bytes() const noexcept = 0;
+
+    // Raises the RAM cap and the spill budget to these, when its node commits more to the job
+    // (added by X-node-commit). Neither ever falls. A store made without a spill file keeps none.
+    virtual void grow(std::uint64_t ram_cap_bytes, std::uint64_t spill_budget_bytes) noexcept = 0;
 };
 
 struct StoreConfig {

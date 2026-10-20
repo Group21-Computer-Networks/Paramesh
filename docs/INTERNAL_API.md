@@ -735,6 +735,10 @@ public:
 
     // Bytes of page data held in RAM now, for the cap and for the status API.
     [[nodiscard]] virtual std::uint64_t ram_bytes() const noexcept = 0;
+
+    // Raises the RAM cap and the spill budget to these, when its node commits more to the job
+    // (added by X-node-commit). Neither ever falls. A store made without a spill file keeps none.
+    virtual void grow(std::uint64_t ram_cap_bytes, std::uint64_t spill_budget_bytes) noexcept = 0;
 };
 
 struct StoreConfig {
@@ -791,11 +795,17 @@ struct PlacementMember {
     std::uint64_t ram_weight = 0;  // bytes of RAM contributed; 0 means it hosts no segment
 };
 
-// RAM-weighted rendezvous hashing. For each segment i, homes[i] becomes the slot of its home.
-// The result depends only on the members' node IDs and weights and on the segment number, so
-// it is the same on every node, and removing a member moves only that member's segments.
+// Bounded RAM-weighted rendezvous hashing. For each segment i, homes[i] becomes the slot of its
+// home. No member is home for more than ceil(segments x its weight / all the weights), the
+// even share its node commits to (docs/PROTOCOL.md, SPAWN_REQ). A segment whose `keep` entry
+// names a member with room stays there; the others go, in segment order, to the member with
+// room that scores highest. The result depends only on the members' node IDs and weights, the
+// segment number and `keep`, so it is the same on every node. With `keep` the current homes,
+// removing a member moves only that member's segments. Bound and `keep` added by
+// X-node-commit, with the person's approval.
 // Errc::kInvalidArgument if no member has a weight above 0.
-Result<void> store_place_segments(std::span<const PlacementMember> members, std::span<Slot> homes);
+Result<void> store_place_segments(std::span<const PlacementMember> members, std::span<Slot> homes,
+                                  std::span<const NodeId> keep = {});
 ```
 
 **[GATE I6]** M1-6's card lists both `src/store/` and `src/rt/` for the hashing of segments to

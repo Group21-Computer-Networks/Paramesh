@@ -561,6 +561,8 @@ Result<std::size_t> wire_encode(const SpawnReqPayload& payload, std::span<std::b
     w.put(payload.threads_per_node, 2);
     w.put(payload.region_bytes, 8);
     w.bytes(payload.binary_hash);
+    w.put(payload.nodes, 2);
+    w.put(0, 2);  // reserved
     put_str16(w, payload.path);
     put_str16(w, payload.cwd);
     w.put(payload.argv.size(), 2);
@@ -584,6 +586,8 @@ Result<SpawnReqPayload> wire_decode_spawn_req(std::span<const std::byte> in) {
     payload.region_bytes = r.get(8);
     const std::span<const std::byte> hash = r.take(payload.binary_hash.size());
     std::copy(hash.begin(), hash.end(), payload.binary_hash.begin());
+    payload.nodes = static_cast<std::uint16_t>(r.get(2));
+    r.take(2);
     payload.path = get_str16(r);
     payload.cwd = get_str16(r);
     const std::size_t argc = r.get(2);
@@ -1045,16 +1049,18 @@ Result<LRegisterPayload> wire_decode_l_register(std::span<const std::byte> in) {
 Result<std::size_t> wire_encode(const LQuotaPayload& payload, std::span<std::byte> out) {
     Writer w{out};
     w.put(payload.threads, 2);
-    w.put(0, 2);  // reserved
+    w.put(payload.flags, 2);
     w.put(payload.ram_bytes, 8);
+    w.put(payload.spill_bytes, 8);
     return w.done();
 }
 
 Result<LQuotaPayload> wire_decode_l_quota(std::span<const std::byte> in) {
     Reader r{in};
     LQuotaPayload payload{static_cast<std::uint16_t>(r.get(2))};
-    r.take(2);
+    payload.flags = static_cast<std::uint16_t>(r.get(2));
     payload.ram_bytes = r.get(8);
+    payload.spill_bytes = r.get(8);
     if (!r.exact()) {
         return kMalformed;
     }
