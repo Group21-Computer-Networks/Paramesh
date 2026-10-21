@@ -86,6 +86,9 @@ struct Settings {
     // are filled in at set-up. PARAMESH_CFG_TASK_AFFINITY=0 turns M3-3 off.
     TasksConfig tasks;
     std::uint64_t cache_share = 25;  // mem.cache_share: percent of the RAM cap
+    // cache.policy = cost: a victim is the cheapest to lose of cache.victim_window oldest
+    // pages; fifo, the default, is a window of 1 (X-cache-policy).
+    std::uint32_t cache_window = 1;
     // coh.busy_retry_backoff: PARAMESH_CFG_COH_BUSY_RETRY_BACKOFF sets the first wait, in ms.
     Nanos busy_initial = std::chrono::milliseconds{5};
     Nanos busy_max = std::chrono::milliseconds{100};
@@ -125,8 +128,17 @@ const char* env(const char* name) {
     return std::getenv(name);  // NOLINT(concurrency-mt-unsafe)
 }
 
-// task.*, thrash.hold_initial and thrash.hold_max from PARAMESH_CFG_*.
+// task.*, thrash.hold_initial, thrash.hold_max and cache.* from PARAMESH_CFG_*.
 void read_waits_and_grain(Settings& s) {
+    if (const char* policy = env("PARAMESH_CFG_CACHE_POLICY");
+        policy != nullptr && std::string_view{policy} == "cost") {
+        const char* window = env("PARAMESH_CFG_CACHE_VICTIM_WINDOW");
+        s.cache_window =
+            window == nullptr
+                ? 8
+                : std::max<std::uint32_t>(
+                      1, static_cast<std::uint32_t>(std::strtoul(window, nullptr, 10)));
+    }
     // task.no_task_backoff and thrash.hold_initial set the first wait, in ms, as
     // coh.busy_retry_backoff does; it doubles up to its maximum, which is never below it.
     if (const char* backoff = env("PARAMESH_CFG_TASK_NO_TASK_BACKOFF")) {
@@ -336,7 +348,7 @@ public:
         home.spill_dir = !s_.pmd_socket.empty() ? s_.pmd_socket.substr(0, s_.pmd_socket.rfind('/'))
                                                 : std::string{tmp != nullptr ? tmp : ""};
         auto store = store_open(home, *this);
-        auto cache = cache_open(cache_bytes);
+        auto cache = cache_open(cache_bytes, s_.cache_window);
         if (!store.ok() || !cache.ok()) {
             return PM_ERR_PLATFORM;
         }
@@ -2083,7 +2095,7 @@ private:
                                            ? PageProtection::kWritable
                                            : PageProtection::kReadOnly)
                              .ok();
-                    cache_->note_installed(page);
+                    cache_->note_installed(page, a.kind == NodeActionKind::kInstallWritable);
                     fault_ended(page);
                     break;
                 }
@@ -2092,6 +2104,7 @@ private:
                     break;
                 case NodeActionKind::kAllowWrites:
                     ok = mem_->write_protect(page, false).ok();
+                    cache_->note_installed(page, true);  // costlier to lose now
                     break;
                 case NodeActionKind::kDiscard:
                     ok = mem_->zap(page).ok();
@@ -2124,7 +2137,7 @@ private:
     // waiting for an upgrade is kept and queued again. False, with the page not counted, if
     // the room is still taken by pages written back and not yet acknowledged.
     bool make_room(PageId page) noexcept {
-        cache_->note_installed(page);
+        cache_->note_installed(page, false);
         std::vector<PageId> kept;
         depth_++;
         while (!aborting_ && cache_->over_budget()) {
@@ -2143,7 +2156,7 @@ private:
         }
         depth_--;
         for (const PageId kept_page : kept) {
-            cache_->note_installed(kept_page);
+            cache_->note_installed(kept_page, false);
         }
         if (cache_->full()) {
             cache_->note_discarded(page);

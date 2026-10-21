@@ -139,7 +139,7 @@ private:
 class FakeCache final : public paramesh::LocalCache {
 public:
     explicit FakeCache(std::size_t budget_pages) : budget_pages_(budget_pages) {}
-    void note_installed(PageId page) override { order_.push_back(page); }
+    void note_installed(PageId page, bool /*writable*/) override { order_.push_back(page); }
     void note_discarded(PageId page) override { std::erase(order_, page); }
     [[nodiscard]] bool over_budget() const noexcept override {
         return order_.size() > budget_pages_;
@@ -313,10 +313,10 @@ TEST_CASE("a fake home store gets what was put and reports what it never had") {
 
 TEST_CASE("a fake local cache offers the page installed first") {
     FakeCache cache{2};
-    cache.note_installed(PageId{10});
-    cache.note_installed(PageId{11});
+    cache.note_installed(PageId{10}, false);
+    cache.note_installed(PageId{11}, false);
     CHECK_FALSE(cache.over_budget());
-    cache.note_installed(PageId{12});
+    cache.note_installed(PageId{12}, false);
     CHECK(cache.over_budget());
     CHECK(cache.next_victim() == std::optional<PageId>{PageId{10}});
     cache.note_discarded(PageId{10});
