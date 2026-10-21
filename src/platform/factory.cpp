@@ -2,7 +2,11 @@
 
 #include "platform/adapters/adapters.h"
 
+#include <cctype>
+#include <cstdlib>
+#include <fstream>
 #include <map>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -95,6 +99,31 @@ Result<Platform> platform_open(const ConfigMap& config, const PlatformOptions& o
 
 std::unique_ptr<ConfigLoader> platform_config_loader() {
     return make_key_value_config_loader();
+}
+
+Result<void> platform_load_settings(const std::string& state_dir) {
+    const std::string path = state_dir + "/paramesh.conf";
+    std::ifstream file{path};
+    if (!file.is_open()) {
+        return {};
+    }
+    std::ostringstream text;
+    text << file.rdbuf();
+    if (file.bad()) {
+        return Error{Errc::kIo, 0, "read paramesh.conf in the state directory"};
+    }
+    const Result<ConfigMap> settings = platform_config_loader()->parse(text.str());
+    if (!settings.ok()) {
+        return settings.error();
+    }
+    for (const auto& [key, value] : settings.value()) {
+        std::string name = "PARAMESH_CFG_";
+        for (const char c : key) {
+            name += c == '.' ? '_' : static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+        ::setenv(name.c_str(), value.c_str(), 0);  // NOLINT(concurrency-mt-unsafe): at start-up
+    }
+    return {};
 }
 
 }  // namespace paramesh

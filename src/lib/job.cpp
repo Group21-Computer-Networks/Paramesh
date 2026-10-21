@@ -82,8 +82,10 @@ struct Settings {
     Nanos start_timeout = std::chrono::seconds{10};
     std::string pmd_socket;  // PARAMESH_PMD_SOCKET; empty when the job runs without pmd
     LogLevel log_level = LogLevel::kWarn;  // log.level
-    bool affinity = true;                  // PARAMESH_CFG_TASK_AFFINITY=0 turns M3-3 off
-    std::uint64_t cache_share = 25;        // mem.cache_share: percent of the RAM cap
+    // The task queue's tunables (task.*), with the plan's defaults; threads, slots and region
+    // are filled in at set-up. PARAMESH_CFG_TASK_AFFINITY=0 turns M3-3 off.
+    TasksConfig tasks;
+    std::uint64_t cache_share = 25;  // mem.cache_share: percent of the RAM cap
     // coh.busy_retry_backoff: PARAMESH_CFG_COH_BUSY_RETRY_BACKOFF sets the first wait, in ms.
     Nanos busy_initial = std::chrono::milliseconds{5};
     Nanos busy_max = std::chrono::milliseconds{100};
@@ -121,6 +123,32 @@ bool parse_endpoint(std::string_view text, Endpoint& out) {
 // Read once, in pm_init(), before this library starts any thread.
 const char* env(const char* name) {
     return std::getenv(name);  // NOLINT(concurrency-mt-unsafe)
+}
+
+// task.*, thrash.hold_initial and thrash.hold_max from PARAMESH_CFG_*.
+void read_waits_and_grain(Settings& s) {
+    // task.no_task_backoff and thrash.hold_initial set the first wait, in ms, as
+    // coh.busy_retry_backoff does; it doubles up to its maximum, which is never below it.
+    if (const char* backoff = env("PARAMESH_CFG_TASK_NO_TASK_BACKOFF")) {
+        s.tasks.backoff_initial =
+            std::chrono::milliseconds{std::max(1L, std::strtol(backoff, nullptr, 10))};
+        s.tasks.backoff_max = std::max(s.tasks.backoff_max, s.tasks.backoff_initial);
+    }
+    if (const char* prefetch = env("PARAMESH_CFG_TASK_PREFETCH")) {
+        s.tasks.prefetch = static_cast<std::uint32_t>(std::strtoul(prefetch, nullptr, 10));
+    }
+    if (const char* grain = env("PARAMESH_CFG_TASK_DEFAULT_GRAIN")) {  // chunks per slot
+        s.tasks.chunks_per_slot = std::max<std::uint32_t>(
+            1, static_cast<std::uint32_t>(std::strtoul(grain, nullptr, 10)));
+    }
+    if (const char* hold = env("PARAMESH_CFG_THRASH_HOLD_INITIAL")) {
+        s.thrash.hold_initial =
+            std::chrono::milliseconds{std::max(1L, std::strtol(hold, nullptr, 10))};
+    }
+    if (const char* hold = env("PARAMESH_CFG_THRASH_HOLD_MAX")) {
+        s.thrash.hold_max = std::chrono::milliseconds{std::max(1L, std::strtol(hold, nullptr, 10))};
+    }
+    s.thrash.hold_max = std::max(s.thrash.hold_max, s.thrash.hold_initial);
 }
 
 // The environment of docs/PROTOCOL.md, section 10. With PARAMESH_PMD_SOCKET the process was
@@ -181,8 +209,9 @@ bool read_settings(Settings& s) {
         s.reply_delay = std::chrono::milliseconds{std::strtol(delay, nullptr, 10)};
     }
     if (const char* affinity = env("PARAMESH_CFG_TASK_AFFINITY")) {
-        s.affinity = std::string_view{affinity} != "0";
+        s.tasks.affinity = std::string_view{affinity} != "0";
     }
+    read_waits_and_grain(s);
     if (socket != nullptr) {
         s.pmd_socket = socket;
         // Any address, a port the system chooses. The launcher is the first member: a worker
@@ -341,7 +370,7 @@ public:
             const std::lock_guard<std::mutex> lock{quota_mu_};
             quota = quota_;
         }
-        TasksConfig tasks;
+        TasksConfig tasks = s_.tasks;
         tasks.threads =
             static_cast<std::uint16_t>(std::clamp<std::uint32_t>(started, 1, kHookThreads - 1));
         tasks.total_slots = static_cast<std::uint32_t>(
@@ -349,7 +378,6 @@ public:
                                       kHookThreads - 1) *
             s_.members.size());
         tasks.region_bytes = region_bytes_;
-        tasks.affinity = s_.affinity;
         if (is_launcher()) {
             std::this_thread::sleep_for(s_.tasks_delay);
         }
