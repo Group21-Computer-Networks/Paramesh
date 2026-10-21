@@ -765,8 +765,10 @@ public:
     LocalCache& operator=(LocalCache&&) = delete;
     virtual ~LocalCache() = default;
 
-    // The page was installed, or discarded, on this node.
-    virtual void note_installed(PageId page) = 0;
+    // The page was installed, or discarded, on this node. `writable`: it may be modified, so
+    // losing it may cost a write-back too. Called again for a page already mapped (an upgrade
+    // to writable), it updates that and keeps the page's place.
+    virtual void note_installed(PageId page, bool writable) = 0;
     virtual void note_discarded(PageId page) = 0;
 
     // True while more pages are mapped than the budget allows, not counting the pages offered
@@ -777,13 +779,18 @@ public:
     // about to be installed then waits until one of them is discarded (added by M4-2).
     [[nodiscard]] virtual bool full() const noexcept = 0;
 
-    // The page mapped longest that has not been offered since it was last installed, or none.
-    // The caller raises EVICT for it; if the node machine does not free it (a page in flight),
-    // the caller asks again and gets the next.
+    // Of the `window` pages mapped longest and not offered since they were last installed, the
+    // cheapest to lose: (1 + the times it came back after this cache gave it up) x 2 if
+    // writable; the oldest on a tie. None when every page has been offered. The caller
+    // raises EVICT for it; if the node machine does not free it (a page in flight), the caller
+    // asks again and gets the next. A window of 1 is first in, first out.
     virtual std::optional<PageId> next_victim() = 0;
 };
 
-Result<std::unique_ptr<LocalCache>> cache_open(std::uint64_t budget_bytes);
+// cache.victim_window, or 1 for cache.policy = fifo (X-cache-policy, with the
+// person's approval).
+Result<std::unique_ptr<LocalCache>> cache_open(std::uint64_t budget_bytes,
+                                               std::uint32_t window = 1);
 ```
 
 `src/store/placement.h`:

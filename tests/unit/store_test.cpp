@@ -335,10 +335,10 @@ TEST_CASE(
     paramesh::LocalCache& cache = *opened.value();
     const auto page = [](std::uint64_t n) { return paramesh::PageId{n}; };
 
-    cache.note_installed(page(1));
-    cache.note_installed(page(2));
+    cache.note_installed(page(1), false);
+    cache.note_installed(page(2), false);
     CHECK_FALSE(cache.over_budget());
-    cache.note_installed(page(3));
+    cache.note_installed(page(3), false);
     CHECK(cache.over_budget());
     CHECK(cache.full());
     CHECK(cache.next_victim() == page(1));  // the oldest
@@ -346,11 +346,11 @@ TEST_CASE(
     CHECK(cache.full());                    // ... but does here, until it is discarded
 
     cache.note_discarded(page(2));  // gone some other way (an INV)
-    cache.note_installed(page(4));
-    cache.note_installed(page(5));
+    cache.note_installed(page(4), false);
+    cache.note_installed(page(5), false);
     CHECK(cache.over_budget());
     CHECK(cache.next_victim() == page(3));  // 2 is skipped
-    cache.note_installed(page(3));          // the node machine kept 3: it goes to the back
+    cache.note_installed(page(3), false);   // the node machine kept 3: it goes to the back
     CHECK(cache.over_budget());
     CHECK(cache.next_victim() == page(4));
     CHECK(cache.next_victim() == page(5));
@@ -363,19 +363,61 @@ TEST_CASE(
     cache.note_discarded(page(3));
     cache.note_discarded(page(4));
     cache.note_discarded(page(5));
-    cache.note_installed(page(1));
+    cache.note_installed(page(1), false);
     CHECK(cache.next_victim() == page(1));  // installed again: offered again
 
     auto unlimited = paramesh::cache_open(0);  // no cap
     for (std::uint64_t n = 0; n < 1000; n++) {
-        unlimited.value()->note_installed(page(n));
+        unlimited.value()->note_installed(page(n), false);
     }
     CHECK_FALSE(unlimited.value()->over_budget());
     CHECK_FALSE(unlimited.value()->full());
 
     auto tiny = paramesh::cache_open(1024);  // less than a page: one page, not "no cap"
-    tiny.value()->note_installed(page(1));
+    tiny.value()->note_installed(page(1), false);
     CHECK_FALSE(tiny.value()->full());
-    tiny.value()->note_installed(page(2));
+    tiny.value()->note_installed(page(2), false);
     CHECK(tiny.value()->full());
+}
+
+TEST_CASE("the cost-aware cache gives up, of its oldest pages, the one cheapest to lose") {
+    const auto page = [](std::uint64_t n) { return paramesh::PageId{n}; };
+    // A cache of `pages` pages that chooses among its `window` oldest.
+    const auto cache = [](std::uint64_t pages, std::uint32_t window) {
+        auto opened = paramesh::cache_open(pages * paramesh::kPageSize, window);
+        REQUIRE(opened.ok());
+        return std::move(opened).value();
+    };
+
+    // A writable page costs twice (a write-back first): the older clean one goes, not the
+    // oldest. Only the window's oldest are looked at.
+    auto dirty = cache(3, 2);
+    dirty->note_installed(page(1), true);
+    dirty->note_installed(page(2), false);
+    dirty->note_installed(page(3), false);
+    dirty->note_installed(page(4), false);
+    CHECK(dirty->next_victim() == page(2));
+
+    // An upgrade keeps the page's place and makes it costlier.
+    auto upgraded = cache(2, 2);
+    upgraded->note_installed(page(1), false);
+    upgraded->note_installed(page(2), false);
+    upgraded->note_installed(page(1), true);  // allowed writes
+    upgraded->note_installed(page(3), false);
+    CHECK(upgraded->next_victim() == page(2));
+
+    // A page given up and wanted back counts its reuse: it outlasts a newer one.
+    auto reused = cache(1, 2);
+    reused->note_installed(page(1), false);
+    reused->note_installed(page(2), false);
+    CHECK(reused->next_victim() == page(1));  // equal: the oldest
+    reused->note_discarded(page(1));
+    reused->note_installed(page(1), false);  // back
+    CHECK(reused->next_victim() == page(2));
+
+    // A window of 1 is first in, first out, whatever the costs.
+    auto fifo = cache(1, 1);
+    fifo->note_installed(page(7), true);
+    fifo->note_installed(page(8), false);
+    CHECK(fifo->next_victim() == page(7));
 }
