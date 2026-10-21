@@ -928,7 +928,7 @@ TEST_CASE("a node that asks is given a chunk whose data it is home for, else the
         REQUIRE(tasks.parallel_for(call).ok());
     };
     // Who gets which chunk when nodes 3, 2, 3, 3, 2, 2 ask in that order.
-    const auto handed_out = [&](bool affinity, bool with_array) {
+    const auto handed_out = [&](std::uint8_t affinity, bool with_array) {
         Process launcher;
         paramesh::TasksConfig config;
         config.threads = 0;
@@ -950,9 +950,37 @@ TEST_CASE("a node that asks is given a chunk whose data it is home for, else the
         return chunks;
     };
     // Node 3 takes its own two, then has none and takes the first left; node 2 the same.
-    CHECK(handed_out(true, true) == "536142");
-    CHECK(handed_out(false, true) == "123456");  // affinity off: first in, first out
-    CHECK(handed_out(true, false) == "123456");  // a call with no array has no home to prefer
+    CHECK(handed_out(1, true) == "536142");
+    CHECK(handed_out(0, true) == "123456");   // affinity off: first in, first out
+    CHECK(handed_out(1, false) == "123456");  // a call with no array has no home to prefer
+    // Affinity 2 (X-locality-sched): the same while a node has chunks of its own. Without, it
+    // takes the last chunk of the home with most pages waiting: node 1's two at first.
+    CHECK(handed_out(2, true) == "536241");
+    CHECK(handed_out(2, false) == "123456");
+
+    // And of the home that would take longest at the rate it has run: node 1 has run a chunk,
+    // node 2 none, each has one chunk of 256 pages waiting; node 3, with none, takes node 2's.
+    Process launcher;
+    paramesh::TasksConfig config;
+    config.threads = 0;
+    config.region_bytes = 3 * paramesh::kSegmentSize;
+    config.affinity = 2;
+    paramesh::Tasks tasks{launcher.net, launcher.host, launcher.sync, config};
+    queue_six(tasks, true);
+    const auto ask = [&](int node) {
+        task_frame(launcher, tasks, Opcode::kTaskReq, static_cast<std::uint16_t>(node), 1,
+                   paramesh::TaskReqPayload{0});
+        const std::string sent = launcher.net.take();
+        const auto at = sent.find("chunk ");
+        REQUIRE(at != std::string::npos);
+        return sent.substr(at + 6, 1);
+    };
+    CHECK(ask(1) == "1");
+    task_frame(launcher, tasks, Opcode::kTaskDone, 1, 0, paramesh::TaskDonePayload{1, 500, 0});
+    CHECK(ask(2) == "3");
+    CHECK(ask(3) == "5");
+    CHECK(ask(3) == "6");
+    CHECK(ask(3) == "4");  // node 2's: 256 pages over 0 run, against node 1's 256 over 1
 }
 
 // ---- a member leaves (M4-5)
