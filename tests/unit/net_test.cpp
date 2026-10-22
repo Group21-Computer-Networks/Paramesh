@@ -182,7 +182,7 @@ std::pair<pid_t, std::uint16_t> start_echo_process() {
         Node node{2, echo};
         echo.attach(*node.transport);
         static_cast<void>(node.transport->add_peer(NodeId{1}, {}));
-        static_cast<void>(::write(ends[1], &node.port, sizeof node.port));
+        [[maybe_unused]] const ssize_t sent = ::write(ends[1], &node.port, sizeof node.port);
         for (;;) {
             ::pause();
         }
