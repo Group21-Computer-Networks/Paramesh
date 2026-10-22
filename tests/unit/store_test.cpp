@@ -204,6 +204,26 @@ TEST_CASE("the store refuses a page only when RAM and the spill budget are both 
     REQUIRE(store->put(PageId{3}, filled(3)).ok());
 }
 
+TEST_CASE("a store filled to the last place says wait, not full, while its last spill is written") {
+    // One page of RAM and one of spill: two pages fit. The first page put is spilled ahead into
+    // the one place in the file; while that write is going on the store holds the page in RAM
+    // and its slot both, and a second page must be told to wait for it, never refused.
+    Told told;
+    const auto store = spilling_store(1, 1, told);
+    for (int round = 0; round < 300; round++) {
+        REQUIRE(store->put(PageId{1}, filled(1)).ok());
+        for (;;) {  // as the home does on the store's next word, but at once and again
+            const auto put = store->put(PageId{2}, filled(2));
+            if (put.ok()) {
+                break;
+            }
+            REQUIRE(put.error().code == Errc::kState);
+        }
+        store->drop(PageId{1});
+        store->drop(PageId{2});
+    }
+}
+
 TEST_CASE("a store grown by its node's commitment takes the pages it refused, and never shrinks") {
     Told told;
     const auto store = spilling_store(1, 1, told);
