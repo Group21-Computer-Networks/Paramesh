@@ -24,13 +24,17 @@ jobs:
       github.event_name == 'push' ||
       (github.event.action != 'edited' &&
        github.event.pull_request.head.repo.full_name != github.repository)
-    name: ${{ matrix.compiler }} / ${{ matrix.sanitizer || 'no sanitizer' }}
+    name: ${{ matrix.compiler }} / ${{ matrix.sanitizer || 'no sanitizer' }}${{ matrix.build_type == 'Release' && ' / release' || '' }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         compiler: [gcc, clang]
         sanitizer: ["", address, undefined, thread]
+        build_type: [Debug]
+        include:  # optimised builds, where GCC warns about more (X-release-build)
+          - {compiler: gcc, sanitizer: "", build_type: Release}
+          - {compiler: clang, sanitizer: "", build_type: Release}
     steps:
       - uses: actions/checkout@v7
       - name: Install tools
@@ -39,7 +43,7 @@ jobs:
         env:
           CC: ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }}
           CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPARAMESH_SANITIZER=${{ matrix.sanitizer }}
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DPARAMESH_SANITIZER=${{ matrix.sanitizer }}
       - name: Build
         run: cmake --build build
       - name: Unit tests

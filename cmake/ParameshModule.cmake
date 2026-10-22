@@ -11,6 +11,11 @@ function(paramesh_target_settings target)
         -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Wcast-align
         -Wnull-dereference -Wdouble-promotion -Wformat=2 -Wimplicit-fallthrough -Wundef
         $<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor -Wold-style-cast -Woverloaded-virtual>
+        # GCC checks -Wnull-dereference only with optimisation on, and at -O2 GCC 13 reports
+        # inlined library code as null dereferences (it points at plain structs such as NodeId).
+        # Debug builds never ran the check; clang-tidy's null-dereference analysis does
+        # (X-release-build).
+        $<$<AND:$<CXX_COMPILER_ID:GNU>,$<NOT:$<CONFIG:Debug>>>:-Wno-null-dereference>
         $<$<BOOL:${PARAMESH_WERROR}>:-Werror>
         $<$<BOOL:${arg_NO_EXCEPTIONS}>:$<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>>)
 endfunction()

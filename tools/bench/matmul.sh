@@ -41,10 +41,7 @@ if [ -z "$build" ]; then
     build="$root/build/bench"
     if [ ! -x "$build/apps/matmul/matmul" ]; then
         echo "building a Release build in $build ..." >&2
-        # Warnings are not errors here: with optimisation on, GCC 13 reports null dereferences
-        # in the library that the Debug builds of CI do not (docs/TODO.md).
-        cmake -S "$root" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DPARAMESH_WERROR=OFF \
-            >/dev/null &&
+        cmake -S "$root" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null &&
             cmake --build "$build" --target matmul >/dev/null 2>&1 || {
             echo "the Release build failed" >&2
             exit 1

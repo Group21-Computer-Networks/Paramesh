@@ -444,7 +444,7 @@ void Pmd::run() {
         }
         if (fds[0].revents != 0) {
             std::uint64_t count = 0;
-            static_cast<void>(::read(stop_fd_, &count, sizeof count));
+            [[maybe_unused]] const ssize_t got = ::read(stop_fd_, &count, sizeof count);
             if (stop_asked_) {
                 say_bye();
                 return;

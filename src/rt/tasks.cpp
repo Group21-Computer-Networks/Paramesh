@@ -305,6 +305,10 @@ void Tasks::done(std::uint64_t chunk_id, NodeId ran_by, std::uint64_t cpu_ns) {
     taken_.erase(found);
     ran_[ran_by.value] += chunk.hi - chunk.lo;
     const auto call = calls_.find(chunk.call);
+    if (call == calls_.end()) {
+        host_.abort_job(Status::kInternal, "a chunk was done for a call that has ended");
+        return;  // a call stays until its last chunk is done
+    }
     const std::uint64_t task_id = call->second.task_id;
     if (--call->second.chunks_left == 0) {
         calls_.erase(call);
