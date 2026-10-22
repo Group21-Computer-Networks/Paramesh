@@ -9,6 +9,7 @@
 
 #include "coh/home_machine.h"
 #include "coh/node_machine.h"
+#include "lib/prefetch.h"
 #include "lib/test_hook.h"
 #include "mem/memory_engine.h"
 #include "net/frame_io.h"
@@ -89,6 +90,10 @@ struct Settings {
     // cache.policy = cost: a victim is the cheapest to lose of cache.victim_window oldest
     // pages; fifo, the default, is a window of 1 (X-cache-policy).
     std::uint32_t cache_window = 1;
+    // prefetch.depth: how many pages a stream of read faults runs ahead (8; 0 turns it off);
+    // prefetch.streams: how many such streams are followed at once (X-prefetch).
+    std::uint32_t prefetch_depth = 8;
+    std::uint32_t prefetch_streams = 4;
     // coh.busy_retry_backoff: PARAMESH_CFG_COH_BUSY_RETRY_BACKOFF sets the first wait, in ms.
     Nanos busy_initial = std::chrono::milliseconds{5};
     Nanos busy_max = std::chrono::milliseconds{100};
@@ -138,6 +143,13 @@ void read_waits_and_grain(Settings& s) {
                 ? 8
                 : std::max<std::uint32_t>(
                       1, static_cast<std::uint32_t>(std::strtoul(window, nullptr, 10)));
+    }
+    if (const char* depth = env("PARAMESH_CFG_PREFETCH_DEPTH")) {
+        s.prefetch_depth = static_cast<std::uint32_t>(std::strtoul(depth, nullptr, 10));
+    }
+    if (const char* streams = env("PARAMESH_CFG_PREFETCH_STREAMS")) {
+        s.prefetch_streams = std::max<std::uint32_t>(
+            1, static_cast<std::uint32_t>(std::strtoul(streams, nullptr, 10)));
     }
     // task.no_task_backoff and thrash.hold_initial set the first wait, in ms, as
     // coh.busy_retry_backoff does; it doubles up to its maximum, which is never below it.
@@ -717,6 +729,9 @@ public:
             node_event(fault.kind == FaultKind::kRead ? NodeEventKind::kNeedRead
                                                       : NodeEventKind::kNeedWrite,
                        fault.page, kNoReq, {}, false);
+            if (fault.kind == FaultKind::kRead) {
+                prefetch(fault.page);
+            }
         }
         pump();
     }
@@ -745,6 +760,20 @@ private:
         }
         hash_ = hasher.sha256(std::as_bytes(std::span{image}));
         return true;
+    }
+
+    // The pages the prefetcher guesses `page`'s read fault leads to, asked for as a fault would
+    // ask: those not held and not on their way. Write faults are not followed: a page fetched
+    // to read and then written costs a second round trip.
+    void prefetch(PageId page) noexcept {
+        for (const std::uint64_t next : prefetcher_.on_fault(page.value)) {
+            if (evicting_ || aborting_ || next >= states_.size() ||
+                states_[next] != PageState::kInvalid) {
+                continue;
+            }
+            prefetched_++;
+            node_event(NodeEventKind::kNeedRead, PageId{next}, kNoReq, {}, false);
+        }
     }
 
     void run_on_network_thread() noexcept { static_cast<void>(net_->start_timer(Nanos{0})); }
@@ -1707,6 +1736,7 @@ private:
             JsonObject{{"received", JsonValue{static_cast<std::int64_t>(pages_in_)}},
                        {"sent_again", JsonValue{static_cast<std::int64_t>(sent_again_)}},
                        {"faults", JsonValue{static_cast<std::int64_t>(faults_taken_)}},
+                       {"prefetched", JsonValue{static_cast<std::int64_t>(prefetched_)}},
                        {"sent", JsonValue{static_cast<std::int64_t>(pages_out_)}},
                        {"latency", JsonValue{std::move(latency)}}});
     }
@@ -2463,8 +2493,10 @@ private:
     std::unordered_map<std::uint64_t, ReqId> current_;
     std::deque<Local> local_;
     std::uint64_t pages_in_ = 0;
-    std::uint64_t pages_out_ = 0;                             // pages sent to other nodes (L_STATS)
-    std::uint64_t faults_taken_ = 0;                          // faults handled (L_STATS)
+    std::uint64_t pages_out_ = 0;     // pages sent to other nodes (L_STATS)
+    std::uint64_t faults_taken_ = 0;  // faults handled (L_STATS)
+    std::uint64_t prefetched_ = 0;    // pages asked for ahead
+    Prefetcher prefetcher_{s_.prefetch_depth, s_.prefetch_streams};
     std::array<std::uint32_t, kLatencyBuckets> latency_{};    // fault to install, by bucket
     std::unordered_map<std::uint64_t, Nanos> fault_started_;  // pages faulted, not yet served
     std::uint64_t sent_again_ = 0;  // requests answered BUSY_RETRY or REDIRECT

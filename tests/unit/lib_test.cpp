@@ -6,6 +6,7 @@
 // The processes map the real region, so these tests are skipped under ThreadSanitizer and
 // where user-mode userfaultfd is missing, as in mem_test.cpp.
 
+#include "lib/prefetch.h"
 #include "lib/test_hook.h"
 #include "platform/ids.h"
 #include "rt/registry.h"
@@ -29,10 +30,13 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 // The environment is read and set only in processes that have one thread at that moment.
@@ -915,6 +919,129 @@ TEST_CASE("the hold window: neighbours in one page cost far fewer page transfers
     CHECK(without_log.find("page_thrash") == std::string::npos);  // off: nothing is held
     // NOLINTNEXTLINE(concurrency-mt-unsafe): as above
     ::unsetenv("PARAMESH_CFG_TASK_AFFINITY");
+}
+
+// ---- the prefetcher (X-prefetch) ----------------------------------------------------------------
+
+using Pages = std::vector<std::uint64_t>;
+
+TEST_CASE("the prefetcher follows a stride after three faults and runs further ahead each time") {
+    paramesh::Prefetcher p{8, 4};
+    CHECK(p.on_fault(10).empty());
+    CHECK(p.on_fault(11).empty());
+    CHECK(p.on_fault(12) == Pages{13, 14});          // three faults one page apart: two ahead
+    CHECK(p.on_fault(15) == Pages{16, 17, 18, 19});  // 13 and 14 were read: four ahead of 15
+    CHECK(p.on_fault(20) == Pages{21, 22, 23, 24, 25, 26, 27, 28});  // eight, the depth
+    CHECK(p.on_fault(29) == Pages{30, 31, 32, 33, 34, 35, 36, 37});  // and no further
+    // A fault on a page still on its way (the application caught up) asks for nothing twice.
+    CHECK(p.on_fault(31) == Pages{38, 39});
+}
+
+TEST_CASE("the prefetcher follows any stride, down as well as up, and stops at page 0") {
+    paramesh::Prefetcher p{4, 4};
+    CHECK(p.on_fault(100).empty());
+    CHECK(p.on_fault(108).empty());
+    CHECK(p.on_fault(116) == Pages{124, 132});
+    paramesh::Prefetcher down{4, 4};
+    CHECK(down.on_fault(9).empty());
+    CHECK(down.on_fault(6).empty());
+    CHECK(down.on_fault(3) == Pages{0});  // -3 would be before the region
+}
+
+TEST_CASE("the prefetcher keeps two interleaved streams apart and guesses nothing from noise") {
+    paramesh::Prefetcher p{4, 4};
+    // Two threads reading their own rows, their faults interleaved.
+    CHECK(p.on_fault(0).empty());
+    CHECK(p.on_fault(500).empty());
+    CHECK(p.on_fault(1).empty());
+    CHECK(p.on_fault(501).empty());
+    CHECK(p.on_fault(2) == Pages{3, 4});
+    CHECK(p.on_fault(502) == Pages{503, 504});
+    CHECK(p.on_fault(5) == Pages{6, 7, 8, 9});
+    CHECK(p.on_fault(505) == Pages{506, 507, 508, 509});
+    // Faults with no stride among them.
+    paramesh::Prefetcher q{4, 4};
+    for (const std::uint64_t page : {7U, 300U, 41U, 1000U, 5U, 78U}) {
+        CHECK(q.on_fault(page).empty());
+    }
+}
+
+TEST_CASE("a prefetcher of depth 0 guesses nothing") {
+    paramesh::Prefetcher p{0, 4};
+    for (std::uint64_t page = 0; page < 10; page++) {
+        CHECK(p.on_fault(page).empty());
+    }
+}
+
+namespace {
+
+// The sum, over every line of `log`, of the number after `key`, and how many lines had it.
+std::pair<long, int> logged(const std::string& log, std::string_view key) {
+    long total = 0;
+    int lines = 0;
+    for (auto at = log.find(key); at != std::string::npos; at = log.find(key, at + 1)) {
+        total += std::strtol(log.c_str() + at + key.size(), nullptr, 10);
+        lines++;
+    }
+    return {total, lines};
+}
+
+// The M1 program with one more setting: the bucket of the median wait of the workers' faults
+// (bucket b: below 2^b us; the launcher's are its writes, which prefetching leaves alone), and
+// the pages prefetched; {-1, -1} if it failed.
+std::pair<long, long> median_wait_and_prefetched(const char* setting) {
+    const Started job = start_job("0", program, setting);
+    const bool ok = wait_for(job.pids[0], 120) == 0 && wait_for(job.pids[1], 10) == 0 &&
+                    wait_for(job.pids[2], 10) == 0;
+    const std::string log = read_all(job.launcher_stderr);
+    std::array<long, 16> buckets{};
+    int workers = 0;
+    std::istringstream lines{log};
+    for (std::string line; std::getline(lines, line);) {
+        const std::string_view key = R"("latency":[)";
+        const auto at = line.find(key);
+        if (line.find(R"("event":"job_pages")") == std::string::npos ||
+            line.find(R"("node":1,)") != std::string::npos || at == std::string::npos) {
+            continue;
+        }
+        const char* next = line.c_str() + at + key.size();
+        for (long& bucket : buckets) {
+            char* end = nullptr;
+            bucket += std::strtol(next, &end, 10);
+            next = end + 1;
+        }
+        workers++;
+    }
+    long median = 0;
+    for (long seen = 0, total = std::accumulate(buckets.begin(), buckets.end(), 0L);
+         seen * 2 < total; median++) {
+        seen += buckets.at(static_cast<std::size_t>(median));
+    }
+    const long prefetched = logged(log, "\"prefetched\":").first;
+    INFO(log);
+    CHECK(ok);  // every worker read every number right
+    CHECK(workers == 2);
+    return ok && workers == 2 ? std::pair{median - 1, prefetched} : std::pair{-1L, -1L};
+}
+
+}  // namespace
+
+// The reader is faster than the network, so it still faults on most pages; with prefetching
+// the page is on its way or there by then, and the wait is short.
+TEST_CASE("with prefetching on, workers reading in order read the same numbers, waiting less" *
+          doctest::skip(!can_run())) {
+    const auto [median_on, prefetched_on] =
+        median_wait_and_prefetched("PARAMESH_CFG_PREFETCH_DEPTH=16");
+    const auto [median_off, prefetched_off] =
+        median_wait_and_prefetched("PARAMESH_CFG_PREFETCH_DEPTH=0");
+    MESSAGE("the workers' median fault wait: below "
+            << (median_on >= 0 ? 1L << median_on : 0) << " us with prefetching (" << prefetched_on
+            << " pages prefetched), below " << (median_off >= 0 ? 1L << median_off : 0)
+            << " us without");
+    CHECK(prefetched_off == 0);
+    CHECK(prefetched_on > 0);
+    CHECK(median_on >= 0);
+    CHECK(median_on + 2 <= median_off);  // at least four times shorter
 }
 
 TEST_CASE("concurrent atomic adds from three processes sum exactly" * doctest::skip(!can_run())) {
