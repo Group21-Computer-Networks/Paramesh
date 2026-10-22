@@ -1,8 +1,9 @@
 // HomeStore: pages in RAM up to the cap and, past it, in a spill file (M4-3). CLOCK picks a
 // cold page; a thread of the store's own writes it out and reads pages back, so the network
 // thread never waits for the disk. A page being written still counts as in RAM until the
-// write is done: put() answers Errc::kState meanwhile and the caller puts again after
-// on_spilled, so the store never holds more than its cap.
+// write is done: put() answers Errc::kState meanwhile, even when that write took the last
+// place in the file, and the caller puts again after on_spilled, so the store never holds
+// more than its cap.
 
 #include "store/home_store.h"
 
@@ -83,7 +84,7 @@ public:
         auto found = pages_.find(page.value);
         if (found == pages_.end() || !found->second.data) {  // it needs a place in RAM
             if (full()) {
-                if (slots_used_ >= budget_slots_) {
+                if (slots_used_ >= budget_slots_ && !spilling_) {
                     return Error{Errc::kNoSpace, 0,
                                  "put a page: the home store's RAM and spill file are full"};
                 }
@@ -277,9 +278,11 @@ private:
             out_ = *e->data;
             const std::uint64_t stamp = e->stamp;
             const std::int64_t slot = take_slot();
+            spilling_ = true;  // a place in RAM is on its way: put() waits, it is not refused
             lock.unlock();
             const bool wrote = disk(true, out_, slot);
             lock.lock();
+            spilling_ = false;
             e = find(*victim);
             if (wrote && e != nullptr && e->stamp == stamp && e->data) {
                 e->data.reset();
@@ -395,6 +398,7 @@ private:
     std::vector<std::int64_t> free_slots_;
     std::int64_t next_slot_ = 0;
     std::uint64_t slots_used_ = 0;
+    bool spilling_ = false;  // make_room() is writing a page out
     std::uint64_t ram_pages_ = 0;
     std::uint64_t stamps_ = 0;
     bool want_room_ = false;

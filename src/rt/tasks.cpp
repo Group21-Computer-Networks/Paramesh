@@ -108,7 +108,20 @@ Result<void> Tasks::parallel_for(const ParallelFor& call) {
     for (const auto& [lo, hi] : cuts) {
         // Where the chunk's data lives, as far as the launcher's own segment map says.
         const NodeId home = array ? host_.home_of(page_of(data + lo * call.stride)) : kNoNode;
-        queue_.push_back(Chunk{next_chunk_++, id, lo, hi, home, kNoNode, 0});
+        Chunk chunk{next_chunk_++, id, lo, hi, home, {}, kNoNode, 0};
+        for (std::uint64_t page = page_of(data + lo * call.stride).value;
+             array && config_.affinity >= 2 && page <= page_of(data + hi * call.stride - 1).value;
+             page++) {
+            const NodeId at = host_.home_of(PageId{page});
+            const auto counted = std::find_if(chunk.pages.begin(), chunk.pages.end(),
+                                              [at](const auto& p) { return p.first == at; });
+            if (counted == chunk.pages.end()) {
+                chunk.pages.emplace_back(at, 1);
+            } else {
+                counted->second++;
+            }
+        }
+        queue_.push_back(std::move(chunk));
     }
     sync_.work_added(cuts.size());
     changed_.notify_all();  // the launcher's own threads may be waiting out an empty queue
@@ -222,8 +235,8 @@ bool Tasks::take(NodeId asker, std::uint16_t thread, TaskAssignPayload& out) {
     }
     // ponytail: a scan of the queue for every request; one queue for each home if a job ever
     // has enough chunks waiting for this to show.
-    auto pick = queue_.begin();
-    if (config_.affinity) {
+    auto pick = config_.affinity >= 2 ? local_or_stolen(asker) : queue_.begin();
+    if (config_.affinity == 1) {
         const auto homed = std::find_if(queue_.begin(), queue_.end(),
                                         [asker](const Chunk& c) { return c.home == asker; });
         pick = homed != queue_.end() ? homed : pick;
@@ -238,6 +251,50 @@ bool Tasks::take(NodeId asker, std::uint16_t thread, TaskAssignPayload& out) {
     return true;
 }
 
+// Launcher, affinity 2: the queued chunk with most pages homed on `asker`, the first such; with
+// none, the last chunk of the home that would take longest over its queued pages, its pages
+// over the indexes it has run so far. A chunk with no array counts as homed nowhere.
+// ponytail: pages queued against indexes run, a fair ratio within one call, rougher across
+// calls of different strides; a scan of the queue for every request, as affinity 1.
+std::deque<Tasks::Chunk>::iterator Tasks::local_or_stolen(NodeId asker) {
+    const auto pages_at = [](const Chunk& c, NodeId node) {
+        const auto found = std::find_if(c.pages.begin(), c.pages.end(),
+                                        [node](const auto& p) { return p.first == node; });
+        return found == c.pages.end() ? std::uint32_t{0} : found->second;
+    };
+    auto local = queue_.begin();
+    for (auto c = queue_.begin(); c != queue_.end(); ++c) {
+        local = pages_at(*c, asker) > pages_at(*local, asker) ? c : local;
+    }
+    if (pages_at(*local, asker) > 0) {
+        return local;
+    }
+    std::unordered_map<std::uint16_t, std::uint64_t> queued;  // pages waiting, by home
+    for (const Chunk& c : queue_) {
+        for (const auto& [node, count] : c.pages) {
+            queued[node.value] += count;
+        }
+    }
+    std::uint16_t slowest = kNoNode.value;
+    for (const auto& [node, count] : queued) {
+        // count / (ran + 1) > best / (best_ran + 1), without division
+        if (slowest == kNoNode.value ||
+            count * (ran_[slowest] + 1) > queued[slowest] * (ran_[node] + 1)) {
+            slowest = node;
+        }
+    }
+    for (auto c = queue_.end(); c != queue_.begin();) {
+        --c;
+        const auto most =
+            std::max_element(c->pages.begin(), c->pages.end(),
+                             [](const auto& a, const auto& b) { return a.second < b.second; });
+        if (most != c->pages.end() && most->first.value == slowest) {
+            return c;
+        }
+    }
+    return queue_.begin();
+}
+
 // Launcher: a chunk finished. Only the first report of a chunk counts.
 void Tasks::done(std::uint64_t chunk_id, NodeId ran_by, std::uint64_t cpu_ns) {
     const auto found = taken_.find(chunk_id);
@@ -246,6 +303,7 @@ void Tasks::done(std::uint64_t chunk_id, NodeId ran_by, std::uint64_t cpu_ns) {
     }
     const Chunk chunk = found->second;
     taken_.erase(found);
+    ran_[ran_by.value] += chunk.hi - chunk.lo;
     const auto call = calls_.find(chunk.call);
     const std::uint64_t task_id = call->second.task_id;
     if (--call->second.chunks_left == 0) {

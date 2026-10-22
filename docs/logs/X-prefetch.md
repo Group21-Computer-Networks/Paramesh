@@ -3,10 +3,10 @@
 - Task: X-prefetch
 - Milestone: none
 - Stream: -
-- Status: in-progress
+- Status: done
 - Branch: x-prefetch
 - Started: 2026-10-22
-- Finished:
+- Finished: 2026-10-22
 
 <!--
 Status is one of: in-progress, blocked, done.
@@ -103,6 +103,17 @@ and the next step.
   The last two go to docs/TODO.md.
 - Next: merge main once the M4-3 fix is in, the loaded runs again, the matrix, the pull request.
 
+### 2026-10-22 — session 2
+
+- PR #76 (M4-3 fix) merged, and X-locality-sched (#75). Merged origin/main: one conflict, in
+  `tools/bench/evaluate.sh`, both experiments kept (`prefetch`, then `sched`); its help text
+  printed lines 2-31 now, as it grew by both.
+- The loaded runs again, ASan build of the merged code (no debug prints): the full suite
+  beside the case in a loop, prefetching on: 21 of 21 runs pass, the suite 16 of 16. Before
+  the fix the same set-up failed 2 of 12 and 2 of 7.
+- Matrix, format, tidy: all pass (Verification).
+- Next: the pull request.
+
 ## Files touched
 
 <!--
@@ -168,6 +179,21 @@ The card's Done-when check: the exact commands run, where (local, Actions, simul
 cabled laptops), and the actual result, pasted or summarised with numbers. Also the quality gate
 (clang-format, clang-tidy, sanitizer runs). Required before Status: done.
 -->
+- Local, Ubuntu 24.04, the merged branch. `cmake -S . -B build/nc-<cc>-<san> -G Ninja
+  -DCMAKE_BUILD_TYPE=Debug -DPARAMESH_SANITIZER=<san>`, then `ctest --output-on-failure -j2`:
+  gcc none/address/undefined 16 of 16, gcc thread 15 of 15; clang none/address/undefined 16 of
+  16, clang thread 15 of 15 (thread runs 15, as in M6-2). Prefetching on (the default).
+- The comparison the feature list asks for, `tools/bench/evaluate.sh prefetch` (matmul 512,
+  three nodes in network namespaces): run time 12.1 s off, 8.4 s at depth 8 with the default
+  caps; 17.5 s and 10.4 s at --cap-ram 1M; faults 265,856 against 166,725 and 273,024 against
+  171,638; median fault wait 128-256 us against 2 us; pages received 136,077 against 134,399
+  and 162,103 against 138,308 (session 1 table).
+- `unit.lib_test`: the prefetcher's cases and "with prefetching on, workers reading in order
+  read the same numbers, waiting less" (median wait below 1 us against below 256 us, dev;
+  below 4 us against below 512 us, ASan).
+- Loaded runs of the out-of-core case with the M4-3 fix: 21 of 21 (session 2).
+- clang-format `--dry-run --Werror` over all sources: clean. `cmake --build --preset tidy`:
+  clean.
 
 ## Deferred
 

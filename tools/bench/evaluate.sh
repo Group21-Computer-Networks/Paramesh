@@ -14,6 +14,8 @@
 #               at --cap-ram 1M and 2M, matrix size doubled: cache.csv
 #   prefetch    predictive prefetching (X-prefetch) off and at prefetch.depth 8 and 32, with
 #               the caps' defaults and at --cap-ram 1M, matrix size doubled: prefetch.csv
+#   sched       apps/sweep (64 MB, 4 rounds) with task.affinity 0, 1 and 2 (X-locality-sched),
+#               with no added delay and with 1 ms: sched.csv
 #
 #   -s   matrix size (default 256)
 #   -t   worker threads a node (default 1)
@@ -45,7 +47,7 @@ while getopts "s:t:b:o:h" opt; do
     b) build="$OPTARG" ;;
     o) results="$OPTARG" ;;
     h)
-        sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     *) exit 2 ;;
@@ -94,7 +96,7 @@ run_job() {
     done
     sleep 2
     timeout 900 nsenter -t "${NS_HOLDERS[0]}" -n "$build/src/tools/pmrun" -n 3 \
-        --state-dir "$work/1" "$build/apps/matmul/matmul" "$size" "$threads" >"$work/out" 2>&1
+        --state-dir "$work/1" ${APP:-"$build/apps/matmul/matmul" "$size" "$threads"} >"$work/out" 2>&1
     local status=$?
     unset PARAMESH_CFG_LOG_LEVEL
     if [ "$status" -ne 0 ]; then  # why, for aborts.log
@@ -196,6 +198,21 @@ experiment_prefetch() {
         done
     done
     unset PARAMESH_CFG_SPILL_BUDGET
+}
+
+experiment_sched() {
+    local file="$results/sched.csv"
+    echo "delay_ms,affinity,$HEADER" >"$file"
+    local row delay affinity
+    for delay in 0 1; do
+        impair "$delay" 0 0
+        for affinity in 0 1 2; do
+            row="$(APP="$build/apps/sweep/sweep 64 4 $threads" PARAMESH_CFG_TASK_AFFINITY=$affinity run_job)"
+            note_abort "$row"
+            echo "$delay,$affinity,$row" | tee -a "$file"
+        done
+    done
+    impair 0 0 0
 }
 
 experiment_histogram() {

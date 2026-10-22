@@ -233,7 +233,8 @@ bool read_settings(Settings& s) {
         s.reply_delay = std::chrono::milliseconds{std::strtol(delay, nullptr, 10)};
     }
     if (const char* affinity = env("PARAMESH_CFG_TASK_AFFINITY")) {
-        s.tasks.affinity = std::string_view{affinity} != "0";
+        s.tasks.affinity =
+            static_cast<std::uint8_t>(std::min(2UL, std::strtoul(affinity, nullptr, 10)));
     }
     read_waits_and_grain(s);
     if (socket != nullptr) {
