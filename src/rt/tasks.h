@@ -41,9 +41,12 @@ struct TasksConfig {
     Nanos backoff_max = std::chrono::milliseconds{200};     // ... doubling to
     std::uint32_t prefetch = 1;                             // task.prefetch
     std::uint32_t chunks_per_slot = 4;  // task.default_grain: range / (this x total_slots)
-    // Data affinity (M3-3): a node that asks is given a chunk whose first page it is home for,
-    // if the queue has one. Off, the queue is first in, first out.
-    bool affinity = true;
+    // task.affinity. 2, the default, locality and capacity (X-locality-sched): an asking node
+    // gets the chunk with most of its pages homed on it; with none, the last chunk of the home
+    // whose queued pages would take longest at the rate it has run chunks. 1, data affinity
+    // (M3-3): a chunk whose first page the asker is home for, if the queue has one. 0, first
+    // in, first out.
+    std::uint8_t affinity = 2;
 };
 
 // Cuts lo <= i < hi into chunks of about `grain` indexes (at least 1). With an array, where
@@ -105,9 +108,10 @@ private:
         std::uint32_t call = 0;
         std::uint64_t lo = 0;
         std::uint64_t hi = 0;
-        NodeId home;   // the home of the chunk's first page; kNoNode for a call with no array
-        NodeId taker;  // who took it, while it is in taken_
-        std::uint16_t thread = 0;  // and which of its threads
+        NodeId home;  // the home of the chunk's first page; kNoNode for a call with no array
+        std::vector<std::pair<NodeId, std::uint32_t>> pages;  // affinity 2: pages per home
+        NodeId taker;                                         // who took it, while it is in taken_
+        std::uint16_t thread = 0;                             // and which of its threads
     };
     struct Worker {
         std::thread thread;
@@ -121,6 +125,7 @@ private:
     void work(std::uint16_t thread);
     void ask(std::uint16_t thread);
     bool take(NodeId asker, std::uint16_t thread, TaskAssignPayload& out);
+    std::deque<Chunk>::iterator local_or_stolen(NodeId asker);
     void done(std::uint64_t chunk_id, NodeId ran_by, std::uint64_t cpu_ns);
     template <typename Payload>
     void send(NodeId to, Opcode opcode, ReqId req, const Payload& payload, ReplyTimer timer);
@@ -139,7 +144,8 @@ private:
     // they belong to.
     std::deque<Chunk> queue_;
     std::unordered_map<std::uint64_t, Chunk> taken_;
-    std::vector<NodeId> leaving_;  // members that get no more chunks
+    std::vector<NodeId> leaving_;                           // members that get no more chunks
+    std::unordered_map<std::uint16_t, std::uint64_t> ran_;  // indexes each node has run
     std::unordered_map<std::uint32_t, Call> calls_;
     std::uint64_t next_chunk_ = 1;
     std::uint32_t next_call_ = 1;
