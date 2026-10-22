@@ -12,6 +12,8 @@
 #   histogram   one run without impairment: each node's fault-latency histogram: histogram.csv
 #   cache       the local cache's two replacement policies, fifo and cost (X-cache-policy),
 #               at --cap-ram 1M and 2M, matrix size doubled: cache.csv
+#   prefetch    predictive prefetching (X-prefetch) off and at prefetch.depth 8 and 32, with
+#               the caps' defaults and at --cap-ram 1M, matrix size doubled: prefetch.csv
 #   sched       apps/sweep (64 MB, 4 rounds) with task.affinity 0, 1 and 2 (X-locality-sched),
 #               with no added delay and with 1 ms: sched.csv
 #
@@ -45,7 +47,7 @@ while getopts "s:t:b:o:h" opt; do
     b) build="$OPTARG" ;;
     o) results="$OPTARG" ;;
     h)
-        sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     *) exit 2 ;;
@@ -176,6 +178,23 @@ experiment_cache() {
             row="$(PARAMESH_CFG_CACHE_POLICY=$policy size=$((size * 2)) run_job --cap-ram "$cap")"
             note_abort "$row"
             echo "$policy,$cap,$((size * 2)),$row" | tee -a "$file"
+        done
+    done
+    unset PARAMESH_CFG_SPILL_BUDGET
+}
+
+experiment_prefetch() {
+    local file="$results/prefetch.csv"
+    echo "depth,cap_ram,size,$HEADER" >"$file"
+    export PARAMESH_CFG_SPILL_BUDGET=67108864
+    local row cap depth
+    for cap in default 1M; do
+        for depth in 0 8 32; do
+            local caps=()
+            [ "$cap" != default ] && caps=(--cap-ram "$cap")
+            row="$(PARAMESH_CFG_PREFETCH_DEPTH=$depth size=$((size * 2)) run_job "${caps[@]}")"
+            note_abort "$row"
+            echo "$depth,$cap,$((size * 2)),$row" | tee -a "$file"
         done
     done
     unset PARAMESH_CFG_SPILL_BUDGET
