@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <span>
 #include <string>
 #include <utility>
@@ -210,6 +211,94 @@ Result<PagePayload> wire_decode_page(std::span<const std::byte> in, std::uint16_
         return kMalformed;
     }
     return payload;
+}
+
+// Page ID, mode, 3 reserved, page CRC, then a bit per 8-byte word with a non-zero byte, and
+// for each such word a mask of its non-zero bytes and those bytes.
+constexpr std::size_t kEncodedHeader = 16;
+constexpr std::size_t kWordMap = kPageSize / 8 / 8;
+
+Result<std::size_t> wire_encode_page(const EncodedPage& header, PageView data, PageView base,
+                                     std::span<std::byte> out) {
+    const std::size_t most = std::min(out.size(), 8 + kPageSize - 1);  // beat a plain page
+    if (most < kEncodedHeader + kWordMap ||
+        (header.mode != kEncodedPage && header.mode != kEncodedDiff)) {
+        return kUnsendable;
+    }
+    Writer w{out};
+    w.put(header.page.value, 8);
+    w.put(header.mode, 1);
+    w.put(0, 3);
+    w.put(header.page_crc, 4);
+    std::fill_n(out.begin() + kEncodedHeader, kWordMap, std::byte{0});
+    std::size_t at = kEncodedHeader + kWordMap;
+    for (std::size_t word = 0; word < kPageSize / 8; word++) {
+        std::uint64_t d = 0;
+        std::uint64_t b0 = 0;
+        std::memcpy(&d, data.data() + word * 8, 8);
+        std::memcpy(&b0, base.data() + word * 8, 8);
+        if (d == b0) {
+            continue;  // most words, in a diff or a sparse page
+        }
+        std::uint8_t mask = 0;
+        std::array<std::byte, 8> kept{};
+        std::size_t count = 0;
+        for (std::size_t i = 0; i < 8; i++) {
+            const std::byte b = data[word * 8 + i] ^ base[word * 8 + i];
+            if (b != std::byte{0}) {
+                mask = static_cast<std::uint8_t>(mask | (1U << i));
+                kept.at(count++) = b;
+            }
+        }
+        if (mask == 0) {
+            continue;
+        }
+        if (at + 1 + count > most) {
+            return kUnsendable;
+        }
+        out[kEncodedHeader + word / 8] |= static_cast<std::byte>(1U << (word % 8));
+        out[at++] = static_cast<std::byte>(mask);
+        std::copy_n(kept.begin(), count, out.begin() + static_cast<std::ptrdiff_t>(at));
+        at += count;
+    }
+    return at;
+}
+
+Result<EncodedPage> wire_decode_encoded_page(std::span<const std::byte> in, PageBuffer out) {
+    Reader r{in};
+    EncodedPage header;
+    header.page = PageId{r.get(8)};
+    header.mode = static_cast<std::uint8_t>(r.get(1));
+    const std::uint64_t reserved = r.get(3);
+    header.page_crc = static_cast<std::uint32_t>(r.get(4));
+    const std::span<const std::byte> map = r.take(kWordMap);
+    if (map.size() != kWordMap || reserved != 0 || in.size() >= 8 + kPageSize ||
+        (header.mode != kEncodedPage && header.mode != kEncodedDiff)) {
+        return kMalformed;
+    }
+    std::fill(out.begin(), out.end(), std::byte{0});
+    for (std::size_t word = 0; word < kPageSize / 8; word++) {
+        if ((std::to_integer<unsigned>(map[word / 8]) & (1U << (word % 8))) == 0) {
+            continue;
+        }
+        const auto mask = static_cast<std::uint8_t>(r.get(1));
+        if (mask == 0) {
+            return kMalformed;
+        }
+        for (std::size_t i = 0; i < 8; i++) {
+            if ((mask & (1U << i)) != 0) {
+                const std::span<const std::byte> b = r.take(1);
+                if (b.empty() || b[0] == std::byte{0}) {
+                    return kMalformed;
+                }
+                out[word * 8 + i] = b[0];
+            }
+        }
+    }
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return header;
 }
 
 Result<std::size_t> wire_encode(const JoinJobPayload& payload, std::span<std::byte> out) {

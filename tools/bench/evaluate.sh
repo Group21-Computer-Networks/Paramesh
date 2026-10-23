@@ -16,6 +16,9 @@
 #               the caps' defaults and at --cap-ram 1M, matrix size doubled: prefetch.csv
 #   sched       apps/sweep (64 MB, 4 rounds) with task.affinity 0, 1 and 2 (X-locality-sched),
 #               with no added delay and with 1 ms: sched.csv
+#   encoding    page.encoding off, auto and on (X-page-encoding), for matrix multiply and
+#               apps/sweep (16 MB, 4 rounds), FIFO chunk placement, on a plain link, with 1 ms
+#               delay and at 20 Mbit/s: encoding.csv
 #
 #   -s   matrix size (default 256)
 #   -t   worker threads a node (default 1)
@@ -25,7 +28,8 @@
 # A row has the run time, faults per second, MB per second received, the median and 99th
 # percentile fault latency (the upper bound of their power-of-two bucket; ">16384" for the
 # last, open-ended one), retries, whether the job aborted, and the pages received and sent
-# (write-backs among them). The counts are what each job process logs as it ends (job_pages),
+# (write-backs among them), the KB of page payloads sent and what they would have been plain,
+# the job processes' CPU seconds, and the pages sent as diffs. The counts are what each job process logs as it ends (job_pages),
 # summed over the nodes. With no experiment, the first three run. Needs no root where
 # unprivileged user namespaces are allowed. The reason for any abort goes to aborts.log. Exit
 # status 0, or 1 if a run aborted.
@@ -47,7 +51,7 @@ while getopts "s:t:b:o:h" opt; do
     b) build="$OPTARG" ;;
     o) results="$OPTARG" ;;
     h)
-        sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     *) exit 2 ;;
@@ -67,12 +71,13 @@ done
 netns_nodes 3 0 0
 work="$(mktemp -d /tmp/pm-eval-XXXXXX)"
 trap 'pkill -P $$ 2>/dev/null; for pid in "${NS_HOLDERS[@]}"; do kill "$pid" 2>/dev/null; done; rm -rf "$work"' EXIT
-HEADER="run_s,faults,faults_per_s,mb_per_s,p50_us,p99_us,retries,aborted,pages_in,pages_out"
+HEADER="run_s,faults,faults_per_s,mb_per_s,p50_us,p99_us,retries,aborted,pages_in,pages_out,page_kb,page_kb_plain,cpu_s,diffs"
 
 # Every node's link: this delay and jitter, in ms, and loss, in percent.
 impair() {
     local spec="delay ${1}ms"
     [ "$2" != 0 ] && spec="$spec ${2}ms"
+    spec="$spec rate ${4:-100gbit}"  # impair delay jitter loss [rate]
     for i in 1 2 3; do
         netns_run "$i" tc qdisc change dev eth0 root netem $spec loss "${3}%"
     done
@@ -112,6 +117,7 @@ out = open(f"{work}/out").read()
 m = re.search(r"job, n \d+: ([0-9.]+) s", out)
 seconds = float(m.group(1)) if m else 0.0
 faults = pages = sent = retries = 0
+page_bytes = plain = cpu_ms = diffs = 0
 buckets = [0] * 16
 for path in [f"{work}/out"] + glob.glob(f"{work}/pmd-*.log"):
     for line in open(path, errors="replace"):
@@ -120,6 +126,8 @@ for path in [f"{work}/out"] + glob.glob(f"{work}/pmd-*.log"):
         f = json.loads(line)["fields"]
         faults += f["faults"]; pages += f["received"]; retries += f["sent_again"]
         sent += f["sent"]
+        page_bytes += f.get("page_bytes", 0); plain += f.get("page_bytes_plain", 0)
+        cpu_ms += f.get("cpu_ms", 0); diffs += f.get("diffs", 0)
         buckets = [a + b for a, b in zip(buckets, f["latency"])]
 def pct(share):  # the bucket's upper bound; the last bucket has none
     total, seen = sum(buckets), 0
@@ -130,7 +138,8 @@ def pct(share):  # the bucket's upper bound; the last bucket has none
     return "0"
 rate = lambda x: x / seconds if seconds else 0.0
 print(f"{seconds:.3f},{faults},{rate(faults):.1f},{rate(pages * 4096 / 1e6):.2f},"
-      f"{pct(0.5)},{pct(0.99)},{retries},{1 if status != 0 else 0},{pages},{sent}")
+      f"{pct(0.5)},{pct(0.99)},{retries},{1 if status != 0 else 0},{pages},{sent},"
+      f"{page_bytes // 1024},{plain // 1024},{cpu_ms / 1000:.2f},{diffs}")
 open(f"{work}/buckets", "w").write(" ".join(map(str, buckets)))
 PY
 }
@@ -213,6 +222,31 @@ experiment_sched() {
         done
     done
     impair 0 0 0
+}
+
+experiment_encoding() {
+    local file="$results/encoding.csv"
+    echo "link,app,encoding,$HEADER" >"$file"
+    export PARAMESH_CFG_TASK_AFFINITY=0  # chunks anywhere, so pages move between rounds
+    local row link app encoding
+    for link in plain 1ms 20mbit; do
+        case "$link" in
+            plain) impair 0 0 0 ;;
+            1ms) impair 1 0 0 ;;
+            20mbit) impair 0 0 0 20mbit ;;
+        esac
+        for app in matmul sweep; do
+            local command=""
+            [ "$app" = sweep ] && command="$build/apps/sweep/sweep 16 4 $threads"
+            for encoding in off auto on; do
+                row="$(APP="$command" PARAMESH_CFG_PAGE_ENCODING=$encoding run_job)"
+                note_abort "$row"
+                echo "$link,$app,$encoding,$row" | tee -a "$file"
+            done
+        done
+    done
+    impair 0 0 0
+    unset PARAMESH_CFG_TASK_AFFINITY
 }
 
 experiment_histogram() {

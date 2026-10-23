@@ -30,6 +30,17 @@ struct PagePayload {
     std::span<const std::byte> data;
 };
 
+// A page payload with COMPRESSED (X-page-encoding). `mode` is kEncodedPage for the page itself,
+// kEncodedDiff for the page XOR the copy its home kept (BASE_KEPT). `page_crc` is the CRC-32C
+// of the page's 4,096 bytes as rebuilt.
+inline constexpr std::uint8_t kEncodedPage = 1;
+inline constexpr std::uint8_t kEncodedDiff = 2;
+struct EncodedPage {
+    PageId page;
+    std::uint8_t mode = kEncodedPage;
+    std::uint32_t page_crc = 0;
+};
+
 struct JoinJobPayload {
     std::uint8_t role = 0;  // 1 launcher, 2 worker
     std::uint16_t listen_port = 0;
@@ -357,7 +368,15 @@ Result<std::size_t> wire_encode(const LRunOkPayload& payload, std::span<std::byt
 Result<std::size_t> wire_encode(const LAdmitReqPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const LAdmitOkPayload& payload, std::span<std::byte> out);
 
+// The bytes of `data` XOR `base` (zeros for kEncodedPage), as docs/PROTOCOL.md 7.2 lays them
+// out. kInvalidArgument when that is not shorter than a plain page payload: send it plain.
+Result<std::size_t> wire_encode_page(const EncodedPage& header, PageView data, PageView base,
+                                     std::span<std::byte> out);
+
 Result<PageIdPayload> wire_decode_page_id(std::span<const std::byte> in);
+// A COMPRESSED page payload. `out` gets the bytes encoded: the page, or for kEncodedDiff what
+// is to be XORed into the base.
+Result<EncodedPage> wire_decode_encoded_page(std::span<const std::byte> in, PageBuffer out);
 // `flags` are the frame's: with ZERO_PAGE the payload must carry no data, without it 4,096 bytes.
 Result<PagePayload> wire_decode_page(std::span<const std::byte> in, std::uint16_t flags);
 Result<JoinJobPayload> wire_decode_join_job(std::span<const std::byte> in);

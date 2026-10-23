@@ -37,7 +37,7 @@ local STATUS = {
 }
 
 local FLAGS = { [0x0001] = "ZERO_PAGE", [0x0002] = "COMPRESSED", [0x0004] = "READ_ONLY",
-                [0x0008] = "RETRY" }
+                [0x0008] = "RETRY", [0x0010] = "BASE_KEPT" }
 
 local f = {
   magic = ProtoField.uint32("pmsh.magic", "Magic", base.HEX),
@@ -66,7 +66,7 @@ local HEADER = 36
 --   u8 u16 u32 u64, ipv4, status, hash (32 bytes), str16, rsv (n bytes, given as third value),
 --   bytes (a count of bytes given by an earlier field), str16s (that many str16),
 --   array (that many entries of a sub-layout), page (a page ID, and 4,096 bytes unless the
---   header says ZERO_PAGE), migrate (SEG_MIGRATE's entries), u32s (n counts).
+--   header says ZERO_PAGE; with COMPRESSED, the encoded page of PROTOCOL.md 7.2), migrate (SEG_MIGRATE's entries), u32s (n counts).
 local MEMBER = { {"node", "u16"}, {"slot", "u8"}, {"flags", "u8"}, {"addr", "ipv4"},
                  {"port", "u16"}, {"", "rsv", 2}, {"ram_weight", "u64"} }
 local TOTAL = { {"peer", "u16"}, {"", "rsv", 2}, {"chunks_for_peer", "u64"},
@@ -213,7 +213,17 @@ local function walk(buf, at, layout, tree, flags, values)
     elseif kind == "page" then
       at = walk(buf, at, PAGE_ID, tree, flags, values)
       if not at then return nil end
-      if bit.band(flags, 0x0001) == 0 then
+      if bit.band(flags, 0x0002) ~= 0 then  -- COMPRESSED (X-page-encoding)
+        at = walk(buf, at, { {"mode", "u8"}, {"", "rsv", 3}, {"page_crc", "u32"} }, tree, flags,
+                  values)
+        if not at or buf:len() < at + 64 then return nil end
+        tree:add(pmsh, buf(at, 64), "word_map: 64 bytes")
+        at = at + 64
+        if buf:len() > at then
+          tree:add(pmsh, buf(at, buf:len() - at), "words: " .. (buf:len() - at) .. " bytes")
+          at = buf:len()
+        end
+      elseif bit.band(flags, 0x0001) == 0 then
         if buf:len() < at + 4096 then return nil end
         tree:add(pmsh, buf(at, 4096), "data: 4096 bytes")
         at = at + 4096

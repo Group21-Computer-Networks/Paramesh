@@ -28,6 +28,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <paramesh.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -94,6 +95,14 @@ struct Settings {
     // prefetch.streams: how many such streams are followed at once (X-prefetch).
     std::uint32_t prefetch_depth = 8;
     std::uint32_t prefetch_streams = 4;
+    // page.encoding (X-page-encoding): off, on (any shorter encoding) or auto, the default: on
+    // a link whose page waits average page.slow_wait_us or more, as on; on a faster one only
+    // an encoding that saves page.fast_min_saving percent. page.diff_pages: how many copies a
+    // process keeps for diffs, as a home and as an owner each.
+    enum class Encoding : std::uint8_t { kOff, kOn, kAuto } encoding = Encoding::kAuto;
+    std::uint64_t slow_wait_us = 500;
+    std::uint64_t fast_min_saving = 50;
+    std::size_t diff_pages = 256;
     // coh.busy_retry_backoff: PARAMESH_CFG_COH_BUSY_RETRY_BACKOFF sets the first wait, in ms.
     Nanos busy_initial = std::chrono::milliseconds{5};
     Nanos busy_max = std::chrono::milliseconds{100};
@@ -143,6 +152,23 @@ void read_waits_and_grain(Settings& s) {
                 ? 8
                 : std::max<std::uint32_t>(
                       1, static_cast<std::uint32_t>(std::strtoul(window, nullptr, 10)));
+    }
+    if (const char* encoding = env("PARAMESH_CFG_PAGE_ENCODING")) {
+        const std::string_view e{encoding};
+        if (e == "off") {
+            s.encoding = Settings::Encoding::kOff;
+        } else if (e == "on") {
+            s.encoding = Settings::Encoding::kOn;
+        }
+    }
+    if (const char* wait = env("PARAMESH_CFG_PAGE_SLOW_WAIT_US")) {
+        s.slow_wait_us = std::strtoull(wait, nullptr, 10);
+    }
+    if (const char* saving = env("PARAMESH_CFG_PAGE_FAST_MIN_SAVING")) {
+        s.fast_min_saving = std::min<std::uint64_t>(100, std::strtoull(saving, nullptr, 10));
+    }
+    if (const char* kept = env("PARAMESH_CFG_PAGE_DIFF_PAGES")) {
+        s.diff_pages = std::strtoull(kept, nullptr, 10);
     }
     if (const char* depth = env("PARAMESH_CFG_PREFETCH_DEPTH")) {
         s.prefetch_depth = static_cast<std::uint32_t>(std::strtoul(depth, nullptr, 10));
@@ -643,7 +669,11 @@ public:
         if ((header.flags & kFlagRetry) != 0) {
             return;  // a request this process already has: TCP lost nothing (PROTOCOL.md 8)
         }
-        handle(header, payload);
+        std::array<std::byte, 8 + kPageSize> rebuilt{};
+        FrameHeader page_header = header;
+        if (receive_page(page_header, payload, rebuilt)) {
+            handle(page_header, payload);
+        }
         pump();
     }
 
@@ -795,6 +825,12 @@ private:
     // Sends one frame, or queues it for this process when it is addressed to itself. Any thread.
     void post(NodeId to, Opcode opcode, std::span<const std::byte> payload, ReqId req = kNoReq,
               std::uint16_t flags = 0, ReplyTimer timer = ReplyTimer::kNone) noexcept {
+        std::array<std::byte, 8 + kPageSize> encoded{};
+        if (to != s_.self && payload.size() == encoded.size() &&
+            (opcode == Opcode::kReadData || opcode == Opcode::kWriteGrant ||
+             opcode == Opcode::kFetchData || opcode == Opcode::kWriteback)) {
+            payload = encode(to, opcode, payload, flags, encoded);
+        }
         FrameHeader header;
         header.opcode = opcode;
         header.flags = flags;
@@ -807,6 +843,135 @@ private:
         } else if (!net_->send(to, header, payload, timer).ok() && !ending_ && !aborting_) {
             abort_job(Status::kNodeLost, to, "node " + std::to_string(to.value) + " lost");
         }
+    }
+
+    // ---- page encoding (X-page-encoding) ------------------------------------------------------
+
+    // A copy of a page kept for diffs, and the node at the other end: as a home, the owner it
+    // was granted to; as an owner, the home that kept it.
+    struct Kept {
+        NodeId node;
+        std::array<std::byte, kPageSize> bytes{};
+    };
+
+    // A page frame for another node: as a diff against the copy its home kept, or as its
+    // non-zero bytes, if shorter and worth it on this link; else plain. The twin goes with
+    // the data, diff or not.
+    std::span<const std::byte> encode(NodeId to, Opcode opcode, std::span<const std::byte> plain,
+                                      std::uint16_t& flags, std::span<std::byte> out) noexcept {
+        static constexpr std::array<std::byte, kPageSize> kZeros{};
+        const PageId page{get_u64(plain)};
+        const PageView data = plain.subspan(8).first<kPageSize>();
+        std::unique_ptr<Kept> twin;
+        if (auto found = twins_.find(page.value);
+            found != twins_.end() &&
+            (opcode == Opcode::kFetchData || opcode == Opcode::kWriteback)) {
+            twin = found->second->node == to ? std::move(found->second) : nullptr;
+            twins_.erase(found);
+        }
+        page_bytes_plain_ += plain.size();
+        Result<std::size_t> size{Error{Errc::kInvalidArgument, 0, "not encoded"}};
+        if (s_.encoding != Settings::Encoding::kOff && twin != nullptr) {
+            size = wire_encode_page(EncodedPage{page, kEncodedDiff, 0}, data, twin->bytes, out);
+        }
+        const bool diff = size.ok();
+        if (s_.encoding != Settings::Encoding::kOff && !diff) {
+            size = wire_encode_page(EncodedPage{page, kEncodedPage, 0}, data, kZeros, out);
+        }
+        const bool slow = s_.encoding == Settings::Encoding::kOn || wait_us_ >= s_.slow_wait_us;
+        if (!size.ok() ||
+            (!slow && (plain.size() - size.value()) * 100 < plain.size() * s_.fast_min_saving)) {
+            page_bytes_ += plain.size();
+            return plain;
+        }
+        const std::uint32_t crc = platform_.checksum->crc32c(data);
+        for (std::size_t i = 0; i < 4; i++) {  // page_crc, big-endian, at offset 12
+            out[12 + i] = static_cast<std::byte>(crc >> (24 - 8 * i));
+        }
+        flags |= kFlagCompressed;
+        encoded_++;
+        diffs_ += diff ? 1U : 0U;
+        page_bytes_ += size.value();
+        return out.first(size.value());
+    }
+
+    // Before a frame is handled: an encoded page rebuilt in `rebuilt`; the copy this home kept
+    // let go once its owner's data comes back; with BASE_KEPT, a copy of what was granted.
+    // False if the page does not rebuild: the job is aborted.
+    bool receive_page(FrameHeader& header, std::span<const std::byte>& payload,
+                      std::span<std::byte> rebuilt) noexcept {
+        const bool back =
+            header.opcode == Opcode::kFetchData || header.opcode == Opcode::kWriteback;
+        std::unique_ptr<Kept> base;
+        if (const auto found = bases_.find(payload.size() >= 8 ? get_u64(payload) : 0);
+            back && found != bases_.end() && found->second->node == header.src) {
+            base = std::move(found->second);
+            bases_.erase(found);
+        }
+        if ((header.flags & kFlagCompressed) != 0) {
+            const PageBuffer out = rebuilt.subspan(8).first<kPageSize>();
+            const Result<EncodedPage> got =
+                (back || header.opcode == Opcode::kReadData ||
+                 header.opcode == Opcode::kWriteGrant) &&
+                        (header.flags & kFlagZeroPage) == 0
+                    ? wire_decode_encoded_page(payload, out)
+                    : Result<EncodedPage>{Error{Errc::kProtocol, 0, "not a page frame"}};
+            const bool ok = got.ok() && (got.value().mode == kEncodedPage || base != nullptr);
+            if (ok && got.value().mode == kEncodedDiff) {
+                for (std::size_t i = 0; i < kPageSize; i++) {
+                    out[i] ^= base->bytes.at(i);
+                }
+            }
+            if (!ok || platform_.checksum->crc32c(out) != got.value().page_crc) {
+                abort_job(
+                    Status::kProtocol, header.src,
+                    "a page from node " + std::to_string(header.src.value) + " does not rebuild");
+                return false;
+            }
+            put_u64(rebuilt, 0, got.value().page.value);
+            payload = rebuilt;
+            header.flags = static_cast<std::uint16_t>(header.flags & ~kFlagCompressed);
+        }
+        if ((header.flags & kFlagBaseKept) != 0 && payload.size() >= 8 &&
+            twins_.size() < s_.diff_pages) {
+            auto twin = std::make_unique<Kept>();
+            twin->node = header.src;
+            const PageId page{get_u64(payload)};
+            const bool copied =
+                header.opcode == Opcode::kWriteGrant
+                    ? ((header.flags & kFlagZeroPage) != 0 || payload.size() == 8 + kPageSize)
+                    : header.opcode == Opcode::kUpgradeGrant && mem_->read(page, twin->bytes).ok();
+            if (copied && header.opcode == Opcode::kWriteGrant && payload.size() > 8) {
+                std::copy_n(payload.begin() + 8, kPageSize, twin->bytes.begin());
+            }
+            if (copied) {
+                twins_[page.value] = std::move(twin);
+            }
+        }
+        return true;
+    }
+
+    // A home granting a page for writing to another node keeps what it grants, while it has
+    // room, and says so with BASE_KEPT. `granted` is the page sent, empty for UPGRADE_GRANT.
+    void keep_base(const HomeAction& a, std::span<const std::byte> granted,
+                   std::uint16_t& flags) noexcept {
+        bases_.erase(a.page.value);
+        if (a.to == s_.self || s_.encoding == Settings::Encoding::kOff ||
+            bases_.size() >= s_.diff_pages) {
+            return;
+        }
+        auto base = std::make_unique<Kept>();
+        base->node = a.to;
+        if (a.source == PageSource::kNone) {  // UPGRADE_GRANT: the home copy is the reader's
+            const Result<StoreLookup> got = store_->get(a.page, base->bytes);
+            if (!got.ok() || got.value() != StoreLookup::kCopied) {
+                return;
+            }
+        } else if (granted.size() == kPageSize) {
+            std::copy(granted.begin(), granted.end(), base->bytes.begin());
+        }  // else ZERO_PAGE: the zeros it has
+        bases_[a.page.value] = std::move(base);
+        flags |= kFlagBaseKept;
     }
 
     void post_job_end(NodeId to, Status status, NodeId node, const std::string& message) noexcept {
@@ -1001,6 +1166,7 @@ private:
         const auto us =
             std::chrono::duration_cast<std::chrono::microseconds>(net_->now() - started->second);
         fault_started_.erase(started);
+        wait_us_ = (wait_us_ * 7 + static_cast<std::uint64_t>(us.count())) / 8;
         std::size_t bucket = 0;
         while (bucket + 1 < kLatencyBuckets && (std::int64_t{1} << bucket) <= us.count()) {
             bucket++;
@@ -1727,6 +1893,18 @@ private:
     // pages, reached it from other nodes.
     // With this process's whole counts, as L_STATS has them (M6-5 reads them from here, since a
     // short job ends before its first report).
+    // This process's CPU time so far, user and system, in ms.
+    static std::int64_t cpu_ms() noexcept {
+        rusage usage{};
+        if (::getrusage(RUSAGE_SELF, &usage) != 0) {
+            return 0;
+        }
+        const auto ms = [](const timeval& t) {
+            return std::int64_t{t.tv_sec} * 1000 + std::int64_t{t.tv_usec} / 1000;
+        };
+        return ms(usage.ru_utime) + ms(usage.ru_stime);
+    }
+
     void log_pages() const noexcept {
         JsonArray latency;
         for (const std::uint32_t count : latency_) {
@@ -1734,12 +1912,18 @@ private:
         }
         platform_.logger->log(
             LogLevel::kInfo, "job_pages",
-            JsonObject{{"received", JsonValue{static_cast<std::int64_t>(pages_in_)}},
-                       {"sent_again", JsonValue{static_cast<std::int64_t>(sent_again_)}},
-                       {"faults", JsonValue{static_cast<std::int64_t>(faults_taken_)}},
-                       {"prefetched", JsonValue{static_cast<std::int64_t>(prefetched_)}},
-                       {"sent", JsonValue{static_cast<std::int64_t>(pages_out_)}},
-                       {"latency", JsonValue{std::move(latency)}}});
+            JsonObject{
+                {"received", JsonValue{static_cast<std::int64_t>(pages_in_)}},
+                {"sent_again", JsonValue{static_cast<std::int64_t>(sent_again_)}},
+                {"faults", JsonValue{static_cast<std::int64_t>(faults_taken_)}},
+                {"prefetched", JsonValue{static_cast<std::int64_t>(prefetched_)}},
+                {"sent", JsonValue{static_cast<std::int64_t>(pages_out_)}},
+                {"page_bytes", JsonValue{static_cast<std::int64_t>(page_bytes_)}},
+                {"page_bytes_plain", JsonValue{static_cast<std::int64_t>(page_bytes_plain_)}},
+                {"encoded", JsonValue{static_cast<std::int64_t>(encoded_)}},
+                {"diffs", JsonValue{static_cast<std::int64_t>(diffs_)}},
+                {"cpu_ms", JsonValue{cpu_ms()}},
+                {"latency", JsonValue{std::move(latency)}}});
     }
 
     // The frames of maps, of segments on the move and of leaving. True if it was one of them.
@@ -2320,6 +2504,9 @@ private:
             return copied;
         }
         pages_out_ += size == buffer.size() && a.to != s_.self ? 1U : 0U;
+        if (a.opcode == Opcode::kWriteGrant || a.opcode == Opcode::kUpgradeGrant) {
+            keep_base(a, std::span{buffer}.subspan(8, size - 8), flags);
+        }
         if (s_.reply_delay > Nanos{} && a.to != s_.self) {
             std::vector<std::byte> later{buffer.begin(), buffer.begin() + size};
             after(std::exchange(s_.reply_delay, Nanos{}),
@@ -2494,7 +2681,17 @@ private:
     std::unordered_map<std::uint64_t, ReqId> current_;
     std::deque<Local> local_;
     std::uint64_t pages_in_ = 0;
-    std::uint64_t pages_out_ = 0;     // pages sent to other nodes (L_STATS)
+    std::uint64_t pages_out_ = 0;  // pages sent to other nodes (L_STATS)
+    // X-page-encoding: the copies kept for diffs, by page; the bytes of page payloads sent to
+    // other nodes, and what they would have been plain; how many went encoded, and as diffs;
+    // this process's page waits, averaged (a sign of a slow link).
+    std::unordered_map<std::uint64_t, std::unique_ptr<Kept>> bases_;
+    std::unordered_map<std::uint64_t, std::unique_ptr<Kept>> twins_;
+    std::uint64_t page_bytes_ = 0;
+    std::uint64_t page_bytes_plain_ = 0;
+    std::uint64_t encoded_ = 0;
+    std::uint64_t diffs_ = 0;
+    std::uint64_t wait_us_ = 0;
     std::uint64_t faults_taken_ = 0;  // faults handled (L_STATS)
     std::uint64_t prefetched_ = 0;    // pages asked for ahead
     Prefetcher prefetcher_{s_.prefetch_depth, s_.prefetch_streams};
