@@ -740,3 +740,97 @@ TEST_CASE("the status report: L_STATS") {
     CHECK(paramesh::wire_decode_l_stats(std::span{out}.first(size.value() - 1)).error().code ==
           Errc::kProtocol);
 }
+
+// ---- COMPRESSED page payloads (X-page-encoding)
+// ------------------------------------------------------
+
+TEST_CASE("an encoded page carries its non-zero bytes and rebuilds exactly") {
+    using Page = std::array<std::byte, paramesh::kPageSize>;
+    static constexpr Page kZeros{};
+    Page page{};
+    page.at(0) = std::byte{0x40};     // word 0: one byte
+    page.at(4095) = std::byte{0x01};  // word 511: one byte
+    page.at(8 * 7 + 2) = std::byte{0xFF};
+    page.at(8 * 7 + 3) = std::byte{0x11};  // word 7: two bytes
+    std::array<std::byte, 8 + paramesh::kPageSize> out{};
+    const auto size = paramesh::wire_encode_page(
+        paramesh::EncodedPage{paramesh::PageId{9}, paramesh::kEncodedPage, 0xDEADBEEF}, page,
+        kZeros, out);
+    REQUIRE(size.ok());
+    // 16 header, 64 word map, then (mask + bytes) for words 0, 7 and 511
+    CHECK(size.value() == 16 + 64 + 2 + 3 + 2);
+    const std::span<const std::byte> bytes = std::span{out}.first(size.value());
+    CHECK(bytes.subspan(8, 8)[0] == std::byte{paramesh::kEncodedPage});
+    CHECK(bytes[16] == std::byte{0x81});       // words 0 and 7
+    CHECK(bytes[16 + 63] == std::byte{0x80});  // word 511
+
+    Page rebuilt{};
+    rebuilt.fill(std::byte{0x55});  // all of it is overwritten
+    const auto decoded = paramesh::wire_decode_encoded_page(bytes, rebuilt);
+    REQUIRE(decoded.ok());
+    CHECK(decoded.value().page == paramesh::PageId{9});
+    CHECK(decoded.value().mode == paramesh::kEncodedPage);
+    CHECK(decoded.value().page_crc == 0xDEADBEEF);
+    CHECK(rebuilt == page);
+
+    // A diff carries what differs from the base: the page with one word changed is 82 bytes.
+    Page base{};
+    for (std::size_t i = 0; i < base.size(); i++) {
+        base.at(i) = static_cast<std::byte>(i * 7 + 1);
+    }
+    Page changed = base;
+    changed.at(100) ^= std::byte{0x0F};
+    const auto diff = paramesh::wire_encode_page(
+        paramesh::EncodedPage{paramesh::PageId{3}, paramesh::kEncodedDiff, 0}, changed, base, out);
+    REQUIRE(diff.ok());
+    CHECK(diff.value() == 16 + 64 + 2);
+    Page delta{};
+    REQUIRE(paramesh::wire_decode_encoded_page(std::span{out}.first(diff.value()), delta).ok());
+    for (std::size_t i = 0; i < base.size(); i++) {
+        delta.at(i) ^= base.at(i);
+    }
+    CHECK(delta == changed);
+
+    // A page with no zero byte would not be shorter: it is sent plain.
+    CHECK(paramesh::wire_encode_page(
+              paramesh::EncodedPage{paramesh::PageId{3}, paramesh::kEncodedPage, 0}, base, kZeros,
+              out)
+              .error()
+              .code == Errc::kInvalidArgument);
+}
+
+TEST_CASE("a malformed encoded page is refused") {
+    using Page = std::array<std::byte, paramesh::kPageSize>;
+    static constexpr Page kZeros{};
+    Page page{};
+    page.at(10) = std::byte{0x22};
+    std::array<std::byte, 8 + paramesh::kPageSize> out{};
+    const auto size = paramesh::wire_encode_page(
+        paramesh::EncodedPage{paramesh::PageId{1}, paramesh::kEncodedPage, 0}, page, kZeros, out);
+    REQUIRE(size.ok());
+    const Bytes good{out.begin(), out.begin() + static_cast<std::ptrdiff_t>(size.value())};
+    Page rebuilt{};
+    REQUIRE(paramesh::wire_decode_encoded_page(good, rebuilt).ok());
+    const auto refused = [&](Bytes bytes) {
+        return paramesh::wire_decode_encoded_page(bytes, rebuilt).error().code == Errc::kProtocol;
+    };
+    Bytes bad = good;
+    bad.at(8) = std::byte{3};  // no such mode
+    CHECK(refused(bad));
+    bad = good;
+    bad.at(9) = std::byte{1};  // reserved
+    CHECK(refused(bad));
+    bad = good;
+    bad.at(80) = std::byte{0};  // a word in the map with an empty mask
+    CHECK(refused(bad));
+    bad = good;
+    bad.at(81) = std::byte{0};  // a byte said to be non-zero is zero
+    CHECK(refused(bad));
+    bad = good;
+    bad.push_back(std::byte{1});  // left over
+    CHECK(refused(bad));
+    bad = good;
+    bad.pop_back();  // cut short
+    CHECK(refused(bad));
+    CHECK(refused(Bytes(4104, std::byte{0})));  // no shorter than a plain page
+}

@@ -308,9 +308,10 @@ enum class Opcode : std::uint8_t {
 
 // Bits of FrameHeader::flags. docs/PROTOCOL.md, section 3.
 inline constexpr std::uint16_t kFlagZeroPage = 0x0001;
-inline constexpr std::uint16_t kFlagCompressed = 0x0002;  // reserved; never set
+inline constexpr std::uint16_t kFlagCompressed = 0x0002;  // an encoded page (X-page-encoding)
 inline constexpr std::uint16_t kFlagReadOnly = 0x0004;
 inline constexpr std::uint16_t kFlagRetry = 0x0008;
+inline constexpr std::uint16_t kFlagBaseKept = 0x0010;  // the home kept what it granted
 
 // docs/PROTOCOL.md, section 12. Sixteen bits because that is its width on the wire.
 // NOLINTNEXTLINE(performance-enum-size)

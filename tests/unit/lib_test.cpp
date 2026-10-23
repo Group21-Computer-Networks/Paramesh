@@ -1044,6 +1044,33 @@ TEST_CASE("with prefetching on, workers reading in order read the same numbers, 
     CHECK(median_on + 2 <= median_off);  // at least four times shorter
 }
 
+// ---- page encoding (X-page-encoding) ------------------------------------------------------------
+
+// The neighbours program moves one page back and forth, a few numbers changed each time: with
+// encoding on, the owners send diffs, far fewer bytes go, and every write still arrives.
+TEST_CASE("with page encoding on, a page that changes hands goes as diffs, and no write is lost" *
+          doctest::skip(!can_run())) {
+    // NOLINTBEGIN(concurrency-mt-unsafe): no other thread of this process is running
+    ::setenv("PARAMESH_CFG_TASK_AFFINITY", "0", 1);
+    ::setenv("PARAMESH_CFG_THRASH_THRESHOLD", "0", 1);  // no hold window: more transfers
+    std::string on_log;
+    std::string off_log;
+    CHECK(page_transfers("PARAMESH_CFG_PAGE_ENCODING=on", neighbours_program, &on_log) > 0);
+    CHECK(page_transfers("PARAMESH_CFG_PAGE_ENCODING=off", neighbours_program, &off_log) > 0);
+    ::unsetenv("PARAMESH_CFG_TASK_AFFINITY");
+    ::unsetenv("PARAMESH_CFG_THRASH_THRESHOLD");
+    // NOLINTEND(concurrency-mt-unsafe)
+    const long diffs = logged(on_log, "\"diffs\":").first;
+    const long sent = logged(on_log, "\"page_bytes\":").first;
+    const long plain = logged(on_log, "\"page_bytes_plain\":").first;
+    MESSAGE("encoding on: " << diffs << " diffs, " << sent << " bytes of " << plain << " plain");
+    CHECK(diffs > 0);
+    CHECK(sent * 4 < plain);
+    CHECK(logged(off_log, "\"diffs\":").first == 0);
+    CHECK(logged(off_log, "\"page_bytes\":").first ==
+          logged(off_log, "\"page_bytes_plain\":").first);
+}
+
 TEST_CASE("concurrent atomic adds from three processes sum exactly" * doctest::skip(!can_run())) {
     const Started job = start_job("0", atomic_program);
     CHECK(wait_for(job.pids[0], 120) == 0);

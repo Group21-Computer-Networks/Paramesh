@@ -72,9 +72,10 @@ Node ID 0 means "no node" and `0xFFFF` means "every node"; neither is ever a nod
 | Bit | Name | Meaning |
 | --- | --- | --- |
 | `0x0001` | `ZERO_PAGE` | The page has never been written. The frame carries the page ID and no page data; the receiver uses 4,096 zero bytes. |
-| `0x0002` | `COMPRESSED` | Reserved for compressed page data. Never set this semester; a receiver that sees it treats the frame as malformed. |
+| `0x0002` | `COMPRESSED` | The page data is encoded, section 7.2: only on `READ_DATA`, `WRITE_GRANT`, `FETCH_DATA` and `WRITEBACK`, never with `ZERO_PAGE`. Added by X-page-encoding, with the person's approval. |
 | `0x0004` | `READ_ONLY` | The page data in this frame is a read copy: the receiver installs it write-protected, and the sender of a `FETCH_DATA` kept its own copy. |
 | `0x0008` | `RETRY` | This request was sent before, with the same `req_id`, and no reply came within the reply timeout. |
+| `0x0010` | `BASE_KEPT` | On `WRITE_GRANT` and `UPGRADE_GRANT`: the home kept a copy of the page as granted, and the receiver may send its next `FETCH_DATA` or `WRITEBACK` of the page to that home as a diff, section 7.2. Added by X-page-encoding, with the person's approval. |
 
 All other bits are reserved.
 
@@ -453,6 +454,26 @@ A **page payload** is the page ID, then the page's 4,096 bytes unless `ZERO_PAGE
 | 8 | 4096 | `data` | The page's bytes. Absent when the header has `ZERO_PAGE`. |
 
 Size: 4,104 bytes, or 8 with `ZERO_PAGE`. A full page frame is 4,140 bytes.
+
+An **encoded page payload** (`COMPRESSED` set) carries the bytes of the page that are not
+zero, or, in a diff, the bytes of the page XOR the copy the home kept that are not zero. It is
+sent only when shorter than 4,104 bytes.
+
+| Offset | Size | Field | Meaning |
+| --- | --- | --- | --- |
+| 0 | 8 | `page_id` | The page. |
+| 8 | 1 | `mode` | 1, the page; 2, a diff against the copy the home kept. |
+| 9 | 3 | reserved | 0. |
+| 12 | 4 | `page_crc` | CRC-32C of the page's 4,096 bytes as rebuilt. |
+| 16 | 64 | `word_map` | Bit `i % 8` of byte `i / 8` is set when 8-byte word `i` of the page (bytes `8i` to `8i + 7`) has a non-zero byte. |
+| 80 | | `words` | For each word set in `word_map`, in order: a byte whose bit `j` is set when byte `j` of the word is not zero, then those bytes, in order. |
+
+Size: 80 bytes or more, below 4,104. The receiver rebuilds the page: zeros, then the bytes
+given; for a diff, XORed into the copy it kept. Mode 2 is legal only on `FETCH_DATA` and
+`WRITEBACK`, sent to the home that set `BASE_KEPT` on the page's last grant to the sender; the
+home lets the copy go when any `FETCH_DATA` or `WRITEBACK` of the page comes from that node. A
+payload that breaks this layout, a diff with no copy kept, or a page whose CRC differs ends
+the job with `PROTOCOL`.
 
 A **page ID payload** is the page ID alone.
 
