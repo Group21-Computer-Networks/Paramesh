@@ -97,6 +97,12 @@ bool to_peer(std::string_view text, Endpoint& out, std::uint16_t& discovery) {
            (second == std::string_view::npos || to_u16(ports.substr(second + 1), 1, discovery));
 }
 
+// This machine's RAM, in bytes.
+std::uint64_t machine_ram() noexcept {
+    return static_cast<std::uint64_t>(::sysconf(_SC_PHYS_PAGES)) *
+           static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
+}
+
 std::string mb(std::uint64_t bytes) {
     return std::to_string(bytes >> 20U) + " MB";
 }
@@ -121,7 +127,7 @@ std::string_view pmd_usage() noexcept {
            "           [--peers address[:port[:port]],...]\n"
            "           [--state-dir DIRECTORY] [--iface NAME] [--no-multicast]\n"
            "           [--control-port N] [--discovery-port N] [--http-port N]\n"
-           "           [--dashboard FILE]\n"
+           "           [--dashboard FILE] [--standby]\n"
            "  --node-id       this node's ID, 1 to 65534 (default: a random ID, made on the first\n"
            "                  run and kept in the state directory)\n"
            "  --cap-cores     the most worker threads a job may run here (default: all "
@@ -138,7 +144,9 @@ std::string_view pmd_usage() noexcept {
            "  --discovery-port the UDP port for beacons, the same on every node (default 47000)\n"
            "  --http-port     the status API on 127.0.0.1 (default 47002); the dashboard is at /\n"
            "  --dashboard     the dashboard page (default: tools/dashboard/index.html of the\n"
-           "                  source tree pmd was built in)\n";
+           "                  source tree pmd was built in)\n"
+           "  --standby       start out of the pool: hear it, take no work, and join from the\n"
+           "                  dashboard with the cores and RAM chosen there\n";
 }
 
 namespace {
@@ -181,8 +189,8 @@ Result<PmdConfig> pmd_parse_args(std::span<const std::string_view> args) {
     PmdConfig config;
     for (std::size_t i = 0; i < args.size(); i += 2) {
         const std::string_view flag = args[i];
-        if (flag == "--no-multicast") {  // the one flag with no value
-            config.multicast = false;
+        if (flag == "--no-multicast" || flag == "--standby") {  // the flags with no value
+            (flag == "--standby" ? config.standby : config.multicast) = flag == "--standby";
             i--;
             continue;
         }
@@ -231,8 +239,7 @@ Result<PmdConfig> pmd_parse_args(std::span<const std::string_view> args) {
             std::clamp<unsigned>(std::thread::hardware_concurrency(), 1, 65535));
     }
     if (config.cap_ram == 0) {  // as with the cores: all of it
-        config.cap_ram = static_cast<std::uint64_t>(::sysconf(_SC_PHYS_PAGES)) *
-                         static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
+        config.cap_ram = machine_ram();
     }
     return config;
 }
@@ -400,6 +407,14 @@ Result<void> Pmd::open() {
     platform_.http->get("/v1/peers", [this](std::string_view /*path*/) {
         return HttpResponse{200, "application/json", peers_json()};
     });
+    platform_.http->post("/v1/join", [this](std::string_view /*path*/, std::string_view body) {
+        return ask_join(body);
+    });
+    platform_.http->post("/v1/leave", [this](std::string_view /*path*/, std::string_view /*body*/) {
+        return ask_leave();
+    });
+    joined_ = !config_.standby;
+    member_ = joined_ ? "joined" : "standby";
     const Result<std::uint16_t> http = platform_.http->start("127.0.0.1", config_.http_port);
     if (!http.ok()) {
         return Error{Errc::kIo, http.error().os_error, "serve the status API on 127.0.0.1"};
@@ -452,6 +467,7 @@ void Pmd::run() {
             if (leave_asked_.exchange(false) && !leaving_) {
                 begin_leave(kLeaveInterrupt);
             }
+            act_on_asks();
         }
         if ((fds[3].revents & POLLIN) != 0) {
             hear();
@@ -475,7 +491,12 @@ void Pmd::run() {
             std::none_of(runs_.begin(), runs_.end(),
                          [](const Run& r) { return r.launcher != 0; })) {
             say_bye();
-            return;
+            if (!std::exchange(back_to_standby_, false)) {
+                return;
+            }
+            leaving_ = false;  // left from the dashboard: out of the pool, still serving it
+            joined_ = false;
+            set_member("standby", "left the pool");
         }
         if ((fds[1].revents & POLLIN) != 0) {
             accept_on(control_listener_, false);
@@ -578,6 +599,11 @@ void Pmd::on_spawn_req(Connection& connection, const FrameHeader& header,
     spawn.hash = request.binary_hash;
     spawn.want = request.threads_per_node;
     const std::string here = " on node " + std::to_string(config_.node.value);
+    if (!joined_) {
+        decline(spawn, Status::kDeclined,
+                "node " + std::to_string(config_.node.value) + " has not joined the pool");
+        return;
+    }
     if (leaving_) {
         decline(spawn, Status::kLeaving,
                 "node " + std::to_string(config_.node.value) + " is leaving");
@@ -812,6 +838,9 @@ void Pmd::announce(Opcode opcode, std::span<const std::byte> payload) {
 // Once a second: HELLO, and the peers silent too long leave the table.
 void Pmd::beacon(Nanos now) {
     last_beacon_ = now;
+    if (!joined_) {
+        return;  // standby: heard from, but says nothing
+    }
     HelloPayload hello;
     hello.instance = instance_;
     hello.control_port = config_.control_port;
@@ -958,20 +987,143 @@ std::string Pmd::peers_json() {
     };
     JsonArray peers;
     JsonArray clashes;
-    {
-        const std::scoped_lock hold{peers_mu_};
-        for (const Peer& peer : table_->peers()) {
-            peers.push_back(entry(peer));
+    const std::scoped_lock hold{peers_mu_};  // the table, and the caps a join changes
+    for (const Peer& peer : table_->peers()) {
+        peers.push_back(entry(peer));
+    }
+    for (const Peer& clash : clashes_) {
+        clashes.push_back(entry(clash));
+    }
+    return platform_.json->encode(JsonValue{
+        JsonObject{{"node", JsonValue{std::int64_t{config_.node.value}}},
+                   {"cap_cores", JsonValue{std::int64_t{config_.cap_cores}}},
+                   {"cap_ram", JsonValue{static_cast<std::int64_t>(config_.cap_ram)}},
+                   {"member", JsonValue{member_}},
+                   {"note", JsonValue{member_note_}},
+                   {"machine_cores", JsonValue{std::int64_t{std::thread::hardware_concurrency()}}},
+                   {"machine_ram", JsonValue{static_cast<std::int64_t>(machine_ram())}},
+                   {"peers", JsonValue{std::move(peers)}},
+                   {"clashes", JsonValue{std::move(clashes)}}}});
+}
+
+// ---- joining and leaving from the dashboard (X-dashboard-join) ----------------------------------
+
+// POST /v1/join, on the HTTP thread: {"cap_cores": N, "cap_ram": bytes, "lead": "address"},
+// the lead optional (a node of the pool, for a network without multicast). Checked here, done
+// by the main thread.
+HttpResponse Pmd::ask_join(std::string_view body) {
+    const auto refuse = [this](int status, const std::string& why) {
+        return HttpResponse{
+            status, "application/json",
+            platform_.json->encode(JsonValue{JsonObject{{"error", JsonValue{why}}}})};
+    };
+    const Result<JsonValue> parsed = platform_.json->decode(body);
+    const auto* fields = parsed.ok() ? std::get_if<JsonObject>(&parsed.value().v) : nullptr;
+    const auto number = [fields](std::string_view key) -> std::int64_t {
+        const auto found = fields->find(key);
+        const auto* n =
+            found != fields->end() ? std::get_if<std::int64_t>(&found->second.v) : nullptr;
+        return n != nullptr ? *n : -1;
+    };
+    if (fields == nullptr) {
+        return refuse(400, "the body is not a JSON object");
+    }
+    JoinAsk ask;
+    const std::int64_t cores = number("cap_cores");
+    const std::int64_t ram = number("cap_ram");
+    if (cores < 1 || cores > std::int64_t{std::thread::hardware_concurrency()}) {
+        return refuse(400, "the cores to give must be 1 to " +
+                               std::to_string(std::thread::hardware_concurrency()));
+    }
+    if (ram < std::int64_t{kPageSize} || static_cast<std::uint64_t>(ram) > machine_ram()) {
+        return refuse(400, "the RAM to give must be at least 4 KB and at most this machine's RAM");
+    }
+    ask.cores = static_cast<std::uint16_t>(cores);
+    ask.ram = static_cast<std::uint64_t>(ram);
+    if (const auto lead = fields->find("lead"); lead != fields->end()) {
+        const auto* text = std::get_if<std::string>(&lead->second.v);
+        Endpoint at;
+        if (text == nullptr || (!text->empty() && !to_peer(*text, at, ask.lead_discovery))) {
+            return refuse(400,
+                          "the lead node must be an IPv4 address, optionally with :control "
+                          "port[:discovery port]");
         }
-        for (const Peer& clash : clashes_) {
-            clashes.push_back(entry(clash));
+        if (!text->empty()) {
+            ask.lead = at;
         }
     }
-    return platform_.json->encode(
-        JsonValue{JsonObject{{"node", JsonValue{std::int64_t{config_.node.value}}},
-                             {"cap_cores", JsonValue{std::int64_t{config_.cap_cores}}},
-                             {"peers", JsonValue{std::move(peers)}},
-                             {"clashes", JsonValue{std::move(clashes)}}}});
+    {
+        const std::scoped_lock hold{peers_mu_};
+        if (member_ != "standby" || join_ask_) {
+            return refuse(409, "this node is " + member_ + ", not standing by");
+        }
+        join_ask_ = ask;
+    }
+    const std::uint64_t one = 1;
+    [[maybe_unused]] const ssize_t written = ::write(stop_fd_, &one, sizeof one);
+    return HttpResponse{202, "application/json", R"({"member":"joining"})"};
+}
+
+// POST /v1/leave, on the HTTP thread: a graceful leave, back to standby when it is done.
+HttpResponse Pmd::ask_leave() {
+    {
+        const std::scoped_lock hold{peers_mu_};
+        if (member_ != "joined") {
+            return HttpResponse{409, "application/json",
+                                platform_.json->encode(JsonValue{
+                                    JsonObject{{"error", JsonValue{"this node is " + member_}}}})};
+        }
+        leave_ask_ = true;
+    }
+    const std::uint64_t one = 1;
+    [[maybe_unused]] const ssize_t written = ::write(stop_fd_, &one, sizeof one);
+    return HttpResponse{202, "application/json", R"({"member":"leaving"})"};
+}
+
+// The main thread: carries out what the dashboard asked.
+void Pmd::act_on_asks() {
+    std::optional<JoinAsk> join;
+    bool leave = false;
+    {
+        const std::scoped_lock hold{peers_mu_};
+        join = std::exchange(join_ask_, std::nullopt);
+        leave = std::exchange(leave_ask_, false);
+        if (join && !joined_) {
+            config_.cap_cores = join->cores;
+            config_.cap_ram = join->ram;
+            if (join->lead) {
+                config_.peers.push_back(*join->lead);
+                config_.peer_discovery_ports.push_back(join->lead_discovery);
+            }
+        }
+    }
+    if (join && !joined_) {
+        const char* budget =
+            std::getenv("PARAMESH_CFG_SPILL_BUDGET");  // NOLINT(concurrency-mt-unsafe)
+        config_.spill_budget =
+            budget != nullptr ? std::strtoull(budget, nullptr, 10) : config_.cap_ram;
+        joined_ = true;
+        set_member("joined", "joined with " + std::to_string(config_.cap_cores) + " cores and " +
+                                 mb(config_.cap_ram) + " of RAM");
+        beacon(platform_.clock->now());
+    }
+    if (leave && joined_ && !leaving_) {
+        const auto launched =
+            std::find_if(runs_.begin(), runs_.end(), [](const Run& r) { return r.launcher != 0; });
+        if (launched != runs_.end()) {
+            set_member("joined", "job " + std::to_string(launched->job.value) +
+                                     ", launched here, is still running: leave when it ends");
+            return;
+        }
+        back_to_standby_ = true;
+        begin_leave(kLeaveAsked);
+    }
+}
+
+void Pmd::set_member(std::string state, std::string note) {
+    const std::scoped_lock hold{peers_mu_};
+    member_ = std::move(state);
+    member_note_ = std::move(note);
 }
 
 Pmd::Run* Pmd::run_of(JobId job) {
@@ -1009,6 +1161,12 @@ void Pmd::on_run_req(Connection& connection, const FrameHeader& /*header*/,
     if (leaving_) {
         reply(connection.id, Opcode::kLRunRefused, JobId{0}, kNoNode, kNoReq,
               StatusTextPayload{Status::kLeaving, "this node is leaving"});
+        return;
+    }
+    if (!joined_) {
+        reply(connection.id, Opcode::kLRunRefused, JobId{0}, kNoNode, kNoReq,
+              StatusTextPayload{Status::kDeclined,
+                                "this node has not joined the pool: join on the dashboard"});
         return;
     }
     Run run;
@@ -1327,6 +1485,7 @@ void Pmd::on_leave_req(Connection& connection, std::span<const std::byte> payloa
 // "leaving" from now on, so nobody asks this node for a worker again.
 void Pmd::begin_leave(std::uint8_t reason) {
     leaving_ = true;
+    set_member("leaving", "");
     // A worker still starting is not given to its job: declined, and stopped.
     for (const Spawn& spawn : spawns_) {
         decline(spawn, Status::kLeaving,

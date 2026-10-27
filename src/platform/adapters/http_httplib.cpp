@@ -2,6 +2,7 @@
 
 #include <httplib.h>
 
+#include <atomic>
 #include <string>
 #include <thread>
 #include <utility>
@@ -43,6 +44,23 @@ public:
         });
     }
 
+    void post(const std::string& pattern, HttpPostHandler handler) override {
+        server_.Post(pattern, [this, handler = std::move(handler)](const httplib::Request& request,
+                                                                   httplib::Response& response) {
+            const std::string port = ":" + std::to_string(port_.load());
+            const std::string host = request.get_header_value("Host");
+            if (request.get_header_value("X-ParaMesh") != "1" ||
+                (host != "127.0.0.1" + port && host != "localhost" + port)) {
+                response.status = 403;
+                response.set_content(R"({"error":"not from this dashboard"})", "application/json");
+                return;
+            }
+            const HttpResponse reply = handler(request.path, request.body);
+            response.status = reply.status;
+            response.set_content(reply.body, reply.content_type);
+        });
+    }
+
     Result<std::uint16_t> start(const std::string& host, std::uint16_t port) override {
         int bound = -1;
         if (port == 0) {
@@ -53,6 +71,7 @@ public:
         if (bound <= 0) {
             return Error{Errc::kIo, 0, "start the HTTP server: cannot bind the address"};
         }
+        port_ = static_cast<std::uint16_t>(bound);
         thread_ = std::thread{[this] { server_.listen_after_bind(); }};
         server_.wait_until_ready();
         return static_cast<std::uint16_t>(bound);
@@ -68,6 +87,7 @@ public:
 private:
     httplib::Server server_;
     std::thread thread_;
+    std::atomic<std::uint16_t> port_{0};
 };
 
 }  // namespace

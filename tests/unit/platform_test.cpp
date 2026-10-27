@@ -244,3 +244,35 @@ TEST_CASE("the HTTP server answers a registered GET and refuses an unknown path"
     CHECK(missing->status == 404);
     platform.http->stop();
 }
+
+TEST_CASE("the HTTP server takes a POST only from its own page: the header and the Host") {
+    const paramesh::Platform platform = open_platform();
+    platform.http->post("/v1/echo", [](std::string_view path, std::string_view body) {
+        return paramesh::HttpResponse{200, "text/plain",
+                                      std::string{path} + " " + std::string{body}};
+    });
+    const auto port = platform.http->start("127.0.0.1", 0);
+    REQUIRE(port.ok());
+    httplib::Client client{"127.0.0.1", port.value()};
+
+    const auto ours = client.Post("/v1/echo", {{"X-ParaMesh", "1"}}, "{}", "application/json");
+    REQUIRE(ours);
+    CHECK(ours->status == 200);
+    CHECK(ours->body == "/v1/echo {}");
+    const auto by_name = client.Post(
+        "/v1/echo", {{"X-ParaMesh", "1"}, {"Host", "localhost:" + std::to_string(port.value())}},
+        "{}", "application/json");
+    REQUIRE(by_name);
+    CHECK(by_name->status == 200);
+
+    // A form on another site cannot set the header; a rebound name gives another Host.
+    const auto no_header = client.Post("/v1/echo", "{}", "application/json");
+    REQUIRE(no_header);
+    CHECK(no_header->status == 403);
+    const auto rebound = client.Post("/v1/echo", {{"X-ParaMesh", "1"}, {"Host", "evil.example:80"}},
+                                     "{}", "application/json");
+    REQUIRE(rebound);
+    CHECK(rebound->status == 403);
+    CHECK(client.Get("/v1/echo")->status == 404);  // POST only
+    platform.http->stop();
+}

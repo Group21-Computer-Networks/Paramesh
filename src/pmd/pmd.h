@@ -60,6 +60,7 @@ struct PmdConfig {
     std::uint16_t discovery_port = kDiscoveryPort;  // --discovery-port; the same on every node
     std::uint16_t http_port = kHttpPort;            // --http-port; 0 lets the system choose
     bool multicast = true;                          // --no-multicast: seeds only
+    bool standby = false;            // --standby: start out of the pool; join from the dashboard
     std::string iface;               // --iface: the one interface for multicast; else every one
     std::string state_dir;           // --state-dir; pmd.sock and node_id are kept in it
     std::string dashboard;           // --dashboard: the page served at / (M6-3)
@@ -178,6 +179,10 @@ private:
     void on_leave_req(Connection& connection, std::span<const std::byte> payload);
     void on_leave_intent(const FrameHeader& header, std::span<const std::byte> payload);
     void begin_leave(std::uint8_t reason);
+    HttpResponse ask_join(std::string_view body);
+    HttpResponse ask_leave();
+    void act_on_asks();
+    void set_member(std::string state, std::string note);
     void on_chunk(const Connection& connection, const FrameHeader& header,
                   std::span<const std::byte> payload);
     void on_segments(const Connection& connection, const FrameHeader& header,
@@ -238,6 +243,9 @@ private:
     std::vector<Spawn> spawns_;
     std::vector<Worker> workers_;
     bool leaving_ = false;
+    bool joined_ = true;            // X-dashboard-join: in the pool (below)
+    bool back_to_standby_ = false;  // a dashboard leave: stand by when it is done
+    bool leave_ask_ = false;        // under peers_mu_: a leave asked on the dashboard
     mutable std::atomic<bool> stop_asked_{false};
     mutable std::atomic<bool> leave_asked_{false};
     std::vector<pid_t> children_;  // every worker started and not yet collected
@@ -249,7 +257,18 @@ private:
     std::vector<std::uint32_t> interfaces_;  // IPv4 of each interface multicast goes out on
     std::uint32_t instance_ = 0;
     Nanos last_beacon_{};
-    std::mutex peers_mu_;               // the table is read by the HTTP thread too
+    std::mutex peers_mu_;  // the table is read by the HTTP thread too
+    // X-dashboard-join, under peers_mu_: a join asked on the dashboard, for the main thread to
+    // carry out, and the state and note /v1/peers shows.
+    struct JoinAsk {
+        std::uint16_t cores = 0;
+        std::uint64_t ram = 0;
+        std::optional<Endpoint> lead;
+        std::uint16_t lead_discovery = 0;
+    };
+    std::optional<JoinAsk> join_ask_;
+    std::string member_ = "joined";  // standby, joined or leaving
+    std::string member_note_;
     std::vector<Peer> clashes_;         // beacons that claimed a node ID another daemon has
     std::unique_ptr<PeerTable> table_;  // made by open(), once the node ID is known
     std::optional<Ledger> ledger_;      // read by open() from the state directory

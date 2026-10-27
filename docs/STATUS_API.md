@@ -1,8 +1,9 @@
 # ParaMesh status API
 
 Each `pmd` serves its own view of the pool over HTTP on `127.0.0.1`, port `--http-port`
-(default 47002; 0 lets the system choose, and the port is in the `pmd_start` log line). Only
-`GET`. Every answer is JSON except `/v1/events`, which is a stream of server-sent events.
+(default 47002; 0 lets the system choose, and the port is in the `pmd_start` log line). `GET`,
+and `POST` for the dashboard's join and leave buttons. Every answer is JSON except
+`/v1/events`, which is a stream of server-sent events.
 What a daemon shows is its own records; what peers announce is shown as theirs and used for
 nothing else.
 
@@ -14,7 +15,9 @@ daemon learning of it.
 This node and the peers it hears.
 
 ```json
-{"node": 1, "cap_cores": 4,
+{"node": 1, "cap_cores": 4, "cap_ram": 4294967296, "member": "joined",
+ "note": "joined with 4 cores and 4096 MB of RAM", "machine_cores": 8,
+ "machine_ram": 16005251072,
  "peers": [{"node": 2, "address": "10.0.0.2", "control_port": 47001, "state": "alive",
             "leaving": false, "cap_cores": 4, "free_cores": 4, "cap_ram": 0, "free_ram": 0,
             "jobs": 1, "silent_ms": 310}],
@@ -23,6 +26,27 @@ This node and the peers it hears.
 
 `state` is `alive` or `suspect` (three beacons missed; a peer is dropped after five).
 `clashes` lists another daemon using this node's ID.
+
+`member` (X-dashboard-join): `standby` (started with `--standby`, or left from the dashboard:
+it hears the pool, sends no beacon, and takes no work), `joined`, or `leaving`. `note` says
+what the last join or leave came to. `machine_cores` and `machine_ram` bound what a join may
+give.
+
+## `POST /v1/join` and `POST /v1/leave` (X-dashboard-join)
+
+Only from the dashboard: the request must carry the header `X-ParaMesh: 1` and a `Host` of
+`127.0.0.1:<port>` or `localhost:<port>`; anything else gets 403. This stops another web page
+the user has open from pressing the buttons.
+
+`/v1/join`, body `{"cap_cores": 4, "cap_ram": 4294967296, "lead": "10.0.0.2"}`: join the pool
+with these caps (cores 1 to `machine_cores`, RAM 4,096 bytes to `machine_ram`). `lead` is
+optional: a node already in the pool, `address[:control port[:discovery port]]`, added to the
+seeds for a network without multicast. 202 `{"member":"joining"}`; 400 with `{"error": ...}`
+for a bad body; 409 when the node is not standing by.
+
+`/v1/leave`, no body: a graceful leave, as `pm leave`, after which the daemon stands by
+instead of stopping. 202 `{"member":"leaving"}`; 409 when the node is not in the pool. A node
+that launched a job still running does not leave; `note` says so.
 
 ## `GET /v1/ledger` (M5-4)
 

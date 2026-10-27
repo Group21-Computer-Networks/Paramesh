@@ -1,7 +1,9 @@
 <!doctype html>
 <!-- The ParaMesh dashboard (M6-3): one page, no library. pmd serves it at / on its status port;
      it reads that pmd's status API (docs/STATUS_API.md): the event stream for live rates, and
-     the peers, jobs and pages once a second. -->
+     the peers, jobs and pages once a second. X-dashboard-join added this node's membership
+     (join the pool with the cores and RAM chosen, leave it) and the compute given and received,
+     from the ledger. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -9,10 +11,12 @@
 <title>ParaMesh</title>
 <style>
   :root { --bg: #fff; --fg: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7; --accent: #0071e3;
-          --home: #0071e3; --shared: #34c759; --modified: #ff9500; --empty: #f2f2f4; }
+          --home: #0071e3; --shared: #34c759; --modified: #ff9500; --empty: #f2f2f4;
+          --danger: #c4001a; }
   @media (prefers-color-scheme: dark) {
     :root { --bg: #111113; --fg: #f5f5f7; --muted: #a1a1a6; --line: #38383d; --accent: #2997ff;
-            --home: #2997ff; --shared: #30d158; --modified: #ff9f0a; --empty: #232326; }
+            --home: #2997ff; --shared: #30d158; --modified: #ff9f0a; --empty: #232326;
+            --danger: #ff6961; }
   }
   body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
          font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -31,21 +35,85 @@
   .bar { height: 8px; background: var(--empty); border-radius: 4px; overflow: hidden; }
   .bar div { height: 100%; background: var(--accent); width: 0; transition: width .3s; }
   #status { font-size: 12px; }
+  ::selection { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  input { accent-color: var(--accent); }
+  .scroll { overflow-x: auto; }
+  .cards { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .card.member { flex: 1 1 320px; }
+  .card.account { flex: 2 1 380px; }
+  .card h2 { margin-top: 0; }
+  .sides { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 24px; align-items: baseline;
+           font-variant-numeric: tabular-nums; }
+  .sides b { font-size: 22px; }
+  .sides .muted { font-size: 12px; }
+  .net { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px;
+           border: 1px solid var(--line); }
+  .badge.joined { color: var(--shared); border-color: var(--shared); }
+  .badge.leaving { color: var(--modified); border-color: var(--modified); }
+  label { display: block; margin: 8px 0 2px; color: var(--muted); }
+  input { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line);
+          border-radius: 6px; padding: 4px 8px; width: 100%; box-sizing: border-box; }
+  input[type=range] { padding: 0; border: 0; }
+  button { font: inherit; margin-top: 12px; padding: 6px 14px; border-radius: 6px;
+           border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  button.quiet { background: transparent; color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  .error { color: var(--danger); margin-top: 8px; }
 </style>
 </head>
 <body>
 <h1>ParaMesh <span id="node" class="muted"></span></h1>
 <div id="status" class="muted">connecting</div>
 
-<h2>Peers</h2>
-<table><thead><tr><th>Node</th><th>Address</th><th>State</th><th class="n">Cores</th>
-  <th class="n">Jobs</th><th class="n">Silent</th></tr></thead><tbody id="peers"></tbody></table>
+<div class="cards">
+  <div class="card member">
+    <h2>This node <span id="member" class="badge"></span></h2>
+    <div id="note" class="muted"></div>
+    <form id="join" hidden>
+      <label for="cores">Cores to give: <b id="cores-out"></b></label>
+      <input id="cores" type="range" min="1" step="1">
+      <label for="ram">RAM to give, MB (of <span id="ram-max"></span>)</label>
+      <input id="ram" type="number" min="1" step="1">
+      <label for="lead">Lead node (optional: a node of the pool, if your network has no
+        multicast)</label>
+      <input id="lead" list="heard" placeholder="10.0.0.2" autocomplete="off">
+      <datalist id="heard"></datalist>
+      <button id="join-button" type="submit">Join the pool</button>
+    </form>
+    <div id="joined" hidden>
+      <div id="giving"></div>
+      <button id="leave" class="quiet" type="button">Leave the pool</button>
+    </div>
+    <div id="ask-error" class="error" role="alert"></div>
+  </div>
+  <div class="card account">
+    <h2>Your account with the pool</h2>
+    <div class="sides">
+      <b id="given">0</b><b id="received">0</b>
+      <span class="muted">core-seconds given: this node's work for other nodes' jobs</span>
+      <span class="muted">core-seconds received: other nodes' work for jobs started here</span>
+    </div>
+    <div id="net" class="net muted"></div>
+  </div>
+</div>
+
+<h2>Given and received, by node</h2>
+<div class="scroll"><table><thead><tr><th>Node</th><th class="n">Given</th><th class="n">Received</th>
+  <th class="n">Balance</th><th class="n">Weight</th><th class="n">Chunks for it</th>
+  <th class="n">Chunks by it</th><th>Its own account</th></tr></thead><tbody id="ledger"></tbody></table></div>
+
+<h2>Nodes heard on your network</h2>
+<div class="scroll"><table><thead><tr><th>Node</th><th>Address</th><th>State</th><th class="n">Cores</th>
+  <th class="n">Jobs</th><th class="n">Silent</th></tr></thead><tbody id="peers"></tbody></table></div>
 <div id="migration"></div>
 
 <h2>Jobs on this node</h2>
-<table><thead><tr><th>Job</th><th>Role</th><th class="n">Launcher</th><th class="n">Slots</th>
+<div class="scroll"><table><thead><tr><th>Job</th><th>Role</th><th class="n">Launcher</th><th class="n">Slots</th>
   <th class="n">Faults/s</th><th class="n">MB in/s</th><th class="n">MB out/s</th>
-  <th class="n">p50 µs</th><th class="n">p99 µs</th></tr></thead><tbody id="jobs"></tbody></table>
+  <th class="n">p50 µs</th><th class="n">p99 µs</th></tr></thead><tbody id="jobs"></tbody></table></div>
 
 <h2>Page ownership</h2>
 <div class="legend muted"><span><i style="background:var(--home)"></i>home here</span>
@@ -75,6 +143,78 @@ function drawPeers(p) {
     `<td class="n">${q.cap_cores}</td><td class="n">${q.jobs}</td><td class="n">${fixed(q.silent_ms / 1000, 1)} s</td></tr>`
   ).join("") || `<tr><td colspan="6" class="muted">no peer heard</td></tr>`;
 }
+
+// Membership: the join form while standing by, the caps and a leave button while in the pool.
+let formFilled = false;
+function drawMember(p) {
+  const badge = $("member");
+  badge.textContent = p.member;
+  badge.className = "badge " + p.member;
+  $("note").textContent = p.note || (p.member === "standby" ? "Not in the pool: nothing runs here for others." : "");
+  $("join").hidden = p.member !== "standby";
+  $("joined").hidden = p.member === "standby";
+  if ($("leave").textContent !== "Leaving…") $("leave").disabled = p.member !== "joined";
+  $("giving").textContent = `Giving ${p.cap_cores} of ${p.machine_cores} cores and ` +
+    `${fixed(p.cap_ram / 1048576, 0)} of ${fixed(p.machine_ram / 1048576, 0)} MB of RAM.`;
+  const cores = $("cores"), ram = $("ram");
+  cores.max = p.machine_cores;
+  ram.max = Math.floor(p.machine_ram / 1048576);
+  $("ram-max").textContent = ram.max;
+  if (!formFilled) {  // half of each, as a start
+    cores.value = Math.max(1, Math.floor(p.machine_cores / 2));
+    ram.value = Math.floor(ram.max / 2);
+    formFilled = true;
+  }
+  $("cores-out").textContent = cores.value + " of " + p.machine_cores;
+  $("heard").innerHTML = (p.peers || []).map((q) => `<option value="${text(q.address)}">node ${q.node}</option>`).join("");
+}
+
+// The ledger: credits in core-seconds (M5-2). Per job, credit_given is what the peer gave this
+// node, credit_taken what this node gave the peer.
+function drawLedger(l) {
+  let given = 0, received = 0;
+  const rows = (l.peers || []).map((q) => {
+    let gave = 0, got = 0;
+    for (const j of q.jobs || []) { gave += j.credit_taken; got += j.credit_given; }
+    given += gave; received += got;
+    const theirs = q.announced === null ? "not heard" : q.disagree ? "disagrees" : "agrees";
+    return `<tr><td>${q.peer}</td><td class="n">${fixed(gave, 1)}</td><td class="n">${fixed(got, 1)}</td>` +
+      `<td class="n">${fixed(q.balance, 1)}</td><td class="n">${fixed(q.weight, 2)}</td>` +
+      `<td class="n">${q.totals.chunks_for_peer}</td><td class="n">${q.totals.chunks_by_peer}</td><td>${theirs}</td></tr>`;
+  });
+  $("given").textContent = fixed(given, 1);
+  $("received").textContent = fixed(received, 1);
+  const net = given - received;
+  $("net").textContent = given + received === 0 ? "Nothing given or received yet." :
+    net >= 0 ? `You have given ${fixed(net, 1)} core-seconds more than you received: other nodes' jobs make room for yours.`
+             : `You have received ${fixed(-net, 1)} core-seconds more than you gave.`;
+  $("ledger").innerHTML = rows.join("") || `<tr><td colspan="8" class="muted">nothing given or received yet</td></tr>`;
+}
+
+// One request at a time; its button says so while it is out.
+async function ask(path, body, button, busy) {
+  const idle = button.textContent;
+  button.disabled = true;
+  button.textContent = busy;
+  $("ask-error").textContent = "";
+  try {
+    const r = await fetch(path, {method: "POST", headers: {"X-ParaMesh": "1", "Content-Type": "application/json"},
+                                 body: JSON.stringify(body || {})});
+    if (!r.ok) $("ask-error").textContent = (await r.json().catch(() => ({}))).error || ("pmd refused it: " + r.status);
+  } catch (e) {
+    $("ask-error").textContent = "No answer from pmd. Is it running?";
+  }
+  button.textContent = idle;
+  button.disabled = false;
+  refresh();
+}
+$("cores").addEventListener("input", () => { $("cores-out").textContent = $("cores").value + " of " + $("cores").max; });
+$("join").addEventListener("submit", (e) => {
+  e.preventDefault();
+  ask("/v1/join", {cap_cores: Number($("cores").value), cap_ram: Number($("ram").value) * 1048576,
+                   lead: $("lead").value.trim()}, $("join-button"), "Joining…");
+});
+$("leave").addEventListener("click", () => ask("/v1/leave", null, $("leave"), "Leaving…"));
 
 function drawJobs(j) {
   $("jobs").innerHTML = (j.jobs || []).map((x) => {
@@ -113,9 +253,9 @@ function drawMigration(peers, all) {
 
 async function refresh() {
   try {
-    const [peers, jobs] = await Promise.all([json("/v1/peers"), json("/v1/jobs")]);
+    const [peers, jobs, ledger] = await Promise.all([json("/v1/peers"), json("/v1/jobs"), json("/v1/ledger")]);
     const pages = await Promise.all((jobs.jobs || []).map((x) => json(`/v1/jobs/${x.job}/pages`).catch(() => ({job: x.job, segments: []}))));
-    drawPeers(peers); drawJobs(jobs); drawPages(pages); drawMigration(peers, pages);
+    drawMember(peers); drawLedger(ledger); drawPeers(peers); drawJobs(jobs); drawPages(pages); drawMigration(peers, pages);
     $("status").textContent = "updated " + new Date().toLocaleTimeString();
   } catch (e) {
     $("status").textContent = "no answer from pmd: " + e.message;
