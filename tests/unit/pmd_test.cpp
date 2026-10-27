@@ -17,6 +17,7 @@
 #include "wire/payloads.h"
 
 #include <doctest/doctest.h>
+#include <httplib.h>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -746,6 +747,10 @@ TEST_CASE("the command line: defaults, every flag, and what is refused") {
     CHECK(all.value().node == NodeId{7});
     CHECK(all.value().cap_cores == 4);
     CHECK(parse({"--dashboard", "/srv/page.html"}).value().dashboard == "/srv/page.html");
+    CHECK(parse({"--standby"}).value().standby);
+    CHECK(parse({"--standby", "--no-multicast"}).value().standby);
+    CHECK_FALSE(parse({"--standby", "--no-multicast"}).value().multicast);
+    CHECK_FALSE(parse({"--node-id", "1"}).value().standby);
     CHECK(parse({"--cap-ram", "512M"}).value().cap_ram == 512ULL << 20U);
     CHECK(parse({"--cap-ram", "2G"}).value().cap_ram == 2ULL << 30U);
     CHECK(parse({"--cap-ram", "8K"}).value().cap_ram == 8192);
@@ -1298,6 +1303,71 @@ TEST_CASE("with multicast off, the seed list is enough") {
         {&one, &two, &three},
         {{"2:alive", "3:alive"}, {"1:alive", "3:alive"}, {"1:alive", "2:alive"}}, 3000ms);
     CHECK(took < 2000ms);
+}
+
+// ---- joining from the dashboard (X-dashboard-join)
+// -----------------------------------------------
+
+// What /v1/peers says of this node: its membership and its cores.
+std::pair<std::string, std::int64_t> member_of(const Daemon& daemon) {
+    const paramesh::Result<std::string> body =
+        paramesh::http_get(daemon.pmd.http_port(), "/v1/peers");
+    REQUIRE(body.ok());
+    const auto parsed = daemon.platform.json->decode(body.value());
+    REQUIRE(parsed.ok());
+    const auto& top = std::get<paramesh::JsonObject>(parsed.value().v);
+    return {std::get<std::string>(top.at("member").v),
+            std::get<std::int64_t>(top.at("cap_cores").v)};
+}
+
+TEST_CASE(
+    "a standby daemon hears the pool, joins with the cores chosen, and leaves back to standby") {
+    const std::vector<std::uint16_t> ports = free_udp_ports(2);
+    const auto seeds_of = [&ports](std::size_t me, bool standby) {
+        return [&ports, me, standby](paramesh::PmdConfig& c) {
+            c.discovery_port = ports[me];
+            c.standby = standby;
+            c.peers.push_back(paramesh::Endpoint{kLoopback, 1});
+            c.peer_discovery_ports.push_back(ports[1 - me]);
+        };
+    };
+    const Daemon one{1, {}, seeds_of(0, true)};
+    const Daemon two{2, {}, seeds_of(1, false)};
+    // Standing by, node 1 hears node 2 and says nothing itself.
+    CHECK(until_heard({&one}, {{"2:alive"}}, 3000ms) < 3000ms);
+    ::usleep(1500000);
+    CHECK(heard_by(two).peers.empty());
+    CHECK(member_of(one).first == "standby");
+
+    httplib::Client client{"127.0.0.1", one.pmd.http_port()};
+    const httplib::Headers ours{{"X-ParaMesh", "1"}};
+    const auto post = [&](const char* path, const std::string& body) {
+        const auto r = client.Post(path, ours, body, "application/json");
+        REQUIRE(r);
+        return r->status;
+    };
+    CHECK(client.Post("/v1/join", R"({"cap_cores":1,"cap_ram":1048576})", "application/json")
+              ->status == 403);  // not from the dashboard
+    CHECK(post("/v1/join", "not json") == 400);
+    CHECK(post("/v1/join", R"({"cap_cores":0,"cap_ram":1048576})") == 400);
+    CHECK(post("/v1/join", R"({"cap_cores":1,"cap_ram":10})") == 400);
+    CHECK(post("/v1/join", R"({"cap_cores":1,"cap_ram":1048576,"lead":"no:where"})") == 400);
+    CHECK(post("/v1/leave", "") == 409);  // not in the pool
+    CHECK(post("/v1/join", R"({"cap_cores":1,"cap_ram":1048576,"lead":""})") == 202);
+    CHECK(until_heard({&two}, {{"1:alive"}}, 3000ms) < 3000ms);
+    CHECK(member_of(one) == std::pair<std::string, std::int64_t>{"joined", 1});
+    CHECK(post("/v1/join", R"({"cap_cores":1,"cap_ram":1048576})") == 409);
+
+    // Leaving with no job here is done at once: BYE, and back to standby, still serving.
+    CHECK(post("/v1/leave", "") == 202);
+    CHECK(until_heard({&two}, {{}}, 3000ms) < 3000ms);
+    for (int i = 0; i < 40 && member_of(one).first != "standby"; i++) {
+        ::usleep(50000);
+    }
+    CHECK(member_of(one).first == "standby");
+    CHECK_FALSE(one.stopped);
+    CHECK(post("/v1/join", R"({"cap_cores":1,"cap_ram":2097152})") == 202);  // and again
+    CHECK(until_heard({&two}, {{"1:alive"}}, 3000ms) < 3000ms);
 }
 
 TEST_CASE("a silent node is suspect after 3 s and disappears after 5 s; BYE removes one at once") {

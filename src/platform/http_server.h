@@ -1,4 +1,4 @@
-// A small HTTP server for the status API (GET only).
+// A small HTTP server for the status API: GET, and POST for the dashboard's buttons.
 #ifndef PARAMESH_PLATFORM_HTTP_SERVER_H
 #define PARAMESH_PLATFORM_HTTP_SERVER_H
 
@@ -25,6 +25,9 @@ using HttpHandler = std::function<HttpResponse(std::string_view path)>;
 using HttpWrite = std::function<bool(std::string_view piece)>;
 using HttpStreamHandler = std::function<void(std::string_view path, const HttpWrite& write)>;
 
+// Called on a server thread with a POST request's path and body.
+using HttpPostHandler = std::function<HttpResponse(std::string_view path, std::string_view body)>;
+
 class HttpServer {
 public:
     HttpServer() = default;
@@ -40,6 +43,11 @@ public:
     // The same for a reply streamed with `content_type`, until the handler returns.
     virtual void get_stream(const std::string& pattern, const std::string& content_type,
                             HttpStreamHandler handler) = 0;
+    // Serves POST requests whose path matches `pattern`, but only from a page this server sent:
+    // the Host header names this server (127.0.0.1 or localhost, its port), against DNS
+    // rebinding, and the request carries "X-ParaMesh: 1", which a page of another site cannot
+    // send without a CORS preflight, which is never answered. Anything else gets 403.
+    virtual void post(const std::string& pattern, HttpPostHandler handler) = 0;
     // Binds and serves on a thread of its own. Port 0 picks a free port. Returns the port.
     virtual Result<std::uint16_t> start(const std::string& host, std::uint16_t port) = 0;
     // Stops serving and joins the thread. Also done by the destructor.
