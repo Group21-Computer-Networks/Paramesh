@@ -406,6 +406,7 @@ public:
         {
             std::unique_lock<std::mutex> lock{mutex_};
             if (!changed_.wait_for(lock, s_.start_timeout, [this] { return up_; })) {
+                log_start_timeout();
                 return PM_ERR_NETWORK;
             }
         }
@@ -657,7 +658,10 @@ public:
                       "node " + std::to_string(peer.node.value) + " runs a different binary");
             return;
         }
-        joined_.insert(peer.node.value);
+        {
+            const std::lock_guard<std::mutex> lock{mutex_};  // start() reads it on a timeout
+            joined_.insert(peer.node.value);
+        }
         if (is_launcher() && up_ && peer.node == joining_ && !join_sent_) {
             send_join_map();
             return;
@@ -782,11 +786,15 @@ private:
         AtomicOpPayload op;
     };
 
+    // In one read: byte by byte it took over a second of CPU in a debug build, and every
+    // process of the job pays it before it listens, so a slow one could keep the others past
+    // job.start_timeout (M1-7 fix).
     bool hash_binary(const Hasher& hasher) {
-        std::ifstream file{"/proc/self/exe", std::ios::binary};
-        std::vector<char> image{std::istreambuf_iterator<char>{file},
-                                std::istreambuf_iterator<char>{}};
-        if (image.empty()) {
+        std::ifstream file{"/proc/self/exe", std::ios::binary | std::ios::ate};
+        std::vector<char> image(
+            static_cast<std::size_t>(std::max<std::streamoff>(0, file.tellg())));
+        if (image.empty() || !file.seekg(0) ||
+            !file.read(image.data(), static_cast<std::streamsize>(image.size()))) {
             return false;
         }
         hash_ = hasher.sha256(std::as_bytes(std::span{image}));
@@ -1034,6 +1042,24 @@ private:
     }
 
     // ---- start-up ------------------------------------------------------------------------------
+
+    // The job did not come up in job.start_timeout: which members this process never heard
+    // from, so the failure says why (M1-7 fix). Called with mutex_ held.
+    void log_start_timeout() const noexcept {
+        JsonArray missing;
+        for (const Member& member : s_.members) {
+            if (member.node != s_.self && !joined_.contains(member.node.value)) {
+                missing.push_back(JsonValue{std::int64_t{member.node.value}});
+            }
+        }
+        platform_.logger->log(
+            LogLevel::kError, "start_timeout",
+            JsonObject{
+                {"seconds",
+                 JsonValue{static_cast<std::int64_t>(
+                     std::chrono::duration_cast<std::chrono::seconds>(s_.start_timeout).count())}},
+                {"not_joined", JsonValue{std::move(missing)}}});
+    }
 
     [[nodiscard]] bool all_joined() const {
         return std::all_of(s_.members.begin(), s_.members.end(), [this](const Member& m) {
@@ -2665,7 +2691,7 @@ private:
     std::size_t segments_ = 0;
     RegionAllocator allocator_{0};
 
-    // Network thread only.
+    // Network thread only; joined_ is written under mutex_, which start() holds to read it.
     std::unordered_set<std::uint16_t> joined_;
     bool map_sent_ = false;
     bool have_map_ = false;

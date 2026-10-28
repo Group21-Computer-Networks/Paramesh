@@ -116,6 +116,19 @@ int program() {
     return pm_finalize() == PM_OK ? 0 : 6;
 }
 
+// A job of which only the node TEST_FUNCTION names starts: its pm_init must give up after
+// job.start_timeout. (With two started, the first to give up exits, and the other sees it lost.)
+int unstarted_program() {
+    const char* self = std::getenv("PARAMESH_NODE_ID");
+    const char* started = std::getenv("TEST_FUNCTION");
+    if (self == nullptr || started == nullptr || std::string_view{self} != started) {
+        return 0;
+    }
+    pm_config config{};
+    config.region_bytes = kRegionBytes;
+    return pm_init(nullptr, nullptr, &config) == PM_ERR_NETWORK ? 2 : 3;
+}
+
 // ---- the M2 program: every node writes one shared page -----------------------------------------
 
 constexpr std::uint64_t kAdds = 1000;
@@ -741,6 +754,33 @@ TEST_CASE("a lost node makes every other process exit with a message" * doctest:
     CHECK(wait_for(job.pids[0], 10) == 1);
     CHECK(wait_for(job.pids[1], 10) == 1);
     CHECK(read_all(job.launcher_stderr) == "job 42 aborted: node 3 lost\n");
+}
+
+// M1-7 fix: a start timeout ended pm_init with no word of why, so a job that a slow start held
+// up (on a loaded CI runner) failed with nothing in its log but a "node lost" from a peer.
+TEST_CASE("nodes that never start: pm_init fails after the start timeout and names them" *
+          doctest::skip(!can_run())) {
+    struct Case {
+        int node;
+        const char* name;
+        const char* missing;
+    };
+    for (const Case& c : {Case{1, "1", "[2,3]"}, Case{2, "2", "[1,3]"}}) {  // launcher, worker
+        CAPTURE(c.node);
+        const Started job =
+            start_job(c.name, unstarted_program, "PARAMESH_CFG_JOB_START_TIMEOUT=1");
+        const int node = c.node;
+        for (int i = 0; i < 3; i++) {
+            CHECK(wait_for(job.pids.at(static_cast<std::size_t>(i)), 30) ==
+                  (i + 1 == node ? 2 : 0));
+        }
+        const std::string log = read_all(job.launcher_stderr);
+        INFO(log);
+        CHECK(logged_at(log,
+                        std::string{R"("event":"start_timeout","fields":{"not_joined":)"} +
+                            c.missing + R"(,"seconds":1})",
+                        node) > 0);
+    }
 }
 
 TEST_CASE("three processes write one shared page and lose no update, with and without a lock" *
