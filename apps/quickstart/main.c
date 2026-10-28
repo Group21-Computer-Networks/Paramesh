@@ -27,7 +27,8 @@ PM_TASK(square) {
 
 int main(int argc, char** argv) {
     const uint64_t count = argc > 1 ? strtoull(argv[1], NULL, 10) : 1000000;
-    const pm_config config = {.region_bytes = count * sizeof(uint64_t) + 2 * PM_PAGE_SIZE};
+    const pm_config config = {.region_bytes =
+                                  count * sizeof(uint64_t) + 2 * (uint64_t)PM_PAGE_SIZE};
     int status = pm_init(&argc, &argv, &config); /* a worker never returns from here */
     if (status != PM_OK) {
         fprintf(stderr, "quickstart: %s\n", pm_strerror(status));

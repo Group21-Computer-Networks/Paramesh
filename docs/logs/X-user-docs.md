@@ -54,6 +54,16 @@ and the next step.
 - The same guide published as a shareable doc (docs skill), its diagram redrawn there and
   looked at: https://claude.ai/artifact/Vca98NGv36xqgxx48st4VM
 - Rebased on `main` after X-dashboard-join (PR #80); X-setup is PR #81. `quickstart` built again on this base. Next: the pull request.
+### 2026-10-28 — CI: tidy finding, thread job hang
+
+- tidy (CI): `apps/quickstart/main.c:30`, `2 * PM_PAGE_SIZE` widened to 64 bits after the
+  multiply. Now `2 * (uint64_t)PM_PAGE_SIZE`; clang-format wrapped the line. The guide's code
+  block in `docs/API.md` and the shared doc changed to match.
+- `clang / thread` (CI): hit the 6-hour job limit in "Install tools" (apt), before configure;
+  nothing of ours ran. Runs again with this push.
+- `cmake --preset tidy && cmake --build --preset tidy --target quickstart`: 22/22, no findings.
+  `clang-format --dry-run --Werror apps/quickstart/main.c`: clean.
+
 ## Files touched
 
 <!--
@@ -118,7 +128,7 @@ cabled laptops), and the actual result, pasted or summarised with numbers. Also 
 No card. The guide's example is `apps/quickstart`: built and run on one node (285, right) and
 three (333332833333500000, right). The lock and `pm_touch` snippets compile with `-Wall -Wextra
 -Werror`. The example in the guide matches the app word for word. `clang-format --dry-run
---Werror apps/quickstart/main.c`: clean. Diagram: `self_check.py` OK, looked at rendered.
+--Werror apps/quickstart/main.c`: clean. clang-tidy on `quickstart` (tidy preset, 2026-10-28): clean. Diagram: `self_check.py` OK, looked at rendered.
 
 ## Deferred
 
