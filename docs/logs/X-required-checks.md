@@ -3,10 +3,10 @@
 - Task: X-required-checks
 - Milestone: none
 - Stream: -
-- Status: in-progress
+- Status: done
 - Branch: x-required-checks
 - Started: 2026-10-30
-- Finished:
+- Finished: 2026-10-30
 
 <!--
 Status is one of: in-progress, blocked, done.
@@ -46,6 +46,18 @@ and the next step.
 - `python3 -c "import yaml; ..."`: both names parse as the intended expression.
 - Next: push the branch and check the names on the push run and the PR run. Then add `format`
   and `tidy` (app 15368) to `main`'s required checks.
+
+### 2026-10-30 — session 2: checked on GitHub
+
+- Pushed `1e020ba` and opened PR #84. Check runs on that commit
+  (`gh api repos/.../commits/1e020ba/check-runs`):
+  - push run: `format | success`, and `tidy` running under its real name;
+  - pull_request run: both skipped copies report under the raw expression
+    (`(github.event_name == 'push' || ...) && 'format' || 'format (not run)'`), as the matrix
+    job does. So GitHub does not evaluate a skipped job's name. Neither skipped copy reports
+    as `format` or `tidy`.
+- Next: when the PR is green, merge it, then add `format` and `tidy` (app 15368) to `main`'s
+  required checks.
 
 ## Files touched
 
@@ -99,6 +111,11 @@ The card's Done-when check: the exact commands run, where (local, Actions, simul
 cabled laptops), and the actual result, pasted or summarised with numbers. Also the quality gate
 (clang-format, clang-tidy, sanitizer runs). Required before Status: done.
 -->
+On GitHub, PR #84, commit `1e020ba`: the push run reports `format` (success) and `tidy`. The
+pull_request run's skipped copies report under the raw expression, not `format` or `tidy`.
+Pull requests from forks, which do run both jobs on `pull_request`, were not tried; the name
+there evaluates to `format`/`tidy` by the same condition as the job's `if`. No C++ changed, so
+no build, format or tidy run was needed locally beyond CI's.
 
 ## Deferred
 
