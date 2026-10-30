@@ -4,6 +4,12 @@ A distributed shared-memory runtime for a small pool of Linux laptops: an ordina
 program calls `paramesh.h`, and its shared region is kept coherent across the nodes by the page
 fault handler, with no socket code in the application.
 
+**Using it:** [`docs/API.md`](docs/API.md), the user guide and API reference: install, join
+the pool from the dashboard, write and run a program, every function of `paramesh.h`. To give
+others an installer, run `tools/setup/package.sh` and share the one file it writes.
+
+**How it is built** (for contributors):
+
 - Plan and task cards: [`docs/PLAN.md`](docs/PLAN.md)
 - Guide for contributors and coding agents: [`AGENTS.md`](AGENTS.md)
 - What has been built and how it was checked: [`docs/logs/`](docs/logs/)

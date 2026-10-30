@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>How a job runs across the pool</title>
+  <!-- Diagram Design, architecture type, in the dashboard's palette (tools/dashboard/index.html).
+       docs/images/job-across-pool.svg is this diagram, exported for docs/API.md with the skill's export_svg.py. -->
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #fff; color: #1d1d1f;
+           display: flex; justify-content: center; padding: 3rem 1rem; }
+    .frame { max-width: 1000px; width: 100%; }
+    h1 { font-size: 1.6rem; font-weight: 600; letter-spacing: -0.01em; margin-bottom: 1.25rem; }
+    .diagram-container { width: 100%; overflow-x: auto; }
+    svg { width: 100%; min-width: 1000px; display: block; }
+    @media print { .diagram-container { overflow-x: visible; } svg { min-width: 0; } }
+  </style>
+</head>
+<body>
+<div class="frame">
+<h1>How a job runs across the pool</h1>
+<div class="diagram-container">
+<svg viewBox="0 0 1000 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="job-across-pool-title job-across-pool-desc" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+  <title id="job-across-pool-title">How a job runs across the pool</title>
+  <desc id="job-across-pool-desc">pmrun starts your program on the launcher, whose pmd has the other nodes' pmd start the same program; main() runs on the launcher and hands out task chunks that workers run, all over one shared region with the same addresses on every node.</desc>
+  <defs>
+    <marker id="jap-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#6e6e73"/></marker>
+    <marker id="jap-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#0071e3"/></marker>
+  </defs>
+  <rect width="1000" height="480" fill="#ffffff"/>
+
+  <!-- zones: one per node -->
+  <g>
+    <rect x="196" y="80" width="232" height="228" rx="8" fill="rgba(29,29,31,0.02)" stroke="#d2d2d7" stroke-width="0.8"/>
+    <text x="216" y="100" font-size="9" font-family="ui-monospace, monospace" fill="#6e6e73" letter-spacing="0.12em">LAUNCHER · NODE 1</text>
+    <rect x="456" y="80" width="232" height="228" rx="8" fill="rgba(29,29,31,0.02)" stroke="#d2d2d7" stroke-width="0.8"/>
+    <text x="476" y="100" font-size="9" font-family="ui-monospace, monospace" fill="#6e6e73" letter-spacing="0.12em">WORKER · NODE 2</text>
+    <rect x="716" y="80" width="232" height="228" rx="8" fill="rgba(29,29,31,0.02)" stroke="#d2d2d7" stroke-width="0.8"/>
+    <text x="736" y="100" font-size="9" font-family="ui-monospace, monospace" fill="#6e6e73" letter-spacing="0.12em">WORKER · NODE 3</text>
+  </g>
+
+  <!-- arrows, before the boxes -->
+  <line x1="136" y1="248" x2="214" y2="248" stroke="#0071e3" stroke-width="1.4" marker-end="url(#jap-arrow-accent)"/>
+  <rect x="152" y="224" width="48" height="14" fill="#ffffff"/>
+  <text x="176" y="234" font-size="9" font-family="ui-monospace, monospace" fill="#6e6e73" text-anchor="middle" letter-spacing="0.08em">PMRUN</text>
+
+  <line x1="408" y1="140" x2="474" y2="140" stroke="#6e6e73" stroke-width="1.2" marker-end="url(#jap-arrow)"/>
+  <path d="M376,112 V60 Q376,52 384,52 H872 Q880,52 880,60 V110" fill="none" stroke="#6e6e73" stroke-width="1.2" marker-end="url(#jap-arrow)"/>
+  <rect x="564" y="30" width="132" height="14" fill="#ffffff"/>
+  <text x="630" y="40" font-size="9" font-family="ui-monospace, monospace" fill="#6e6e73" text-anchor="middle" letter-spacing="0.08em">START THE PROGRAM</text>
+
+  <line x1="408" y1="236" x2="474" y2="236" stroke="#6e6e73" stroke-width="1.2" marker-end="url(#jap-arrow)"/>
+  <rect x="416" y="210" width="52" height="14" fill="#ffffff"/>
+  <text x="442" y="220" font-size="9" font-family="ui-monospace, monospace" fill="#6e6e73" text-anchor="middle" letter-spacing="0.08em">CHUNKS</text>
+  <path d="M360,284 V290 Q360,298 368,298 H792 Q800,298 800,290 V286" fill="none" stroke="#6e6e73" stroke-width="1.2" marker-end="url(#jap-arrow)"/>
+
+  <!-- you -->
+  <rect x="24" y="212" width="112" height="72" rx="6" fill="#ffffff" stroke="#1d1d1f" stroke-width="1"/>
+  <text x="80" y="244" font-size="13" font-weight="600" fill="#1d1d1f" text-anchor="middle">You</text>
+  <text x="80" y="262" font-size="9" font-family="ui-monospace, monospace" fill="#6e6e73" text-anchor="middle">pmrun -n 3 app</text>
+
+  <!-- pmd on each node -->
+  <g font-size="13" font-weight="600" fill="#1d1d1f" text-anchor="middle">
+    <rect x="216" y="112" width="192" height="56" rx="6" fill="#f5f5f7" stroke="#d2d2d7"/>
+    <text x="312" y="136">pmd</text>
+    <rect x="476" y="112" width="192" height="56" rx="6" fill="#f5f5f7" stroke="#d2d2d7"/>
+    <text x="572" y="136">pmd</text>
+    <rect x="736" y="112" width="192" height="56" rx="6" fill="#f5f5f7" stroke="#d2d2d7"/>
+    <text x="832" y="136">pmd</text>
+  </g>
+  <g font-size="9" font-family="ui-monospace, monospace" fill="#6e6e73" text-anchor="middle">
+    <text x="312" y="154">starts processes, shares cores</text>
+    <text x="572" y="154">starts processes, shares cores</text>
+    <text x="832" y="154">starts processes, shares cores</text>
+  </g>
+
+  <!-- your program, the same file on every node -->
+  <rect x="216" y="212" width="192" height="72" rx="6" fill="rgba(0,113,227,0.08)" stroke="#0071e3" stroke-width="1.4"/>
+  <text x="312" y="242" font-size="13" font-weight="600" fill="#1d1d1f" text-anchor="middle">your program</text>
+  <text x="312" y="260" font-size="9" font-family="ui-monospace, monospace" fill="#0058b0" text-anchor="middle">main() runs here</text>
+  <rect x="476" y="212" width="192" height="72" rx="6" fill="#ffffff" stroke="#1d1d1f"/>
+  <text x="572" y="242" font-size="13" font-weight="600" fill="#1d1d1f" text-anchor="middle">your program</text>
+  <text x="572" y="260" font-size="9" font-family="ui-monospace, monospace" fill="#6e6e73" text-anchor="middle">waits in pm_init(), runs chunks</text>
+  <rect x="736" y="212" width="192" height="72" rx="6" fill="#ffffff" stroke="#1d1d1f"/>
+  <text x="832" y="242" font-size="13" font-weight="600" fill="#1d1d1f" text-anchor="middle">your program</text>
+  <text x="832" y="260" font-size="9" font-family="ui-monospace, monospace" fill="#6e6e73" text-anchor="middle">waits in pm_init(), runs chunks</text>
+
+  <!-- the shared region under all three -->
+  <rect x="196" y="340" width="752" height="64" rx="6" fill="#f5f5f7" stroke="#d2d2d7"/>
+  <text x="572" y="368" font-size="13" font-weight="600" fill="#1d1d1f" text-anchor="middle">Shared region, from pm_malloc()</text>
+  <text x="572" y="386" font-size="9" font-family="ui-monospace, monospace" fill="#6e6e73" text-anchor="middle">the same addresses on every node · a page is fetched when a thread touches it</text>
+
+  <!-- legend -->
+  <line x1="24" y1="428" x2="976" y2="428" stroke="#d2d2d7" stroke-width="0.8"/>
+  <g font-size="10" fill="#6e6e73">
+    <rect x="24" y="444" width="14" height="10" rx="2" fill="rgba(0,113,227,0.08)" stroke="#0071e3"/>
+    <text x="46" y="453">where main() runs</text>
+    <rect x="176" y="444" width="14" height="10" rx="2" fill="#ffffff" stroke="#1d1d1f"/>
+    <text x="198" y="453">your program, the same file at the same path on every node</text>
+    <rect x="560" y="444" width="14" height="10" rx="2" fill="#f5f5f7" stroke="#d2d2d7"/>
+    <text x="582" y="453">ParaMesh, installed on every node</text>
+  </g>
+</svg>
+</div>
+</div>
+</body>
+</html>
