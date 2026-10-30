@@ -59,6 +59,15 @@ and the next step.
 - Next: when the PR is green, merge it, then add `format` and `tidy` (app 15368) to `main`'s
   required checks.
 
+### 2026-10-30 — session 3: implementation-logs too
+
+- The person also asked for `implementation-logs` to be required. It is never skipped, but it
+  ran twice per commit under one name: the pull_request run checks the diff and the title, the
+  push run only the log files. So the weaker run could stand in for the stricter one. `ci.yml`
+  now names the push copy `implementation-logs (push)`.
+- Next: check the names on the new commit, merge, then add `format`, `tidy` and
+  `implementation-logs` to `main`'s required checks.
+
 ## Files touched
 
 <!--
@@ -67,7 +76,7 @@ A directory entry ends with "/" and covers everything under it. plan.py check --
 if the branch changes a file not covered here.
 Example:  - `src/net/epoll_loop.cpp` — epoll wrapper and timer wheel
 -->
-- `.github/workflows/ci.yml` — `format` and `tidy` report under another name when skipped
+- `.github/workflows/ci.yml` — `format` and `tidy` report under another name when skipped; the push copy of `implementation-logs` likewise
 
 ## Decisions
 

@@ -90,6 +90,9 @@ jobs:
         run: cmake --build --preset tidy
 
   implementation-logs:
+    # A required check (X-required-checks): only the pull_request run has the title and the diff
+    # to check, so the push run, which checks less, must not report under the same name.
+    name: ${{ github.event_name == 'pull_request' && 'implementation-logs' || 'implementation-logs (push)' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
