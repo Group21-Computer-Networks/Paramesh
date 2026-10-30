@@ -50,6 +50,11 @@ jobs:
         run: ctest --test-dir build --output-on-failure --no-tests=error
 
   format:
+    # A required check (X-required-checks): when this job is skipped it must not report
+    # under its own name, or the skip would count as a pass. The condition is the job's `if`.
+    name: >-
+      ${{ (github.event_name == 'push' || (github.event.action != 'edited' && github.event.pull_request.head.repo.full_name != github.repository))
+      && 'format' || 'format (not run)' }}
     if: >-
       github.event_name == 'push' ||
       (github.event.action != 'edited' &&
@@ -65,6 +70,11 @@ jobs:
             | xargs --no-run-if-empty clang-format --dry-run --Werror
 
   tidy:
+    # A required check (X-required-checks): when this job is skipped it must not report
+    # under its own name, or the skip would count as a pass. The condition is the job's `if`.
+    name: >-
+      ${{ (github.event_name == 'push' || (github.event.action != 'edited' && github.event.pull_request.head.repo.full_name != github.repository))
+      && 'tidy' || 'tidy (not run)' }}
     if: >-
       github.event_name == 'push' ||
       (github.event.action != 'edited' &&
@@ -80,6 +90,9 @@ jobs:
         run: cmake --build --preset tidy
 
   implementation-logs:
+    # A required check (X-required-checks): only the pull_request run has the title and the diff
+    # to check, so the push run, which checks less, must not report under the same name.
+    name: ${{ github.event_name == 'pull_request' && 'implementation-logs' || 'implementation-logs (push)' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
