@@ -403,12 +403,8 @@ public:
             run_on_network_thread();  // a job of one node: nobody to wait for
         }
 
-        {
-            std::unique_lock<std::mutex> lock{mutex_};
-            if (!changed_.wait_for(lock, s_.start_timeout, [this] { return up_; })) {
-                log_start_timeout();
-                return PM_ERR_NETWORK;
-            }
+        if (!wait_until_up()) {
+            return PM_ERR_NETWORK;
         }
         // The job is up: start this process's worker threads, as many as it may ever use: the
         // program's own bound, or one for each processor here. Of those, only as many as the
@@ -1043,8 +1039,47 @@ private:
 
     // ---- start-up ------------------------------------------------------------------------------
 
-    // The job did not come up in job.start_timeout: which members this process never heard
-    // from, so the failure says why (M1-7 fix). Called with mutex_ held.
+    // Waits for the job to come up. Ending a job that does not is the launcher's to do
+    // (PROTOCOL.md, 11): it tells every member that joined, and the caller returns the error.
+    // A worker that has the launcher waits to be told, or to lose it; one that has not cannot
+    // start, and exits with the reason, as paramesh.h says.
+    bool wait_until_up() {
+        const std::string message =
+            "the job did not start within " +
+            std::to_string(
+                std::chrono::duration_cast<std::chrono::seconds>(s_.start_timeout).count()) +
+            " s";
+        std::vector<NodeId> joined;
+        {
+            std::unique_lock<std::mutex> lock{mutex_};
+            while (!changed_.wait_for(lock, s_.start_timeout, [this] { return up_; })) {
+                if (!is_launcher() && joined_.contains(s_.members.front().node.value)) {
+                    continue;
+                }
+                log_start_timeout();
+                if (!is_launcher()) {
+                    exit_with(Status::kStartTimeout, message);
+                }
+                aborting_ = true;  // a member that goes now is no news
+                for (const Member& member : s_.members) {
+                    if (joined_.contains(member.node.value)) {
+                        joined.push_back(member.node);
+                    }
+                }
+                break;
+            }
+            if (up_) {
+                return true;
+            }
+        }
+        for (const NodeId node : joined) {
+            post_job_end(node, Status::kStartTimeout, kNoNode, message);
+        }
+        std::this_thread::sleep_for(kLinger);  // so the JOB_ENDs leave
+        return false;
+    }
+
+    // Which members this process never heard from, so the failure says why. mutex_ is held.
     void log_start_timeout() const noexcept {
         JsonArray missing;
         for (const Member& member : s_.members) {
