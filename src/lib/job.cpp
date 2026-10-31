@@ -118,7 +118,7 @@ struct Settings {
     // The hold window against thrashing (AT-1), with the plan's proposed defaults.
     // PARAMESH_CFG_THRASH_THRESHOLD sets the count; 0 turns the window off.
     HomeConfig thrash{8, std::chrono::milliseconds{100}, std::chrono::milliseconds{1},
-                      std::chrono::milliseconds{64}};
+                      std::chrono::milliseconds{64}, true};
 };
 
 // "127.0.0.1:47100" -> endpoint. False if it is not that.
@@ -242,6 +242,9 @@ bool read_settings(Settings& s) {
         if (s.thrash.thrash_transfers == 0) {
             s.thrash.thrash_period = Nanos{};  // off
         }
+    }
+    if (const char* readers = env("PARAMESH_CFG_THRASH_HOLD_READERS")) {
+        s.thrash.hold_readers = std::string_view{readers} != "0";
     }
     if (const char* share = env("PARAMESH_CFG_MEM_CACHE_SHARE")) {
         s.cache_share = std::min<std::uint64_t>(std::strtoul(share, nullptr, 10), 100);

@@ -562,6 +562,49 @@ void fight(Home& home) {
 
 }  // namespace
 
+// Node 3 reads what node 2 writes, over and over: the same writer every time, so no transfers.
+void read_fight(Home& home) {
+    home.send(kWrite, 2);
+    for (int round = 0; round < 3; round++) {
+        REQUIRE(home.does(kRead, 3) == "FETCH>2");
+        REQUIRE(!home.does(kFetchData, 2).empty());
+        REQUIRE(home.does(kUpgrade, 2) == "INV>3");
+        REQUIRE(!home.does(kInvAck, 3).empty());
+    }
+}
+
+TEST_CASE("hold window: readers are not held, or counted, without thrash.hold_readers") {
+    Home home{quick_to_hold()};
+    read_fight(home);
+    CHECK(home.does(kRead, 3) == "FETCH>2");
+}
+
+TEST_CASE("hold window: a read-write fight holds readers too, for the window and no longer") {
+    paramesh::HomeConfig config = quick_to_hold();
+    config.hold_readers = true;
+    Home home{config};
+    read_fight(home);  // three reads count; the threshold is 2, so the third is a fight
+    home.now = std::chrono::milliseconds{5};
+    CHECK(home.does(kRead, 4) == "arm@10");  // the window of the last upgrade grant, at 0 ms
+    CHECK(home.entry().queued == 1);
+    home.now = std::chrono::milliseconds{10};
+    CHECK(home.does(kHoldExpired, 0) == "FETCH>2");
+    CHECK(home.entry().queued == 0);
+}
+
+TEST_CASE("hold window: reads that stop leave no read fight behind") {
+    paramesh::HomeConfig config = quick_to_hold();
+    config.hold_readers = true;
+    Home home{config};
+    read_fight(home);
+    home.now = std::chrono::milliseconds{500};  // a new period: this read is the first in it
+    CHECK(home.does(kRead, 3) == "FETCH>2");
+    CHECK(!home.does(kFetchData, 2).empty());
+    CHECK(home.does(kUpgrade, 2) == "INV>3");
+    CHECK(!home.does(kInvAck, 3).empty());
+    CHECK(home.does(kRead, 3) == "FETCH>2");  // no window: the read is not held
+}
+
 TEST_CASE("hold window: off by default, however often the page changes hands") {
     Home home;
     home.send(kWrite, 2);

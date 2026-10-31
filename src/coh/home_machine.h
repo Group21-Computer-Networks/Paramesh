@@ -89,6 +89,7 @@ struct HomeConfig {
     Nanos thrash_period{};               // ... within this long
     Nanos hold_initial{};                // thrash.hold_initial
     Nanos hold_max{};                    // thrash.hold_max
+    bool hold_readers = false;           // thrash.hold_readers (X-adaptive-coherence)
 };
 
 // What a caller may see of one directory entry.
