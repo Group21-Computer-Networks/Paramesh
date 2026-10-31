@@ -1,6 +1,6 @@
 /* falseshare: two tasks write neighbouring numbers, which share a page they do not mean to.
  *
- *     falseshare [writes] [pairs]
+ *     falseshare [writes] [pairs] [read]
  *
  * Chunk i of the task write_left adds 1, `writes` times (default 2000000), to number 2i of an
  * array; chunk i of write_right does the same to number 2i + 1. There are `pairs` chunks of
@@ -16,7 +16,10 @@
  *
  * The second run has the hold window off. With PARAMESH_CFG_LOG_LEVEL=info each process also
  * logs the pages it received (job_pages), the home logs the fight (page_thrash, with the two
- * nodes) and the launcher logs which task ran on which node (task_on_node). */
+ * nodes) and the launcher logs which task ran on which node (task_on_node).
+ *
+ * With a third argument, `read`, the right-hand chunks read their neighbour `writes` times
+ * instead of writing: a read-write fight, which PARAMESH_CFG_THRASH_HOLD_READERS=1 holds too. */
 
 #include <paramesh.h>
 #include <stdint.h>
@@ -65,14 +68,28 @@ PM_TASK(write_right) {
     pm_atomic_add(&args->by_node[ctx->node], hi - lo);
 }
 
+PM_TASK(read_right) {
+    const struct WriteArgs* args = arg;
+    for (uint64_t i = lo; i < hi; i++) {
+        const volatile uint64_t* number = &args->numbers[2 * i];
+        for (uint64_t n = 0; n < args->writes; n++) {
+            (void)*number;
+        }
+    }
+    pm_atomic_add(&args->by_node[ctx->node], hi - lo);
+}
+
 int main(int argc, char** argv) {
     const uint64_t writes = argc > 1 ? strtoull(argv[1], NULL, 10) : 2000000;
     const uint64_t pairs = argc > 2 ? strtoull(argv[2], NULL, 10) : 16;
+    const int read = argc > 3;
     if (writes == 0 || pairs == 0 || pairs > MAX_PAIRS) {
         fprintf(stderr, "usage: falseshare [writes, 1 or more] [pairs, 1 to %d]\n", MAX_PAIRS);
         return 2;
     }
-    const pm_config config = {.region_bytes = (uint64_t)4 << 20};
+    /* A read fight needs the reader on another node: one thread a node, so two chunks cannot
+     * run side by side on one. */
+    const pm_config config = {.region_bytes = (uint64_t)4 << 20, .threads_per_node = read ? 1 : 0};
     const int status = pm_init(&argc, &argv, &config); /* a worker does not return from this */
     if (status != PM_OK) {
         fprintf(stderr, "falseshare: pm_init: %s\n", pm_strerror(status));
@@ -93,7 +110,8 @@ int main(int argc, char** argv) {
     for (uint64_t i = 0; i < pairs && ran == PM_OK; i++) {
         ran = pm_parallel_for("write_left", i, i + 1, 1, &args, sizeof args);
         if (ran == PM_OK) {
-            ran = pm_parallel_for("write_right", i, i + 1, 1, &args, sizeof args);
+            ran = pm_parallel_for(read ? "read_right" : "write_right", i, i + 1, 1, &args,
+                                  sizeof args);
         }
     }
     if (ran == PM_OK) {
@@ -107,7 +125,7 @@ int main(int argc, char** argv) {
 
     int exact = 1;
     for (uint64_t i = 0; i < 2 * pairs; i++) {
-        exact = exact && args.numbers[i] == writes;
+        exact = exact && (args.numbers[i] == writes || (read && i % 2 != 0));
     }
     const uint64_t numbers = 2 * pairs;
     printf("falseshare: %llu numbers in one page, %llu writes each: %.3f s, %s\n",

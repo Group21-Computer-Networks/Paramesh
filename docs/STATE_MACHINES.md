@@ -418,8 +418,16 @@ the last one that had it. `thrash.threshold` gives a count and a period (8 trans
 - The window ends at its end time (`HOLD_EXPIRED`), or as soon as the page stops being
   `EXCLUSIVE`, whichever is first. The held-back requests are then taken in order.
 
-**[DECIDED]** Only writers wait. A `READ_REQ` during a hold window is served at once, which
-makes the page shared and so ends the window.
+A read-write fight is noticed the same way (X-adaptive-coherence). With `thrash.hold_readers`
+on, a `READ_REQ` that takes the page from its owner by `FETCH` counts as a transfer. While that
+count is above the threshold the page is in a read fight: the home logs it, the next write
+grant opens or doubles the hold window, even to the last writer, and a `READ_REQ` from another
+node is held back with the writers. Reads are bounded as writes are, by the window's end, and
+the count is the same one, so the fight ends the same way.
+
+**[DECIDED]** Writers wait, and readers only in a read fight. Any other `READ_REQ` during a hold
+window is served at once, which makes the page shared and so ends the window. Changed from
+"only writers wait" with the person's approval, 2026-10-31.
 
 **[GATE S6]** The counting rule above is a proposal, as is treating `ATOMIC_OP` as a writer.
 One thing in the plan cannot be met from the messages as drafted: AT-1's report is to name

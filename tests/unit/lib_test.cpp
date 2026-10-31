@@ -393,6 +393,47 @@ void write_many(const NeighbourArgs* args, std::uint64_t which, std::uint16_t no
     }
 }
 
+// The read-fight program's two tasks, one writing what the other reads for 300 ms from when
+// both have begun. hits[0] counts up; at the end, hits[1] says what the writer got to.
+void wait_for_the_other(const NeighbourArgs* args, std::uint16_t node) {
+    volatile std::uint64_t* started = args->started;
+    started[node] = 1;
+    for (int waited = 0; waited < 20000 && started[1] + started[2] + started[3] < 2; waited++) {
+        ::usleep(1000);
+    }
+}
+
+PM_TASK(lib_test_fight_write) {
+    const auto* args = static_cast<const NeighbourArgs*>(arg);
+    static_cast<void>(lo);
+    static_cast<void>(hi);
+    wait_for_the_other(args, ctx->node);
+    volatile std::uint64_t* number = args->hits;
+    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds{300};
+    std::uint64_t count = 0;
+    while (std::chrono::steady_clock::now() < end) {
+        *number = ++count;
+    }
+    args->hits[1] = count;
+}
+
+PM_TASK(lib_test_fight_read) {
+    const auto* args = static_cast<const NeighbourArgs*>(arg);
+    static_cast<void>(lo);
+    static_cast<void>(hi);
+    wait_for_the_other(args, ctx->node);
+    const volatile std::uint64_t* number = args->hits;
+    std::uint64_t seen = 0;
+    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds{300};
+    while (std::chrono::steady_clock::now() < end) {
+        const std::uint64_t now = *number;
+        if (now < seen) {
+            pm_test_fail("a reader saw the number go back");
+        }
+        seen = now;
+    }
+}
+
 struct LeaveArgs {
     std::uint64_t* numbers;
     std::uint64_t* told;  // told[0] becomes 1 when node 3 has been told to leave
@@ -630,6 +671,33 @@ int neighbours_program() {
         if (numbers[i] != 300000) {
             return 6;  // a write was lost while the page changed hands
         }
+    }
+    return pm_finalize() == PM_OK ? 0 : 7;
+}
+
+// One writer and one reader of one page, one thread a node so they are on two: a read fight.
+int read_fight_program() {
+    pm_config config{};
+    config.region_bytes = kRegionBytes;
+    config.threads_per_node = 1;
+    if (pm_init(nullptr, nullptr, &config) != PM_OK) {
+        return 2;
+    }
+    auto* numbers = static_cast<std::uint64_t*>(pm_malloc(paramesh::kPageSize));
+    auto* started = static_cast<std::uint64_t*>(pm_malloc(paramesh::kPageSize));
+    if (numbers == nullptr || started == nullptr) {
+        return 3;
+    }
+    const NeighbourArgs args{numbers, started};
+    if (pm_parallel_for("lib_test_fight_write", 0, 1, 1, &args, sizeof args) != PM_OK ||
+        pm_parallel_for("lib_test_fight_read", 0, 1, 1, &args, sizeof args) != PM_OK) {
+        return 4;
+    }
+    if (pm_wait_all() != PM_OK) {
+        return 5;
+    }
+    if (numbers[1] == 0 || numbers[0] != numbers[1]) {
+        return 6;  // a write was lost, or a held reader broke something
     }
     return pm_finalize() == PM_OK ? 0 : 7;
 }
@@ -969,6 +1037,23 @@ TEST_CASE("the hold window: neighbours in one page cost far fewer page transfers
     CHECK(without_log.find("page_thrash") == std::string::npos);  // off: nothing is held
     // NOLINTNEXTLINE(concurrency-mt-unsafe): as above
     ::unsetenv("PARAMESH_CFG_TASK_AFFINITY");
+}
+
+TEST_CASE("the hold window: a read-write fight costs far fewer page transfers with readers held" *
+          doctest::skip(!can_run())) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): no other thread of this process is running
+    ::setenv("PARAMESH_CFG_TASK_AFFINITY", "0", 1);
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): as above. With a chunk on hand, one node takes both.
+    ::setenv("PARAMESH_CFG_TASK_PREFETCH", "0", 1);
+    const long held = page_transfers("PARAMESH_CFG_THRASH_HOLD_READERS=1", read_fight_program);
+    const long not_held = page_transfers("PARAMESH_CFG_THRASH_HOLD_READERS=0", read_fight_program);
+    MESSAGE("page transfers: " << held << " with readers held, " << not_held << " without");
+    CHECK(held >= 0);
+    CHECK(held * 2 < not_held);
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): as above
+    ::unsetenv("PARAMESH_CFG_TASK_AFFINITY");
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): as above
+    ::unsetenv("PARAMESH_CFG_TASK_PREFETCH");
 }
 
 // ---- the prefetcher (X-prefetch) ----------------------------------------------------------------

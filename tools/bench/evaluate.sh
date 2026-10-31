@@ -19,6 +19,9 @@
 #   encoding    page.encoding off, auto and on (X-page-encoding), for matrix multiply and
 #               apps/sweep (16 MB, 4 rounds), FIFO chunk placement, on a plain link, with 1 ms
 #               delay and at 20 Mbit/s: encoding.csv
+#   coherence   apps/falseshare, a write-write and a read-write fight over one page, with
+#               matmul and apps/sweep beside them, with the hold window off, for writers
+#               only, and for readers too (X-adaptive-coherence), three runs each: coherence.csv
 #
 #   -s   matrix size (default 256)
 #   -t   worker threads a node (default 1)
@@ -51,7 +54,7 @@ while getopts "s:t:b:o:h" opt; do
     b) build="$OPTARG" ;;
     o) results="$OPTARG" ;;
     h)
-        sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     *) exit 2 ;;
@@ -114,7 +117,7 @@ run_job() {
 import glob, json, re, sys
 work, status = sys.argv[1], int(sys.argv[2])
 out = open(f"{work}/out").read()
-m = re.search(r"job, n \d+: ([0-9.]+) s", out)
+m = re.search(r"(?:job, n \d+|falseshare: .*?): ([0-9.]+) s", out)
 seconds = float(m.group(1)) if m else 0.0
 faults = pages = sent = retries = 0
 page_bytes = plain = cpu_ms = diffs = 0
@@ -247,6 +250,30 @@ experiment_encoding() {
     done
     impair 0 0 0
     unset PARAMESH_CFG_TASK_AFFINITY
+}
+
+experiment_coherence() {
+    local file="$results/coherence.csv"
+    echo "workload,hold,run,$HEADER" >"$file"
+    local row workload app hold run
+    for workload in write read matmul sweep; do
+        case "$workload" in
+        write) app="$build/apps/falseshare/falseshare 20000000 16" ;;
+        read) app="$build/apps/falseshare/falseshare 20000000 16 read" ;;
+        matmul) app="$build/apps/matmul/matmul $size $threads" ;;
+        sweep) app="$build/apps/sweep/sweep 16 4 $threads" ;;
+        esac
+        for hold in off writers readers; do
+            for run in 1 2 3; do
+                row="$(APP="$app" \
+                    PARAMESH_CFG_THRASH_THRESHOLD=$([ "$hold" = off ] && echo 0 || echo 8) \
+                    PARAMESH_CFG_THRASH_HOLD_READERS=$([ "$hold" = readers ] && echo 1 || echo 0) \
+                    run_job)"
+                note_abort "$row"
+                echo "$workload,$hold,$run,$row" | tee -a "$file"
+            done
+        done
+    done
 }
 
 experiment_histogram() {

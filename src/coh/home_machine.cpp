@@ -34,6 +34,7 @@ struct Entry {
     Nanos hold{};                 // the hold duration; zero while the page is not thrashing
     Nanos hold_until{};           // the end of the hold window that is running, if one is
     bool hold_armed = false;      // HOLD_EXPIRED has been asked for and has not come
+    bool read_fight = false;      // reads taking the page from its writer are over the threshold
 };
 
 // What one step works with besides the entry.
@@ -97,36 +98,65 @@ void store_received(Entry& e, PageId page, std::vector<HomeAction>& out) {
     e.owner = kNoNode;
 }
 
-// Section 2.6. Write access has just been granted to op.from. If that is a node other than
-// the last writer, it is an ownership transfer: count it, and if the count in the period is
-// above the threshold the page is thrashing, and the new owner keeps it for a hold window
-// that doubles for as long as the fight goes on.
-void count_transfer(Entry& e, const HomeEvent& op, const Step& step) {
-    const NodeId previous = e.last_writer;
-    e.last_writer = op.from;
-    const HomeConfig& config = *step.config;
-    if (previous == kNoNode || previous == op.from || config.thrash_period <= Nanos{} ||
-        config.hold_initial <= Nanos{}) {
-        return;
-    }
+bool hold_window_on(const HomeConfig& config) noexcept {
+    return config.thrash_period > Nanos{} && config.hold_initial > Nanos{};
+}
+
+// Section 2.6: counts one transfer in the period; true if that is above the threshold.
+bool over_threshold(Entry& e, const Step& step) {
     // ponytail: periods laid end to end, not a window that slides: a fight that straddles
     // two periods is noticed a little later. A ring of the last transfer times if it matters.
-    if (step.now - e.counting_since > config.thrash_period) {
+    if (step.now - e.counting_since > step.config->thrash_period) {
         e.counting_since = step.now;
         e.transfers = 0;
     }
     e.transfers++;
-    if (e.transfers <= config.thrash_transfers) {
+    return e.transfers > step.config->thrash_transfers;
+}
+
+// Section 2.6, a read-write fight. e.op has just taken the page from its writer, which keeps a
+// read copy: with thrash.hold_readers that counts as a transfer, and above the threshold the
+// writer's next grant opens a hold window that readers wait out too.
+void count_read(Entry& e, const Step& step) {
+    if (!step.config->hold_readers || !hold_window_on(*step.config)) {
+        return;
+    }
+    const bool fight = over_threshold(e, step);
+    if (fight && !e.read_fight) {
+        HomeAction report = action(HomeActionKind::kReportThrash, e.op.page);
+        report.to = e.op.from;
+        report.other = e.owner;
+        step.out->push_back(report);
+    }
+    e.read_fight = fight;
+}
+
+// Section 2.6. Write access has just been granted to op.from. If that is a node other than
+// the last writer, it is an ownership transfer: count it, and if the count in the period is
+// above the threshold the page is thrashing, and the new owner keeps it for a hold window
+// that doubles for as long as the fight goes on. A read-write fight opens the window too.
+void count_transfer(Entry& e, const HomeEvent& op, const Step& step) {
+    const NodeId previous = e.last_writer;
+    e.last_writer = op.from;
+    const HomeConfig& config = *step.config;
+    const bool moved = previous != kNoNode && previous != op.from;
+    if (!hold_window_on(config) || (!moved && !e.read_fight)) {
+        return;
+    }
+    if (moved && !over_threshold(e, step)) {
         e.hold = Nanos{};
         e.hold_until = Nanos{};
+        e.read_fight = false;
         return;
     }
     if (e.hold == Nanos{}) {
         e.hold = config.hold_initial;
-        HomeAction report = action(HomeActionKind::kReportThrash, op.page);
-        report.to = op.from;
-        report.other = previous;
-        step.out->push_back(report);
+        if (moved) {  // a read fight was reported when it began
+            HomeAction report = action(HomeActionKind::kReportThrash, op.page);
+            report.to = op.from;
+            report.other = previous;
+            step.out->push_back(report);
+        }
     } else {
         e.hold = std::min(e.hold * 2, config.hold_max);
     }
@@ -134,12 +164,13 @@ void count_transfer(Entry& e, const HomeEvent& op, const Step& step) {
 }
 
 // True if the hold window keeps this request waiting: it would pass write access to another
-// node while the window runs. Readers, and the owner itself, are not held.
+// node while the window runs, or it is a read in a read-write fight. The owner is not held.
 bool held_back(const Entry& e, const HomeEvent& request, Nanos now) noexcept {
     const bool writer = request.kind == HomeEventKind::kWriteReq ||
                         request.kind == HomeEventKind::kUpgradeReq ||
                         request.kind == HomeEventKind::kAtomicOp;
-    return writer && e.state == HomeState::kExclusive && now < e.hold_until &&
+    const bool reader = request.kind == HomeEventKind::kReadReq && e.read_fight;
+    return (writer || reader) && e.state == HomeState::kExclusive && now < e.hold_until &&
            request.from != e.owner;
 }
 
@@ -257,6 +288,7 @@ void answer(Entry& e, const HomeEvent& event, const Step& step) {
                 break;
             }
             if (e.wait == HomeWait::kFetch) {  // the owner keeps a read copy
+                count_read(e, step);
                 store_received(e, event.page, out);
                 e.state = HomeState::kShared;  // `copyset` is already the old owner alone
                 finish(e, true, step);
