@@ -328,6 +328,7 @@ public:
     std::unordered_map<std::uint64_t, Entry> entries;
     Nodes nodes{};
     HomeConfig config;
+    std::uint64_t left = 0;  // the slots of members that have left
 };
 
 void HomeDirectoryDeleter::operator()(HomeDirectory* directory) const noexcept {
@@ -397,21 +398,70 @@ Result<void> home_import_entry(HomeDirectory& directory, PageId page, const Home
     return {};
 }
 
+namespace {
+
+// Takes the next requests of an idle entry, then asks for the end of a hold window if only
+// held-back ones are left.
+void take_next(HomeDirectory& directory, Entry& e, const HomeEvent& event, const Step& step) {
+    std::vector<HomeAction>& out = *step.out;
+    // Take the next request for as long as the entry is free: the first in the queue that the
+    // hold window does not hold back.
+    while (e.wait == HomeWait::kIdle) {
+        const auto next = std::find_if(
+            e.waitq.begin(), e.waitq.end(),
+            [&](const HomeEvent& request) { return !held_back(e, request, event.now); });
+        if (next == e.waitq.end()) {
+            break;
+        }
+        const HomeEvent request = *next;
+        e.waitq.erase(next);
+        directory.nodes.at(request.slot.value) = request.from;
+        start(e, request, step);
+    }
+    // Only held-back requests are left: they are taken when the window ends.
+    if (e.wait == HomeWait::kIdle && !e.waitq.empty() && !e.hold_armed) {
+        HomeAction arm = action(HomeActionKind::kArmHoldTimer, event.page);
+        arm.at = e.hold_until;
+        out.push_back(arm);
+        e.hold_armed = true;
+    }
+}
+
+}  // namespace
+
 // Section 3, "new map drops a member". An entry the member owns cannot exist: a leaver
 // writes its pages back first.
-void home_drop_member(HomeDirectory& directory, Slot slot) {
+// A member has left. Its INV_ACK will never come: the connection is closed, and what it held for
+// reading is gone. An operation that needs bytes only it had cannot go on, and is never answered
+// with zeros: the job ends.
+void home_drop_member(HomeDirectory& directory, Slot slot, Nanos now,
+                      std::vector<HomeAction>& out) {
+    const NodeId gone = directory.nodes.at(slot.value);
+    directory.nodes.at(slot.value) = kNoNode;
+    directory.left |= bit(slot);
+    const Step step{&directory.config, &directory.nodes, now, &out};
     for (auto& [page, e] : directory.entries) {
         e.copyset &= ~bit(slot);
-        if (e.state == HomeState::kShared && e.copyset == 0) {
+        const bool waited = e.wait == HomeWait::kInv && (e.pending & bit(slot)) != 0;
+        e.pending &= ~bit(slot);
+        if ((e.wait == HomeWait::kFetch || e.wait == HomeWait::kFetchInv) && e.owner == gone) {
+            out.push_back(action(HomeActionKind::kAbort, PageId{page}));
+        } else if (waited && e.pending == 0) {
+            finish(e, false, step);
+            HomeEvent event;
+            event.page = PageId{page};
+            event.now = now;
+            take_next(directory, e, event, step);
+        } else if (e.state == HomeState::kShared && e.copyset == 0) {
             e.state = HomeState::kUncached;
         }
     }
-    directory.nodes.at(slot.value) = kNoNode;
 }
 
 void home_set_member(HomeDirectory& directory, Slot slot, NodeId node) {
     if (slot.value < kMaxSlots) {
         directory.nodes.at(slot.value) = node;
+        directory.left &= ~bit(slot);
     }
 }
 
@@ -436,6 +486,9 @@ void home_step(HomeDirectory& directory, const HomeEvent& event, std::vector<Hom
         out.push_back(action(HomeActionKind::kAbort, event.page));  // not the page's home
         return;
     }
+    if (event.kind == HomeEventKind::kInvAck && (directory.left & bit(event.slot)) != 0) {
+        return;  // it was read before the connection closed; home_drop_member stopped waiting
+    }
     Entry& e = directory.entries[event.page.value];
     const Step step{&directory.config, &directory.nodes, event.now, &out};
     if (event.kind == HomeEventKind::kHoldExpired) {
@@ -445,27 +498,7 @@ void home_step(HomeDirectory& directory, const HomeEvent& event, std::vector<Hom
     } else {
         e.waitq.push_back(event);  // home rule 1: one request per page at a time
     }
-    // Take the next request for as long as the entry is free: the first in the queue that the
-    // hold window does not hold back.
-    while (e.wait == HomeWait::kIdle) {
-        const auto next = std::find_if(
-            e.waitq.begin(), e.waitq.end(),
-            [&](const HomeEvent& request) { return !held_back(e, request, event.now); });
-        if (next == e.waitq.end()) {
-            break;
-        }
-        const HomeEvent request = *next;
-        e.waitq.erase(next);
-        directory.nodes.at(request.slot.value) = request.from;
-        start(e, request, step);
-    }
-    // Only held-back requests are left: they are taken when the window ends.
-    if (e.wait == HomeWait::kIdle && !e.waitq.empty() && !e.hold_armed) {
-        HomeAction arm = action(HomeActionKind::kArmHoldTimer, event.page);
-        arm.at = e.hold_until;
-        out.push_back(arm);
-        e.hold_armed = true;
-    }
+    take_next(directory, e, event, step);
 }
 
 }  // namespace paramesh

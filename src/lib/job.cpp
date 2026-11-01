@@ -1928,16 +1928,18 @@ private:
         }
         // A member named no longer has left: it is in no copyset, and its connection closing
         // is no loss.
+        actions_.clear();
         std::erase_if(s_.members, [&](const Member& gone) {
             const bool listed =
                 std::any_of(map.members.begin(), map.members.end(),
                             [&gone](const SegMapMember& m) { return m.node == gone.node; });
             if (!listed) {
-                home_drop_member(*dir_, gone.slot);
+                home_drop_member(*dir_, gone.slot, net_->now(), actions_);
                 left_.insert(gone.node.value);
             }
             return !listed;
         });
+        run_home_actions(actions_, {}, net_->now());
         if (first) {
             seg_.assign(homes_.size(), Seg::kOther);
             states_.assign(homes_.size() * kPagesPerSegment, PageState::kInvalid);
