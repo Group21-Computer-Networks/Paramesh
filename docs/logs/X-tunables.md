@@ -41,8 +41,8 @@ and the next step.
 
 ### 2026-11-01 — session 2: two corrections to the plan
 
-- At the person's request: `log.level` in the Tunables table now says `warn`, as the job processes
-  do, and row 21 of the Changes table says what `COMPRESSED` means since X-page-encoding. The
+- At the person's request: `log.level` in the Tunables table now says `warn` for job processes
+  and `info` for `pmd`, as `src/lib/job.cpp` and `src/pmd/main.cpp` do, and row 21 of the Changes table says what `COMPRESSED` means since X-page-encoding. The
   TODO.md wording about row 21 is gone. The `spill.budget` row stays open.
 
 ## Files touched

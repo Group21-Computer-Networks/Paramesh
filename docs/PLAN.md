@@ -288,7 +288,7 @@ The values in the first table are my proposals and need your review; none has be
 | `task.default_grain` | Range length / (4 x total worker slots), rounded to a page boundary | About four chunks per slot, so fast nodes can take more. Used when the caller passes 0. |
 | `task.prefetch` | 1 chunk | As the HLD says. |
 | `fuzz.schedules` | 2,000 in Actions, 100,000 at the M2 gate | Keeps each push fast while the gate meets FR-5.1's stated count. |
-| `log.level` | `warn` | The job processes print nothing on a good run, and a test holds them to it. `info` adds the logs the evaluation reads, such as `job_pages`. |
+| `log.level` | `warn` for job processes, `info` for `pmd` | A job process prints nothing on a good run, and a test holds it to that; `info` adds what the evaluation reads, such as `job_pages`. The daemon logs what it does at `info`. |
 
 These keys were added after the M0 gate, by the task named in each row, and added here on 2026-11-01. Each default is the one in the code.
 
