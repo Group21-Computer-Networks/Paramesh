@@ -48,5 +48,6 @@ sleep 2
 export PMRUN="$build/src/tools/pmrun" STATE="$work/1"
 python3 tests/multi/playground_checks.py
 status=$?
+[ "$status" -eq 0 ] && { PREFIX="$work/prefix" python3 tests/multi/translate_checks.py; status=$?; }
 [ "$status" -eq 0 ] && echo PASS || { echo FAIL; tail -5 "$work/pmd1.log"; }
 exit "$status"

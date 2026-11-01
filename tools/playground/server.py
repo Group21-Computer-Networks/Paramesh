@@ -37,6 +37,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from translate import translate
+
 JOBS = Path("/var/tmp/paramesh-play")  # kSandboxRoot in src/platform/sandbox.h
 PORT = 47080  # within what a job cannot reach (kFirstDaemonPort)
 MAX_SOURCE = 64 * 1024
@@ -285,10 +287,17 @@ class Service:
         try:
             JOBS.mkdir(mode=0o755, exist_ok=True)
             directory.mkdir(mode=0o700)
-            (directory / "main.c").write_text(source)
+            translated, notes = translate(source, self.args.region_mb << 20) if nodes > 1 else (source, [])
+            (directory / "main.c").write_text(translated)
             run["program"] = hashlib.sha256(source.encode()).hexdigest()[:16]
             run["nodes_asked"] = nodes
-            if self.compile(run, directory) and not run["stop"]:
+            compiled = self.compile(run, directory)
+            if not compiled and translated != source:  # the user's C comes first: it may be our fault
+                (directory / "main.c").write_text(source)
+                notes = ["the split program did not compile, so this ran on one laptop"]
+                compiled = self.compile(run, directory)
+            run["translator"] = notes
+            if compiled and not run["stop"]:
                 peers = self.stage(run, directory, nodes)
                 if peers is not None and not run["stop"]:
                     self.launch(run, directory, nodes)
@@ -714,6 +723,7 @@ def main():
     parser.add_argument("--bin", default="/opt/paramesh/bin", help="where pm and pmrun are")
     parser.add_argument("--prefix", default="/opt/paramesh", help="where paramesh.h and the library are")
     parser.add_argument("--cc", default="gcc")
+    parser.add_argument("--region-mb", type=int, default=512, help="shared memory of a program split for the pool")
     parser.add_argument("--timeout", type=int, default=RUN_SECONDS, help="seconds a job may run")
     args = parser.parse_args()
     server = ThreadingHTTPServer(("0.0.0.0" if args.public else "127.0.0.1", args.port), Handler)

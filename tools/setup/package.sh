@@ -23,7 +23,7 @@ cp "$build/src/pmd/pmd" "$build/src/tools/pm" "$build/src/tools/pmrun" "$stage/b
 cp "$root/include/paramesh.h" "$stage/include/"
 cp "$root/tools/dashboard/index.html" "$stage/tools/dashboard/"  # where pmd looks for it
 mkdir -p "$stage/tools/playground" "$stage/tools/site"  # the website and the C playground
-cp "$root/tools/playground/server.py" "$stage/tools/playground/"
+cp "$root/tools/playground/server.py" "$root/tools/playground/translate.py" "$stage/tools/playground/"
 cp "$root"/tools/site/* "$stage/tools/site/"
 for app in "$build"/apps/*/; do
     name="$(basename "$app")"
