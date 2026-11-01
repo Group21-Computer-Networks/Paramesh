@@ -288,7 +288,7 @@ The values in the first table are my proposals and need your review; none has be
 | `task.default_grain` | Range length / (4 x total worker slots), rounded to a page boundary | About four chunks per slot, so fast nodes can take more. Used when the caller passes 0. |
 | `task.prefetch` | 1 chunk | As the HLD says. |
 | `fuzz.schedules` | 2,000 in Actions, 100,000 at the M2 gate | Keeps each push fast while the gate meets FR-5.1's stated count. |
-| `log.level` | `info` |  |
+| `log.level` | `warn` | The job processes print nothing on a good run, and a test holds them to it. `info` adds the logs the evaluation reads, such as `job_pages`. |
 
 These keys were added after the M0 gate, by the task named in each row, and added here on 2026-11-01. Each default is the one in the code.
 
@@ -373,7 +373,7 @@ This plan departs from the earlier documents in 30 places; the earlier documents
 
 | # | Earlier documents said | The plan does | Why | Where to update |
 | --- | --- | --- | --- | --- |
-| 21 | The `COMPRESSED` flag means LZ4 page data (HLD, frame header). | The flag is reserved and never set. | Avoids another library this semester. | HLD page-payload sentence. |
+| 21 | The `COMPRESSED` flag means LZ4 page data (HLD, frame header). | No LZ4. The flag means the page is sent as its non-zero bytes or as a diff against a kept copy, with a CRC of the rebuilt page (X-page-encoding, `docs/PROTOCOL.md` 7.2). | Avoids another library, and these encodings suit pages better. | HLD page-payload sentence. |
 | 22 | A stride prefetcher after 3 sequential faults (Doc 1, rejected-mechanisms table). | Deferred to `docs/TODO.md`. | Decided once the M3 speed-up is measured. | Doc 1 table. |
 | 23 | Spill at the home or at the origin listed as open (Doc 1, Open questions). | At the home. | Closes the open question. | Doc 1 Open questions. |
 

@@ -37,7 +37,13 @@ and the next step.
   says none of its values was measured. Each default was read from `src/lib/job.cpp`.
 - Trimmed the "not in the table" wording from the TODO.md rows and removed the `task.affinity`
   row, which said nothing else. Row 21 of the Changes table and the `spill.budget` row stay open.
-- Found, not changed: the table says `log.level` is `info`; the job processes default to `warn`.
+- Found, not changed: the table says `log.level` is `info`; the job processes default to `warn`. (Changed in session 2.)
+
+### 2026-11-01 — session 2: two corrections to the plan
+
+- At the person's request: `log.level` in the Tunables table now says `warn`, as the job processes
+  do, and row 21 of the Changes table says what `COMPRESSED` means since X-page-encoding. The
+  TODO.md wording about row 21 is gone. The `spill.budget` row stays open.
 
 ## Files touched
 
