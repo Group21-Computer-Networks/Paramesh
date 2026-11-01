@@ -95,6 +95,7 @@ cat <<EOF
 
 Done. Next:
   1. Open http://127.0.0.1:47002/ and join the pool with the cores and RAM you want to give.
+     The website and C playground: see /opt/paramesh/share/doc/paramesh/PLAYGROUND.md
   2. Build a program once:   cc -O2 app.c \$(pkg-config --cflags --libs paramesh) -o app
      Copy the same file to $PREFIX/apps/ on every node, then from that directory:
                              pmrun -n 3 $PREFIX/apps/app

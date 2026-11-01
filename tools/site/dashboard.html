@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard: ParaMesh</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&family=Young+Serif&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/site.css">
+</head>
+<body>
+<header class="nav"><div class="wrap">
+  <a class="mark" href="/">ParaMesh</a>
+  <a href="/#top">Home</a>
+  <a href="/#how">How It Works</a>
+  <a href="/#architecture">Architecture</a>
+  <a href="/dashboard">Dashboard</a>
+  <a href="https://github.com/Group21-Computer-Networks/Paramesh">GitHub</a>
+  <a class="button solid" href="/playground">Playground</a>
+</div></header>
+
+<main class="wrap board">
+  <div class="board-head">
+    <h1 id="title">This node</h1>
+    <span class="status"><i class="dot" id="dot"></i><span id="status">Asking this node's daemon</span></span>
+  </div>
+
+  <div class="board-grid">
+    <div class="panel">
+      <h3>Membership <span id="member" class="badge"></span></h3>
+      <p class="soft" id="note"></p>
+      <form id="join" hidden>
+        <label for="cores">Cores to give: <b id="cores-out"></b></label>
+        <input id="cores" type="range" min="1" step="1">
+        <label for="ram">RAM to give, MB, of <span id="ram-max"></span></label>
+        <input id="ram" type="number" min="1" step="1">
+        <label for="lead">Lead node, if your network has no multicast (optional)</label>
+        <input id="lead" list="heard" placeholder="10.0.0.2" autocomplete="off">
+        <datalist id="heard"></datalist>
+        <button class="button solid" id="join-button" type="submit">Join the pool</button>
+      </form>
+      <div id="joined" hidden>
+        <p id="giving"></p>
+        <button class="button" id="leave" type="button">Leave the pool</button>
+      </div>
+      <p class="soft" id="visitor" hidden>You are viewing this from another machine. Join and Leave work only on the node itself.</p>
+      <p class="notice bad" id="ask-error" role="alert" hidden></p>
+    </div>
+    <div class="panel navy">
+      <h3>Your account with the pool</h3>
+      <div class="sums">
+        <b id="given">–</b><b id="received">–</b>
+        <span class="soft">core-seconds given: this node's work for other nodes' jobs</span>
+        <span class="soft">core-seconds received: other nodes' work for jobs started here</span>
+      </div>
+      <p class="net soft" id="net"></p>
+    </div>
+  </div>
+
+  <h2>Given and received, by node</h2>
+  <div class="scroll"><table><thead><tr><th>Node</th><th class="n">Given</th><th class="n">Received</th><th class="n">Balance</th><th class="n">Weight</th><th class="n">Chunks for it</th><th class="n">Chunks by it</th><th>Its own account</th></tr></thead><tbody id="ledger"></tbody></table></div>
+  <p class="soft note">Credit is valued at what the same work costs on this node. "Its own account" compares the peer's raw counts with this node's, to flag a disagreement. What a peer announces is never an input to a weight.</p>
+
+  <h2>Nodes heard on your network</h2>
+  <div class="scroll"><table><thead><tr><th>Node</th><th>Address</th><th>State</th><th class="n">Cores</th><th class="n">Jobs</th><th class="n">Silent</th></tr></thead><tbody id="peers"></tbody></table></div>
+  <div id="migration"></div>
+
+  <h2>Jobs on this node</h2>
+  <div class="scroll"><table><thead><tr><th>Job</th><th>Role</th><th class="n">Launcher</th><th class="n">Slots</th><th class="n">Faults/s</th><th class="n">MB in/s</th><th class="n">MB out/s</th><th class="n">p50 µs</th><th class="n">p99 µs</th></tr></thead><tbody id="jobs"></tbody></table></div>
+
+  <h2>Page ownership</h2>
+  <div class="key"><span><i class="c-home"></i>home here</span><span><i class="c-modified"></i>held modified (M)</span><span><i class="c-shared"></i>held shared (S)</span><span><i class="c-empty"></i>neither</span></div>
+  <div id="pages"></div>
+</main>
+
+<footer><div class="wrap">
+  <span>ParaMesh, by Group 21, a computer networks project.</span>
+  <nav>
+    <a href="https://github.com/Group21-Computer-Networks/Paramesh">GitHub</a>
+    <a href="https://github.com/Group21-Computer-Networks/Paramesh/blob/main/docs/API.md">Documentation</a>
+    <a href="/playground">Playground</a>
+  </nav>
+</div></footer>
+<script src="/dashboard.js"></script>
+</body>
+</html>

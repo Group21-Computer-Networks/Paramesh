@@ -2,14 +2,23 @@
 // interface, and the factory choosing an implementation by configured name.
 
 #include "platform/factory.h"
+#include "platform/sandbox.h"
 
 #include <doctest/doctest.h>
 #include <httplib.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -20,6 +29,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -275,4 +285,67 @@ TEST_CASE("the HTTP server takes a POST only from its own page: the header and t
     CHECK(rebound->status == 403);
     CHECK(client.Get("/v1/echo")->status == 404);  // POST only
     platform.http->stop();
+}
+
+// ---- the playground's sandbox (X-playground) ----------------------------------------------------
+
+namespace {
+
+// What `probe` returns in a forked child confined as a job.
+template <typename Probe>
+int in_sandbox(const std::filesystem::path& directory, Probe probe) {
+    const pid_t child = ::fork();
+    if (child == 0) {
+        if (!paramesh::sandbox_enter(directory.c_str(), paramesh::SandboxProfile::kJob)) {
+            ::_exit(99);
+        }
+        ::_exit(probe());
+    }
+    int status = 0;
+    ::waitpid(child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 100;
+}
+
+bool tcp_refused_by_sandbox(std::uint16_t port) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(port);
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API
+    return ::connect(fd, reinterpret_cast<const sockaddr*>(&to), sizeof to) != 0 && errno == EACCES;
+}
+
+bool can_sandbox() {
+    return ::syscall(SYS_landlock_create_ruleset, nullptr, 0, 1) >= 4 &&
+           std::string_view{PARAMESH_SANITIZER_NAME}.empty();
+}
+
+}  // namespace
+
+TEST_CASE("a sandboxed job cannot leave its directory, start a process or reach a low port" *
+          doctest::skip(!can_sandbox())) {
+    const auto directory =
+        std::filesystem::temp_directory_path() / ("pm-sandbox." + std::to_string(::getpid()));
+    std::filesystem::create_directories(directory);
+    const auto inside = directory / "file";
+    CHECK(in_sandbox(directory, [&] { return std::ofstream{inside}.good() ? 0 : 1; }) == 0);
+    CHECK(in_sandbox(directory, [] { return std::ifstream{"/etc/passwd"}.good() ? 1 : 0; }) == 0);
+    CHECK(in_sandbox(directory,
+                     [] { return std::ofstream{"/tmp/pm-sandbox-escape"}.good() ? 1 : 0; }) == 0);
+    CHECK(in_sandbox(directory, [] { return ::fork() < 0 && errno == EPERM ? 0 : 1; }) == 0);
+    CHECK(in_sandbox(directory, [] {
+              std::array<char*, 1> argv{};
+              return ::execv("/bin/true", argv.data()) != 0 ? 0 : 1;
+          }) == 0);
+    CHECK(in_sandbox(directory, [] { return ::kill(1, 0) != 0 && errno == EPERM ? 0 : 1; }) == 0);
+    CHECK(in_sandbox(directory, [] { return ::socket(AF_INET, SOCK_DGRAM, 0) < 0 ? 0 : 1; }) == 0);
+    CHECK(in_sandbox(directory, [] { return tcp_refused_by_sandbox(22) ? 0 : 1; }) == 0);
+    CHECK(in_sandbox(directory, [] { return tcp_refused_by_sandbox(47002) ? 0 : 1; }) == 0);
+    CHECK(in_sandbox(directory, [] {  // threads, which the runtime needs, still work
+              std::atomic<int> ran{0};
+              std::thread{[&ran] { ran = 1; }}.join();
+              return ran == 1 ? 0 : 1;
+          }) == 0);
+    std::filesystem::remove_all(directory);
 }

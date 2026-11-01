@@ -2,6 +2,7 @@
 
 #include "net/frame_io.h"
 #include "platform/factory.h"
+#include "platform/sandbox.h"
 #include "wire/payloads.h"
 
 #include <arpa/inet.h>
@@ -16,6 +17,7 @@
 #include <cstdlib>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace paramesh {
 
@@ -238,9 +240,31 @@ int leave(std::span<const std::string_view> args) {
     return said.value().status == Status::kOk ? 0 : 1;
 }
 
+// `pm sandbox DIRECTORY program [arguments...]`: runs the compiler for the playground, confined
+// to DIRECTORY and the toolchain.
+int sandboxed(std::span<const std::string_view> args) {
+    std::vector<std::string> words{args.begin() + 2, args.end()};
+    std::vector<char*> argv;
+    argv.reserve(words.size() + 1);
+    for (std::string& word : words) {
+        argv.push_back(word.data());
+    }
+    argv.push_back(nullptr);
+    if (!sandbox_enter(std::string{args[1]}.c_str(), SandboxProfile::kCompiler)) {
+        static_cast<void>(std::fputs("pm: cannot sandbox the program\n", stderr));
+        return 126;
+    }
+    ::execvp(argv[0], argv.data());
+    static_cast<void>(std::fprintf(stderr, "pm: cannot run %s\n", argv[0]));
+    return 127;
+}
+
 int pm(std::span<const std::string_view> args) {
     if (!args.empty() && args[0] == "leave") {
         return leave(args);
+    }
+    if (args.size() >= 3 && args[0] == "sandbox") {
+        return sandboxed(args);
     }
     std::uint16_t port = kStatusPort;
     if (args.size() == 3 && args[1] == "--http-port") {

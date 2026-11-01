@@ -2,6 +2,7 @@
 
 #include "net/frame_io.h"
 #include "platform/factory.h"
+#include "platform/sandbox.h"
 #include "wire/payloads.h"
 
 #include <sys/socket.h>
@@ -79,6 +80,11 @@ std::string socket_path(const std::string& state_dir) {
         argv.push_back(argument.data());
     }
     argv.push_back(nullptr);
+    if (sandbox_path(path) &&
+        !sandbox_enter(path.substr(0, path.rfind('/')).c_str(), SandboxProfile::kJob)) {
+        static_cast<void>(std::fputs("pmrun: cannot sandbox the job\n", stderr));
+        ::_exit(126);
+    }
     ::execv(path.c_str(), argv.data());
     static_cast<void>(std::fprintf(stderr, "pmrun: cannot start %s\n", path.c_str()));
     ::_exit(127);

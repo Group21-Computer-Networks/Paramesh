@@ -408,6 +408,9 @@ public:
         const char* tmp = env("TMPDIR");
         home.spill_dir = !s_.pmd_socket.empty() ? s_.pmd_socket.substr(0, s_.pmd_socket.rfind('/'))
                                                 : std::string{tmp != nullptr ? tmp : ""};
+        if (const char* spill = env("PARAMESH_CFG_SPILL_DIR")) {  // a sandboxed job's directory
+            home.spill_dir = spill;
+        }
         auto store = store_open(home, *this);
         auto cache = cache_open(cache_bytes, s_.cache_window);
         if (!store.ok() || !cache.ok()) {
