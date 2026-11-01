@@ -6,24 +6,14 @@ standard library. The dashboard on port 47002 does not change.
 
 ## Running it
 
-The installer puts both under `/opt/paramesh`. A node needs `gcc` and `g++` to compile for the
-playground (`sudo apt install g++`), and Linux 6.7 or later for the sandbox. Join the pool first,
-then on every node:
+The installer puts both under `/opt/paramesh`, and runs the server on every node as a systemd user
+service, `paramesh-site`, open to the LAN. Allow TCP 47080 between the nodes. A node needs `g++` to
+compile for the playground (`sudo apt install g++`), and Linux 6.7 or later for the sandbox.
 
-```bash
-python3 /opt/paramesh/tools/playground/server.py --public
-```
-
-The first node prints an access code and a node token. Start the other nodes with that token, so
-they accept the program from it:
-
-```bash
-python3 /opt/paramesh/tools/playground/server.py --public --token THE_TOKEN
-```
-
-Then open `http://ADDRESS:47080/` on any machine of the LAN, or `http://127.0.0.1:47080/`. Run
-needs the access code; give it to the people you are supervising. Without `--public` the server
-answers on 127.0.0.1 only and asks for no code. Allow TCP 47080 between the nodes.
+Open `http://127.0.0.1:47080/dashboard` on the first node and join. It shows an invite code for the
+other nodes and the playground's access code; give that to the people you are supervising. The
+site is `http://ADDRESS:47080/` from any machine of the LAN. To keep it to one machine, stop the
+service and run `python3 /opt/paramesh/tools/playground/server.py`, which answers on 127.0.0.1 only.
 
 ## What a run does
 
@@ -114,7 +104,7 @@ inviter as its lead node. It can then receive and run other nodes' programs, and
 The code holds the inviter's address and port and four bytes derived from the token. It is a
 convenience, not a lock: `pmd` lets any node on the LAN join with or without it.
 
-The server must run on the new laptop too, with `--public`, so the others can send it programs.
+The installed service does the rest: it is how the other nodes send this laptop their programs.
 
 ## What this machine is doing
 

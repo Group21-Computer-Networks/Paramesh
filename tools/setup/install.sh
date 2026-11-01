@@ -15,6 +15,7 @@ set -euo pipefail
 
 PREFIX=/opt/paramesh
 UNIT="$HOME/.config/systemd/user/paramesh.service"
+SITE_UNIT="$HOME/.config/systemd/user/paramesh-site.service"
 SERVICE=1
 say() { printf 'paramesh: %s\n' "$*"; }
 die() { say "$*" >&2; exit 1; }
@@ -23,8 +24,8 @@ case "${1:-}" in
     "") ;;
     --no-service) SERVICE=0 ;;
     --uninstall)
-        systemctl --user disable --now paramesh.service 2>/dev/null || true
-        rm -f "$UNIT"
+        systemctl --user disable --now paramesh-site.service paramesh.service 2>/dev/null || true
+        rm -f "$UNIT" "$SITE_UNIT"
         systemctl --user daemon-reload 2>/dev/null || true
         sudo rm -rf "$PREFIX" "$PREFIX.old"
         sudo rm -f /usr/local/bin/pmd /usr/local/bin/pm /usr/local/bin/pmrun \
@@ -87,6 +88,23 @@ EOF
     curl -fs http://127.0.0.1:47002/v1/peers >/dev/null 2>&1 ||
         die "pmd did not start; see: journalctl --user -u paramesh.service"
     say "pmd is running in standby (systemctl --user status paramesh)."
+    cat >"$SITE_UNIT" <<EOF
+[Unit]
+Description=ParaMesh website and playground: http://127.0.0.1:47080/
+After=paramesh.service
+
+[Service]
+ExecStart=/usr/bin/python3 $PREFIX/tools/playground/server.py --public
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable paramesh-site.service >/dev/null 2>&1
+    systemctl --user restart paramesh-site.service
+    say "the website is running: http://127.0.0.1:47080/ (systemctl --user status paramesh-site)."
+    command -v g++ >/dev/null || say "to compile for the playground on this node: sudo apt install g++"
 else
     say "no systemd user session: start pmd yourself with: pmd --standby"
 fi
@@ -94,8 +112,9 @@ fi
 cat <<EOF
 
 Done. Next:
-  1. Open http://127.0.0.1:47002/ and join the pool with the cores and RAM you want to give.
-     The website and C playground: see /opt/paramesh/share/doc/paramesh/PLAYGROUND.md
+  1. Open http://127.0.0.1:47080/dashboard. To give your cores, enter an invite code from a
+     node in the pool. The first node just joins, and shows the code for the others.
+     The website is open to the LAN: see /opt/paramesh/share/doc/paramesh/PLAYGROUND.md.
   2. Build a program once:   cc -O2 app.c \$(pkg-config --cflags --libs paramesh) -o app
      Copy the same file to $PREFIX/apps/ on every node, then from that directory:
                              pmrun -n 3 $PREFIX/apps/app

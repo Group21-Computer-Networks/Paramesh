@@ -102,7 +102,7 @@ function gauge(name, value, label, top) {
   const most = top || Math.max(...line, 1);
   const points = line.map((v, i) => `${(120 * (i + 60 - line.length)) / 59},${32 - (30 * v) / most}`).join(" ");
   const first = (120 * (60 - line.length)) / 59;
-  $(`c-${name}`).innerHTML = `<polygon points="${first},34 ${points} 120,34" fill="#c3d8e8"/><polyline points="${points}" fill="none" stroke="#47698f" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`;
+  $(`c-${name}`).innerHTML = `<polygon points="${first},34 ${points} 120,34" fill="#c8d8e2"/><polyline points="${points}" fill="none" stroke="#3f6386" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`;
 }
 
 function drawLocal(local, jobs) {

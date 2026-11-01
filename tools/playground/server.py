@@ -74,7 +74,7 @@ class Service:
         self.order = []
         self.lock = threading.Lock()
         self.busy = False
-        self.code = args.code or secrets.token_hex(3) if args.public else None
+        self.code = self.load_code() if args.public else None
         self.token = self.load_token()
         self.history = self.state / "playground.jsonl"
         self.usage_lock = threading.Lock()
@@ -82,6 +82,17 @@ class Service:
         self.usage = {}
         self.ticks = {}
         self.machine_ticks = None
+
+    def load_code(self):
+        """The access code: the same across restarts, and the dashboard shows it."""
+        if self.args.code:
+            return self.args.code
+        path = self.state / "playground.code"
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch(0o600)
+            path.write_text(secrets.token_hex(3) + "\n")
+        return path.read_text().strip()
 
     def load_token(self):
         path = self.state / "playground.token"

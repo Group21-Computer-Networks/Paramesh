@@ -1,6 +1,6 @@
 // The page grid in the hero, and the live figures, from /api/cluster and nothing else.
 const pages = document.getElementById("pages");
-const tints = ["#c3d8e8", "#47698f", "#e3d5bc", "#2a3d60"];
+const tints = ["#c8d8e2", "#3f6386", "#e6d9c1", "#34506f"];
 for (let row = 0; row < 5; row++) {
   for (let column = 0; column < 8; column++) {
     const cell = document.createElementNS("http://www.w3.org/2000/svg", "rect");

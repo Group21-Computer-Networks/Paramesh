@@ -68,6 +68,12 @@ and the next step.
 - The new test found why discovery was one-way on the real laptops: `pmd` beacons to multicast and
   its seeds only, so a node that found this one by address, across subnets, heard nothing back.
   `pmd` now beacons to each new peer's source address too, on a list kept apart from job choice.
+- At the person's request: their palette of blue, tan and olive, with the tones chosen here, and the
+  fonts Prata and Karla, a pairing from a public Pinterest pin. Pinterest's own search needs a login,
+  so it came through a web search. The installer now runs the server as `paramesh-site`, and the
+  access code is kept across restarts. `install.sh` itself has not been run: it needs sudo.
+- The person's reference, a Cosmos gallery, moved the "What is ParaMesh?" wall to drawings in full-bleed
+  frames with captions below, near-square corners and no shadows.
 - NOT tested: the real two laptops. The new `pmd` and server need installing on both, which needs
   the person's sudo. Running on 127.0.0.1, peers skip staging; POST /node/stage is unexercised.
 - Next: the person installs on both laptops and runs a two-node job.

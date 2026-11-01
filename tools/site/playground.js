@@ -47,11 +47,11 @@ function startEditor() {
       api.editor.defineTheme("paramesh-paper", { base: "vs", inherit: true, rules: [
         { token: "comment", foreground: "6a7588" }, { token: "keyword", foreground: "47698f" },
         { token: "string", foreground: "8a6d3f" }, { token: "number", foreground: "2e6b58" }],
-        colors: { "editor.background": "#fbf8f1", "editorLineNumber.foreground": "#a7a294", "editor.lineHighlightBackground": "#f2ecdf" } });
+        colors: { "editor.background": "#fbf7ee", "editorLineNumber.foreground": "#a7a08c", "editor.lineHighlightBackground": "#f1ead9" } });
       api.editor.defineTheme("paramesh-night", { base: "vs-dark", inherit: true, rules: [
         { token: "comment", foreground: "8795a8" }, { token: "keyword", foreground: "9dc2de" },
         { token: "string", foreground: "dcc497" }],
-        colors: { "editor.background": "#14233f", "editor.lineHighlightBackground": "#1c2e50" } });
+        colors: { "editor.background": "#1e3550", "editor.lineHighlightBackground": "#28425f" } });
       editor = api.editor.create($("editor"), { value: examples[3].source, language: "c", theme: "paramesh-paper",
         automaticLayout: true, minimap: { enabled: false }, fontFamily: "IBM Plex Mono, monospace", fontSize: 14,
         tabSize: 4, insertSpaces: true, autoIndent: "full", matchBrackets: "always", scrollBeyondLastLine: false });
@@ -205,7 +205,7 @@ function renderAnalytics(run) {
   const m = run.metrics || {};
   const nodes = m.nodes_ran_tasks && m.nodes_ran_tasks.length ? m.nodes_ran_tasks.length : null;
   const cpu = m.cpu_ms ?? run.launcher_cpu_ms;
-  const parts = [["Compile", run.compile_ms, "#a98a5c"], ["Stage", run.stage_ms, "#c3d8e8"], ["Program", run.run_ms, "#47698f"]].filter((p) => p[1]);
+  const parts = [["Compile", run.compile_ms, "#a88a5e"], ["Stage", run.stage_ms, "#5f6b38"], ["Program", run.run_ms, "#3f6386"]].filter((p) => p[1]);
   const total = parts.reduce((sum, p) => sum + p[1], 0);
   const timeline = html("div", { className: "timeline" });
   const legend = html("div", { className: "legend" });
