@@ -1,4 +1,4 @@
-# X-translator: Plain C with a pragma, translated for the playground
+# X-translator: Plain C, with safe loops run on the pool
 
 - Task: X-translator
 - Milestone: none
@@ -56,8 +56,11 @@ Example:  - `src/net/epoll_loop.cpp` — epoll wrapper and timer wheel
 - `tools/site/playground.js` — shows where each loop ran
 - `tools/site/examples.js` — a plain C example
 - `tools/setup/package.sh` — packs the translator
-- `tests/multi/translate_checks.py`, `tests/multi/run_playground.sh` — checks
-- `docs/PLAYGROUND.md`, `docs/logs/X-translator.md`, `docs/TODO.md`
+- `tests/multi/translate_checks.py` — each program run both ways
+- `tests/multi/run_playground.sh` — runs those checks
+- `docs/PLAYGROUND.md` — how it behaves
+- `docs/TODO.md` — its limits
+- `docs/logs/X-translator.md` — this log
 
 ## Decisions
 
