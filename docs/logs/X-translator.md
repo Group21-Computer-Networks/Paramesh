@@ -42,6 +42,13 @@ and the next step.
 - Result: `tests/multi/run_playground.sh build/dev` printed PASS, all playground checks and every
   translator case, on 2 local nodes. NOT tested on the two real laptops.
 
+### 2026-11-02 — session 2 (fix): the converted code is shown
+
+- The person wanted to see the conversion before the run. `POST /api/translate` returns it, the page
+  has a Convert button and a Converted code tab, and Run shows that tab first with 2 or more nodes.
+- Check added to `playground_checks.py`. `tests/multi/run_playground.sh build/dev` printed PASS. The page
+  itself was not opened in a browser.
+
 ## Files touched
 
 <!--
@@ -53,7 +60,9 @@ Example:  - `src/net/epoll_loop.cpp` — epoll wrapper and timer wheel
 
 - `tools/playground/translate.py` — the translator
 - `tools/playground/server.py` — translates, falls back, `--region-mb`
-- `tools/site/playground.js` — shows where each loop ran
+- `tools/site/playground.js` — shows where each loop ran, and the converted code
+- `tools/site/playground.html` — Convert and its tab
+- `tests/multi/playground_checks.py` — checks Convert
 - `tools/site/examples.js` — a plain C example
 - `tools/setup/package.sh` — packs the translator
 - `tests/multi/translate_checks.py` — each program run both ways

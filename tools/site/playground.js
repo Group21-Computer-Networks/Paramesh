@@ -105,7 +105,7 @@ async function poolStatus() {
 // ---- running ---------------------------------------------------------------------------------
 
 function showTab(name) {
-  for (const tab of ["output", "analytics", "history"]) {
+  for (const tab of ["output", "converted", "analytics", "history"]) {
     $(`tab-${tab}`).setAttribute("aria-selected", tab === name);
     $(`pane-${tab}`).hidden = tab !== name;
   }
@@ -281,8 +281,34 @@ function running(active) {
   $("run").textContent = active ? "Running" : "Run Code";
 }
 
+// Asks the server what the program becomes, and shows it. Returns false if the server said no.
+async function convert() {
+  const pane = $("pane-converted");
+  let body;
+  try {
+    const answer = await fetch("/api/translate", { method: "POST",
+      headers: { "Content-Type": "application/json", "X-Access-Code": $("code").value.trim() },
+      body: JSON.stringify({ source: code() }) });
+    body = await answer.json();
+    if (!answer.ok) throw new Error(body.error);
+  } catch (failure) {
+    pane.replaceChildren(html("p", { className: "notice bad", textContent: failure.message || "The playground server is not answering." }));
+    return false;
+  }
+  const heading = body.changed ? "Your program, converted" : "Nothing to convert: this program runs as you wrote it";
+  pane.replaceChildren(
+    ...(body.notes.length ? [stream("Where each loop runs", body.notes.join("\n"), "compiler")] : []),
+    stream(heading, body.source, "stdout"));
+  return true;
+}
+
 async function runProgram() {
   const headers = { "Content-Type": "application/json", "X-Access-Code": $("code").value.trim() };
+  if (Number($("nodes").value) > 1) {  // the converted code first, then the run
+    showTab("converted");
+    running(true);
+    if (await convert()) await new Promise((done) => setTimeout(done, 1800));
+  }
   showTab("output");
   markErrors([]);
   running(true);
@@ -337,6 +363,11 @@ $("reset").onclick = () => setCode(chosen().source);
 $("clear").onclick = () => setCode("");
 $("copy").onclick = () => navigator.clipboard?.writeText(code());
 $("run").onclick = runProgram;
+$("convert").onclick = async () => {
+  showTab("converted");
+  await convert();
+};
+$("tab-converted").onclick = () => showTab("converted");
 $("stop").onclick = () => current && fetch(`/api/stop/${current}`, { method: "POST", headers: { "X-Access-Code": $("code").value.trim() } });
 $("theme").onclick = () => {
   dark = !dark;

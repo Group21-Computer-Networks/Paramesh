@@ -22,6 +22,7 @@
 
 <div class="toolbar">
   <button class="button solid" id="run">Run Code</button>
+  <button class="button" id="convert">Convert</button>
   <button class="button" id="stop" disabled>Stop</button>
   <label>Nodes <select id="nodes"><option>1</option></select></label>
   <label id="code-field" hidden>Access code <input id="code" autocomplete="off" spellcheck="false"></label>
@@ -38,6 +39,7 @@
   <div class="results">
     <div class="tabs" role="tablist">
       <button role="tab" id="tab-output" aria-selected="true">Output</button>
+      <button role="tab" id="tab-converted" aria-selected="false">Converted code</button>
       <button role="tab" id="tab-analytics" aria-selected="false">Analytics</button>
       <button role="tab" id="tab-history" aria-selected="false">Past runs</button>
       <button class="icon" id="clear-output">Clear output</button>
@@ -45,6 +47,7 @@
       <button class="icon" id="download-output">Download</button>
     </div>
     <div class="pane" id="pane-output"></div>
+    <div class="pane" id="pane-converted" hidden></div>
     <div class="pane" id="pane-analytics" hidden></div>
     <div class="pane" id="pane-history" hidden></div>
   </div>
