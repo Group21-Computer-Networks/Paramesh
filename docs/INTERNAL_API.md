@@ -581,8 +581,9 @@ Result<void> home_import_entry(HomeDirectory& directory, PageId page, const Home
 
 // The store moved a home copy between RAM and the spill file.
 void home_set_where(HomeDirectory& directory, PageId page, HomeWhere where);
-// A member left the job: clear its bit in every copyset.
-void home_drop_member(HomeDirectory& directory, Slot slot);
+// A member left the job: clear its bit in every copyset and stop waiting for its INV_ACK, which
+// may finish an operation; `out` has what follows, an abort if only it had a page's bytes.
+void home_drop_member(HomeDirectory& directory, Slot slot, Nanos now, std::vector<HomeAction>& out);
 // The node behind a copyset bit. The caller tells the directory every member of each map: a
 // segment that arrives names readers that never sent this node a request (added by M4-5).
 void home_set_member(HomeDirectory& directory, Slot slot, NodeId node);

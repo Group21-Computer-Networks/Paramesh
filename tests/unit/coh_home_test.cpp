@@ -789,6 +789,52 @@ TEST_CASE("a segment's entries leave one directory and serve from another as the
     CHECK(text(old_home.send(kRead, 2, shared_page)) == "abort");
 }
 
+// M4-5 fix: the home waited for ever for the INV_ACK of a node that had left, and every request
+// for the page went unanswered: "no reply from node 2" in CI, just after a leave.
+TEST_CASE("a member that leaves while the home waits for its INV_ACK is waited for no longer") {
+    Home home;
+    home.send(kRead, 2);
+    home.send(kRead, 3);
+    REQUIRE(home.does(kWrite, 4) == "INV>2 INV>3");
+    std::vector<HomeAction> out;
+    paramesh::home_drop_member(*home.directory, paramesh::Slot{3}, home.now, out);
+    CHECK(out.empty());  // node 2 still has to answer
+    CHECK(home.entry().wait == HomeWait::kInv);
+    CHECK(home.does(kInvAck, 2) == "WRITE_GRANT>4:zero");
+    CHECK(home.entry().wait == HomeWait::kIdle);
+}
+
+TEST_CASE("the last INV_ACK being the leaver's, its going ends the wait, and the queue moves on") {
+    Home home;
+    home.send(kRead, 3);
+    REQUIRE(home.does(kWrite, 4) == "INV>3");
+    home.send(kRead, 2);  // waits behind the write
+    std::vector<HomeAction> out;
+    paramesh::home_drop_member(*home.directory, paramesh::Slot{3}, home.now, out);
+    CHECK(text(out) == "WRITE_GRANT>4:zero FETCH>4");
+    CHECK(home.entry().queued == 0);
+}
+
+TEST_CASE("an INV_ACK that arrives just after its sender left is ignored") {
+    Home home;
+    home.send(kRead, 2);
+    home.send(kRead, 3);
+    REQUIRE(home.does(kWrite, 4) == "INV>2 INV>3");
+    std::vector<HomeAction> out;
+    paramesh::home_drop_member(*home.directory, paramesh::Slot{3}, home.now, out);
+    CHECK(home.does(kInvAck, 3).empty());  // not "impossible"
+    CHECK(home.does(kInvAck, 2) == "WRITE_GRANT>4:zero");
+}
+
+TEST_CASE("a leaver that owes the home the only copy of a page ends the job, with no zeros") {
+    Home home;
+    home.send(kWrite, 3);
+    REQUIRE(home.does(kRead, 2) == "FETCH>3");
+    std::vector<HomeAction> out;
+    paramesh::home_drop_member(*home.directory, paramesh::Slot{3}, home.now, out);
+    CHECK(text(out) == "abort");
+}
+
 TEST_CASE("a member that left is in no copyset, and a page only it read is uncached again") {
     Home home;
     const PageId both{9};
@@ -796,7 +842,9 @@ TEST_CASE("a member that left is in no copyset, and a page only it read is uncac
     home.send(kRead, 2, both);
     home.send(kRead, 3, both);
     home.send(kRead, 3, only_three);
-    paramesh::home_drop_member(*home.directory, paramesh::Slot{3});
+    std::vector<HomeAction> out;
+    paramesh::home_drop_member(*home.directory, paramesh::Slot{3}, home.now, out);
+    CHECK(out.empty());
     CHECK(paramesh::home_entry(*home.directory, both).copyset == 0b100);
     CHECK(paramesh::home_entry(*home.directory, both).state == HomeState::kShared);
     CHECK(paramesh::home_entry(*home.directory, only_three).copyset == 0);
