@@ -940,6 +940,17 @@ void Pmd::say_bye() {
     announce(Opcode::kBye, bytes);
 }
 
+// A node that found this one by address may be out of multicast's reach, on another subnet:
+// without an answer it would hear nobody. Only beacons go back, so this list has no part in
+// choosing a job's nodes.
+void Pmd::answer_beacons(std::uint32_t address, std::uint16_t port) {
+    const std::pair source{address, port};
+    if (answered_.size() < kMaxAnswered &&
+        std::find(answered_.begin(), answered_.end(), source) == answered_.end()) {
+        answered_.push_back(source);
+    }
+}
+
 // Every beacon that has arrived.
 void Pmd::hear() {
     std::array<std::byte, 2048> datagram{};
@@ -989,13 +1000,8 @@ void Pmd::hear() {
                 clashes_.push_back(Peer{node, address, hello.value(), platform_.clock->now()});
             }
         }
-        // A node that found this one by address may be out of multicast's reach, on another
-        // subnet: without an answer it would hear nobody. Only beacons go back, so this list has
-        // no part in choosing a job's nodes.
-        const std::pair<std::uint32_t, std::uint16_t> source{address, ntohs(from.sin_port)};
-        if (heard == PeerTable::Heard::kNew && answered_.size() < kMaxAnswered &&
-            std::find(answered_.begin(), answered_.end(), source) == answered_.end()) {
-            answered_.push_back(source);
+        if (heard == PeerTable::Heard::kNew) {
+            answer_beacons(address, ntohs(from.sin_port));
         }
         for (const LedgerTotal& total : hello.value().totals) {
             if (total.peer == config_.node) {  // what the peer says about this node, kept

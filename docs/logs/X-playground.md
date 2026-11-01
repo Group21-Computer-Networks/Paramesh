@@ -74,6 +74,8 @@ and the next step.
   access code is kept across restarts. `install.sh` itself has not been run: it needs sudo.
 - The person's reference, a Cosmos gallery, moved the "What is ParaMesh?" wall to drawings in full-bleed
   frames with captions below, near-square corners and no shadows.
+- CI's tidy failed on `Pmd::hear` at cognitive complexity 41: `answer_beacons` now holds the list.
+  `cmake --build --preset tidy --target pmd` printed `[7/7] Linking CXX executable src/pmd/pmd`.
 - NOT tested: the real two laptops. The new `pmd` and server need installing on both, which needs
   the person's sudo. Running on 127.0.0.1, peers skip staging; POST /node/stage is unexercised.
 - Next: the person installs on both laptops and runs a two-node job.
