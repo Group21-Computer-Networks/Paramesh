@@ -870,6 +870,9 @@ void Pmd::announce(Opcode opcode, std::span<const std::byte> payload) {
                       i < config_.peer_discovery_ports.size() ? config_.peer_discovery_ports[i]
                                                               : kDiscoveryPort);
     }
+    for (const auto& [address, port] : answered_) {
+        send_datagram(opcode, payload, address, port);
+    }
 }
 
 // Once a second: HELLO, and the peers silent too long leave the table.
@@ -985,6 +988,14 @@ void Pmd::hear() {
             } else if (heard == PeerTable::Heard::kClash) {
                 clashes_.push_back(Peer{node, address, hello.value(), platform_.clock->now()});
             }
+        }
+        // A node that found this one by address may be out of multicast's reach, on another
+        // subnet: without an answer it would hear nobody. Only beacons go back, so this list has
+        // no part in choosing a job's nodes.
+        const std::pair<std::uint32_t, std::uint16_t> source{address, ntohs(from.sin_port)};
+        if (heard == PeerTable::Heard::kNew && answered_.size() < kMaxAnswered &&
+            std::find(answered_.begin(), answered_.end(), source) == answered_.end()) {
+            answered_.push_back(source);
         }
         for (const LedgerTotal& total : hello.value().totals) {
             if (total.peer == config_.node) {  // what the peer says about this node, kept

@@ -16,6 +16,7 @@ report or a measurement here; what nothing measures is null, shown as "Not avail
 See docs/PLAYGROUND.md for what the sandbox does not stop.
 """
 import argparse
+import base64
 import hashlib
 import hmac
 import ipaddress
@@ -25,6 +26,8 @@ import re
 import secrets
 import shutil
 import signal
+import socket
+import struct
 import subprocess
 import threading
 import time
@@ -74,6 +77,11 @@ class Service:
         self.code = args.code or secrets.token_hex(3) if args.public else None
         self.token = self.load_token()
         self.history = self.state / "playground.jsonl"
+        self.usage_lock = threading.Lock()
+        self.usage_at = 0
+        self.usage = {}
+        self.ticks = {}
+        self.machine_ticks = None
 
     def load_token(self):
         path = self.state / "playground.token"
@@ -86,6 +94,108 @@ class Service:
             path.touch(0o600)
             path.write_text(secrets.token_hex(16) + "\n")
         return path.read_text().strip()
+
+    # ---- invite codes: a way in for a node that only gives its cores ---------------------------
+
+    def invite_secret(self):
+        return hashlib.sha256(self.token.encode()).digest()[:4]
+
+    def address(self):
+        """This machine's address on the network it would reach others by. Sends nothing."""
+        if self.args.advertise:
+            return self.args.advertise
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            try:
+                probe.connect(("10.255.255.255", 1))
+                return probe.getsockname()[0]
+            except OSError:
+                return "127.0.0.1"
+
+    def invite_code(self):
+        """Where to find this node, and the proof of having been told: 16 letters, as XXXX-XXXX-..."""
+        raw = socket.inet_aton(self.address()) + struct.pack(">H", self.args.port) + self.invite_secret()
+        text = base64.b32encode(raw).decode()
+        return "-".join(text[i:i + 4] for i in range(0, 16, 4))
+
+    def lead(self):
+        return self.address() + (f":{self.args.pmd_ports}" if self.args.pmd_ports else "")
+
+    def enter(self, code, cap_cores, cap_ram):
+        """On the node that was given the code: find the inviter, take the nodes' token, join."""
+        try:
+            raw = base64.b32decode(code.replace("-", "").replace(" ", "").upper())
+            if len(raw) != 10:
+                raise ValueError
+        except (ValueError, AttributeError):
+            return 400, {"error": "that is not an invite code"}
+        address = socket.inet_ntoa(raw[:4])
+        port = struct.unpack(">H", raw[4:6])[0]
+        url = f"http://{address}:{port}/node/invite?secret={raw[6:].hex()}"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as answer:
+                invite = json.load(answer)
+        except urllib.error.HTTPError:
+            return 403, {"error": "that code is not right for this pool"}
+        except (OSError, ValueError):
+            return 502, {"error": f"cannot reach the node at {address}: check the network and its firewall"}
+        self.token = invite["token"]
+        path = self.state / "playground.token"
+        path.write_text(self.token + "\n")
+        return self.pool_request("/v1/join", json.dumps({"cap_cores": cap_cores, "cap_ram": cap_ram,
+                                                         "lead": invite["lead"]}).encode())
+
+    # ---- what this machine is doing --------------------------------------------------------
+
+    def local_usage(self):
+        """CPU and RAM from /proc, for the machine and for each job's process here. At most once
+        a second, however many pages are open: two readings make a rate."""
+        with self.usage_lock:
+            now = time.monotonic()
+            if now - self.usage_at >= 0.9:
+                self.usage = self.read_usage(now - self.usage_at)
+                self.usage_at = now
+            return self.usage
+
+    def read_usage(self, elapsed):
+        page = os.sysconf("SC_PAGE_SIZE")
+        tick = os.sysconf("SC_CLK_TCK")
+        memory = {}
+        with open("/proc/meminfo") as lines:
+            for line in lines:
+                name, value = line.split(":", 1)
+                memory[name] = int(value.split()[0]) * 1024
+        with open("/proc/stat") as lines:
+            fields = [int(x) for x in lines.readline().split()[1:]]
+        idle, total = fields[3] + fields[4], sum(fields[:8])
+        busy = None
+        if self.machine_ticks and total > self.machine_ticks[1]:
+            busy = 100 * (1 - (idle - self.machine_ticks[0]) / (total - self.machine_ticks[1]))
+        self.machine_ticks = (idle, total)
+        jobs = {}
+        ticks = {}
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry.name}/environ", "rb") as source:
+                    found = re.search(rb"(?:^|\0)PARAMESH_JOB_ID=(\d+)", source.read())
+                if found is None:
+                    continue
+                with open(f"/proc/{entry.name}/stat") as source:
+                    stat = source.read().rsplit(")", 1)[1].split()
+            except OSError:
+                continue  # gone, or not this user's
+            used = int(stat[11]) + int(stat[12])
+            job = jobs.setdefault(found[1].decode(), {"rss_bytes": 0, "cpu_percent": None})
+            job["rss_bytes"] += int(stat[21]) * page
+            ticks[entry.name] = used
+            if entry.name in self.ticks and elapsed > 0:
+                job["cpu_percent"] = (job["cpu_percent"] or 0) + 100 * (used - self.ticks[entry.name]) / tick / elapsed
+        self.ticks = ticks
+        return {"cores": os.cpu_count(), "cpu_percent": busy, "ram_total": memory["MemTotal"],
+                "ram_used": memory["MemTotal"] - memory["MemAvailable"],
+                "paramesh_rss": sum(j["rss_bytes"] for j in jobs.values()),
+                "paramesh_cpu_percent": sum(j["cpu_percent"] or 0 for j in jobs.values()), "jobs": jobs}
 
     def pmd(self, path):
         return http_json(f"http://127.0.0.1:{self.args.pmd_http}{path}", timeout=2)
@@ -128,7 +238,8 @@ class Service:
                 pages.append(self.pmd(f"/v1/jobs/{int(job['job'])}/pages"))
             except (OSError, ValueError, KeyError):
                 pass  # the job ended between the two questions
-        return {"online": True, "peers": peers, "jobs": jobs, "ledger": ledger, "pages": pages}
+        return {"online": True, "peers": peers, "jobs": jobs, "ledger": ledger, "pages": pages,
+                "local": self.local_usage()}
 
     def pool_request(self, path, body):
         """Join or leave, passed to pmd with the marks it asks of its own dashboard."""
@@ -478,12 +589,23 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/cluster":
             self.reply(200, service.cluster())
         elif path == "/api/node":
-            self.reply(200, {**service.node(), "can_manage": self.is_local()})
+            answer = {**service.node(), "can_manage": self.is_local()}
+            if self.is_local():
+                answer["invite"] = {"code": service.invite_code(), "address": service.address(),
+                                    "access_code": service.code}
+            self.reply(200, answer)
         elif path == "/api/runs":
             self.reply(200, {"runs": service.recent()})
         elif path.startswith("/api/run/"):
             run = service.runs.get(path.rsplit("/", 1)[1])
             self.reply(200, service.public(run)) if run else self.reply(404, {"error": "no such run"})
+        elif path == "/node/invite":
+            given = bytes.fromhex(query.get("secret", "")) if re.fullmatch(r"[0-9a-f]{8}", query.get("secret", "")) else b""
+            if hmac.compare_digest(given, service.invite_secret()):
+                self.reply(200, {"token": service.token, "lead": service.lead()})
+            else:
+                time.sleep(1)  # four bytes: this is what makes guessing slow
+                self.reply(403, {"error": "not this pool's code"})
         elif path == "/node/log" and self.token_ok() and valid_id(query.get("job")):
             log = JOBS / query["job"] / "worker.log"
             self.reply(200, log.read_bytes()[-MAX_OUTPUT:] if log.exists() else b"", "text/plain")
@@ -528,6 +650,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             status, answer = service.pool_request(path.replace("/api/", "/v1/"), raw)
             self.reply(status, answer)
+        elif path == "/api/enter":
+            if not self.is_local() or self.headers.get("X-ParaMesh") != "1":
+                self.reply(403, {"error": "this works only on the machine itself"})
+                return
+            try:
+                request = json.loads(self.body(1024) or b"")
+                status, answer = service.enter(request["code"], int(request["cap_cores"]), int(request["cap_ram"]))
+            except (ValueError, KeyError, TypeError):
+                status, answer = 400, {"error": "send a code, cores and RAM"}
+            self.reply(status, answer)
         elif path.startswith("/api/stop/"):
             run = service.runs.get(path.rsplit("/", 1)[1])
             if not self.code_ok() or run is None:
@@ -565,6 +697,8 @@ def main():
     parser.add_argument("--code", help="the access code (default: a new one, printed at start)")
     parser.add_argument("--token", help="set the token the nodes share, and keep it")
     parser.add_argument("--pmd-http", type=int, default=47002)
+    parser.add_argument("--pmd-ports", help="control:discovery ports, if not the defaults")
+    parser.add_argument("--advertise", help="the address to put in invite codes (default: found)")
     parser.add_argument("--state-dir", default="~/.local/state/paramesh")
     parser.add_argument("--bin", default="/opt/paramesh/bin", help="where pm and pmrun are")
     parser.add_argument("--prefix", default="/opt/paramesh", help="where paramesh.h and the library are")
@@ -573,6 +707,7 @@ def main():
     args = parser.parse_args()
     server = ThreadingHTTPServer(("0.0.0.0" if args.public else "127.0.0.1", args.port), Handler)
     server.service = Service(args)
+    server.daemon_threads = True
     shutil.rmtree(JOBS, ignore_errors=True)  # what a killed server left
     print(f"ParaMesh site: http://127.0.0.1:{args.port}/", flush=True)
     if args.public:

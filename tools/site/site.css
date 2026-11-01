@@ -214,6 +214,13 @@ th.group, th.group:last-child { font-weight: 600; padding-top: 18px; text-align:
 .c-modified { background: var(--tan); }
 .c-shared { background: var(--sky); }
 .c-empty { background: var(--paper-deep); }
-@media (max-width: 800px) { .board-grid { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 800px) { .board-grid { grid-template-columns: minmax(0, 1fr); } .gauges { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .board .status { color: var(--ink-soft); }
 .note { font-size: 0.9rem; margin-top: 10px; max-width: 46em; }
+.invite-title { margin-top: 18px; }
+.invite-code { font-size: 1.15rem; font-weight: 500; letter-spacing: 0.04em; background: var(--paper-deep); border-radius: 10px; padding: 10px 12px; margin: 8px 0; user-select: all; word-break: break-all; }
+.gauges { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.gauge { background: var(--card); border-radius: 14px; box-shadow: var(--shadow); padding: 14px 16px; }
+.gauge span { display: block; font-size: 0.85rem; color: var(--ink-soft); }
+.gauge b { display: block; font: 600 1.35rem/1.3 var(--sans); font-variant-numeric: tabular-nums lining-nums; }
+.gauge svg { display: block; width: 100%; height: 40px; margin-top: 8px; }

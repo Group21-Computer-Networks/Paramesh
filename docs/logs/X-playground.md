@@ -61,6 +61,13 @@ and the next step.
   jobs first; the ledger's rule that nothing a peer reports counts. Two things differ from those
   decisions, by the person's choice: the server is Python, where the plan says C++ for tools, and
   Monaco and fonts come from a CDN, where the plan vendors third-party code.
+- At the person's request, a laptop can join just to give its cores: an invite code on a joined
+  node's dashboard, entered on the new laptop's. It brings the node token and the lead address.
+  It is a convenience, not a lock on the pool. The live view adds CPU and RAM for the machine and
+  for ParaMesh's job processes, from /proc, with the last 60 seconds. 10 more checks.
+- The new test found why discovery was one-way on the real laptops: `pmd` beacons to multicast and
+  its seeds only, so a node that found this one by address, across subnets, heard nothing back.
+  `pmd` now beacons to each new peer's source address too, on a list kept apart from job choice.
 - NOT tested: the real two laptops. The new `pmd` and server need installing on both, which needs
   the person's sudo. Running on 127.0.0.1, peers skip staging; POST /node/stage is unexercised.
 - Next: the person installs on both laptops and runs a two-node job.
@@ -75,7 +82,7 @@ Example:  - `src/net/epoll_loop.cpp` — epoll wrapper and timer wheel
 -->
 - `src/platform/sandbox.cpp` — the sandbox
 - `src/platform/sandbox.h` — the sandbox
-- `src/pmd/pmd.cpp` — sandboxes jobs, refuses requests from them
+- `src/pmd/pmd.cpp` — sandboxes jobs, refuses requests from them, answers new peers' beacons
 - `src/pmd/pmd.h` — `from_sandbox`
 - `src/tools/pmrun.cpp` — sandboxes the launcher
 - `src/tools/pm.cpp` — `pm sandbox`

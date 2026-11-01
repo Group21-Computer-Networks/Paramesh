@@ -90,10 +90,50 @@ function drawPeers(p) {
     cell(q.cap_cores, true), cell(q.jobs, true), cell(`${fixed(q.silent_ms / 1000, 1)} s`, true)]), "No peer heard.", 6);
 }
 
-function drawJobs(jobs) {
+const history = { cpu: [], ram: [], pcpu: [], pram: [], faults: [], net: [] };
+const mib = (bytes) => (bytes >= 1073741824 ? `${(bytes / 1073741824).toFixed(1)} GiB` : `${Math.round(bytes / 1048576)} MiB`);
+
+// One gauge: its figure, and a line of its last 60 readings against `top`, or their own highest.
+function gauge(name, value, label, top) {
+  $(`g-${name}`).textContent = label;
+  const line = history[name];
+  line.push(value);
+  if (line.length > 60) line.shift();
+  const most = top || Math.max(...line, 1);
+  const points = line.map((v, i) => `${(120 * (i + 60 - line.length)) / 59},${32 - (30 * v) / most}`).join(" ");
+  const first = (120 * (60 - line.length)) / 59;
+  $(`c-${name}`).innerHTML = `<polygon points="${first},34 ${points} 120,34" fill="#c3d8e8"/><polyline points="${points}" fill="none" stroke="#47698f" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`;
+}
+
+function drawLocal(local, jobs) {
+  if (!local) return;
+  const running = jobs.jobs || [];
+  const faults = running.reduce((n, x) => n + x.faults_per_s, 0);
+  const net = running.reduce((n, x) => n + x.mb_in_per_s + x.mb_out_per_s, 0);
+  gauge("cpu", local.cpu_percent ?? 0, local.cpu_percent === null ? "–" : `${fixed(local.cpu_percent, 0)}%`, 100);
+  gauge("ram", local.ram_used, `${fixed(local.ram_used / 1073741824, 1)} of ${fixed(local.ram_total / 1073741824, 1)} GiB`, local.ram_total);
+  gauge("pcpu", local.paramesh_cpu_percent, `${fixed(local.paramesh_cpu_percent, 0)}%`, 100 * local.cores);
+  gauge("pram", local.paramesh_rss, mib(local.paramesh_rss));
+  gauge("faults", faults, fixed(faults, 0));
+  gauge("net", net, `${fixed(net, 2)} MB/s`);
+}
+
+function drawInvite(node) {
+  const show = node.can_manage && node.peers.member === "joined" && node.invite;
+  $("invite").hidden = !show;
+  if (!show) return;
+  $("invite-code").textContent = node.invite.code;
+  $("access-line").hidden = !node.invite.access_code;
+  $("access-code").textContent = node.invite.access_code || "";
+}
+
+function drawJobs(jobs, local) {
+  const usage = (local && local.jobs) || {};
   rows($("jobs"), (jobs.jobs || []).map((x) => [cell(x.job), cell(x.role), cell(x.launcher, true), cell(x.slots, true),
+    cell(usage[x.job]?.cpu_percent == null ? "–" : `${fixed(usage[x.job].cpu_percent, 0)}%`, true),
+    cell(usage[x.job] ? mib(usage[x.job].rss_bytes) : "–", true),
     cell(fixed(x.faults_per_s, 1), true), cell(fixed(x.mb_in_per_s, 2), true), cell(fixed(x.mb_out_per_s, 2), true),
-    cell(x.fault_latency.p50_us, true), cell(x.fault_latency.p99_us, true)]), "No job on this node.", 9);
+    cell(x.fault_latency.p50_us, true), cell(x.fault_latency.p99_us, true)]), "No job on this node.", 11);
 }
 
 function drawPages(all) {
@@ -153,7 +193,9 @@ async function refresh() {
   drawMember(node.peers, node.can_manage);
   drawLedger(node.ledger);
   drawPeers(node.peers);
-  drawJobs(node.jobs);
+  drawJobs(node.jobs, node.local);
+  drawLocal(node.local, node.jobs);
+  drawInvite(node);
   drawPages(node.pages);
   drawMigration(node.peers, node.pages);
   $("status").textContent = `Updated ${new Date().toLocaleTimeString()}`;
@@ -182,7 +224,10 @@ async function ask(path, body, button, busy) {
 $("cores").addEventListener("input", () => { $("cores-out").textContent = `${$("cores").value} of ${$("cores").max}`; });
 $("join").addEventListener("submit", (event) => {
   event.preventDefault();
-  ask("/api/join", { cap_cores: Number($("cores").value), cap_ram: Number($("ram").value) * 1048576, lead: $("lead").value.trim() }, $("join-button"), "Joining");
+  const code = $("invite-in").value.trim();
+  const caps = { cap_cores: Number($("cores").value), cap_ram: Number($("ram").value) * 1048576 };
+  if (code) ask("/api/enter", { code, ...caps }, $("join-button"), "Joining");
+  else ask("/api/join", { ...caps, lead: $("lead").value.trim() }, $("join-button"), "Joining");
 });
 $("leave").addEventListener("click", () => ask("/api/leave", null, $("leave"), "Leaving"));
 refresh();

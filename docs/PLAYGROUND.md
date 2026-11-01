@@ -104,6 +104,24 @@ Anyone who can open the site can read this, addresses included. Join and Leave w
 machine itself: from a browser on `127.0.0.1` or `localhost`, with the `X-ParaMesh` header. A visitor
 on the LAN sees no buttons, and the server refuses the request if it is sent anyway.
 
+## Adding a laptop with an invite code
+
+A laptop can join only to give its cores and RAM. On a node in the pool, the dashboard shows an
+invite code. On the new laptop, open its own dashboard, enter the code, choose the cores and RAM,
+and press the button. Its server asks the inviter for the node token, keeps it, and joins with the
+inviter as its lead node. It can then receive and run other nodes' programs, and need run nothing.
+
+The code holds the inviter's address and port and four bytes derived from the token. It is a
+convenience, not a lock: `pmd` lets any node on the LAN join with or without it.
+
+The server must run on the new laptop too, with `--public`, so the others can send it programs.
+
+## What this machine is doing
+
+The dashboard also shows the machine's CPU and RAM, and the CPU and RAM of ParaMesh's job processes
+here, once a second for the last 60 seconds. They come from `/proc`: `/proc/stat`, `/proc/meminfo`,
+and each process with `PARAMESH_JOB_ID` in its environment. So jobs started with `pmrun` count too.
+
 ## API
 
 | Request | Meaning |
@@ -114,5 +132,6 @@ on the LAN sees no buttons, and the server refuses the request if it is sent any
 | `POST /api/stop/<id>` | Stops it. |
 | `GET /api/runs` | Past runs. |
 | `GET /api/node` | All the dashboard shows, and `can_manage`. `{"online": false}` without `pmd`. |
+| `POST /api/enter` | `{"code", "cap_cores", "cap_ram"}`: join with an invite code. From the machine itself. |
 | `POST /api/join`, `POST /api/leave` | Passed to `pmd`, as in docs/STATUS_API.md. 403 unless from the machine itself. |
 | `POST /node/stage`, `GET /node/log`, `POST /node/clean` | Between nodes, with `X-Token`. |

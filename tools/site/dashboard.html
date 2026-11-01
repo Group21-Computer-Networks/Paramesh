@@ -31,18 +31,25 @@
       <h3>Membership <span id="member" class="badge"></span></h3>
       <p class="soft" id="note"></p>
       <form id="join" hidden>
+        <label for="invite-in">Invite code from a node in the pool</label>
+        <input id="invite-in" placeholder="XXXX-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false" class="mono">
         <label for="cores">Cores to give: <b id="cores-out"></b></label>
         <input id="cores" type="range" min="1" step="1">
         <label for="ram">RAM to give, MB, of <span id="ram-max"></span></label>
         <input id="ram" type="number" min="1" step="1">
-        <label for="lead">Lead node, if your network has no multicast (optional)</label>
+        <label for="lead">Or, with no code, a node's address (optional)</label>
         <input id="lead" list="heard" placeholder="10.0.0.2" autocomplete="off">
         <datalist id="heard"></datalist>
-        <button class="button solid" id="join-button" type="submit">Join the pool</button>
+        <button class="button solid" id="join-button" type="submit">Give these to the pool</button>
       </form>
       <div id="joined" hidden>
         <p id="giving"></p>
         <button class="button" id="leave" type="button">Leave the pool</button>
+        <div id="invite" hidden>
+          <p class="soft invite-title">To add a laptop, give it this code. It only gives cores and RAM; it runs nothing of its own.</p>
+          <p class="invite-code mono" id="invite-code"></p>
+          <p class="soft" id="access-line" hidden>Playground access code: <span class="mono" id="access-code"></span></p>
+        </div>
       </div>
       <p class="soft" id="visitor" hidden>You are viewing this from another machine. Join and Leave work only on the node itself.</p>
       <p class="notice bad" id="ask-error" role="alert" hidden></p>
@@ -58,6 +65,17 @@
     </div>
   </div>
 
+  <h2>This machine now</h2>
+  <div class="gauges">
+    <div class="gauge"><span>Machine CPU</span><b id="g-cpu">–</b><svg id="c-cpu" viewBox="0 0 120 34" preserveAspectRatio="none" aria-hidden="true"></svg></div>
+    <div class="gauge"><span>Machine RAM</span><b id="g-ram">–</b><svg id="c-ram" viewBox="0 0 120 34" preserveAspectRatio="none" aria-hidden="true"></svg></div>
+    <div class="gauge"><span>ParaMesh CPU</span><b id="g-pcpu">–</b><svg id="c-pcpu" viewBox="0 0 120 34" preserveAspectRatio="none" aria-hidden="true"></svg></div>
+    <div class="gauge"><span>ParaMesh RAM</span><b id="g-pram">–</b><svg id="c-pram" viewBox="0 0 120 34" preserveAspectRatio="none" aria-hidden="true"></svg></div>
+    <div class="gauge"><span>Page faults a second</span><b id="g-faults">–</b><svg id="c-faults" viewBox="0 0 120 34" preserveAspectRatio="none" aria-hidden="true"></svg></div>
+    <div class="gauge"><span>Network, in + out</span><b id="g-net">–</b><svg id="c-net" viewBox="0 0 120 34" preserveAspectRatio="none" aria-hidden="true"></svg></div>
+  </div>
+  <p class="soft note">The last 60 seconds, since this page opened. CPU is 100% per core for ParaMesh, and the whole machine for Machine CPU. Network counts page data only.</p>
+
   <h2>Given and received, by node</h2>
   <div class="scroll"><table><thead><tr><th>Node</th><th class="n">Given</th><th class="n">Received</th><th class="n">Balance</th><th class="n">Weight</th><th class="n">Chunks for it</th><th class="n">Chunks by it</th><th>Its own account</th></tr></thead><tbody id="ledger"></tbody></table></div>
   <p class="soft note">Credit is valued at what the same work costs on this node. "Its own account" compares the peer's raw counts with this node's, to flag a disagreement. What a peer announces is never an input to a weight.</p>
@@ -67,7 +85,7 @@
   <div id="migration"></div>
 
   <h2>Jobs on this node</h2>
-  <div class="scroll"><table><thead><tr><th>Job</th><th>Role</th><th class="n">Launcher</th><th class="n">Slots</th><th class="n">Faults/s</th><th class="n">MB in/s</th><th class="n">MB out/s</th><th class="n">p50 µs</th><th class="n">p99 µs</th></tr></thead><tbody id="jobs"></tbody></table></div>
+  <div class="scroll"><table><thead><tr><th>Job</th><th>Role</th><th class="n">Launcher</th><th class="n">Slots</th><th class="n">CPU</th><th class="n">RAM</th><th class="n">Faults/s</th><th class="n">MB in/s</th><th class="n">MB out/s</th><th class="n">p50 µs</th><th class="n">p99 µs</th></tr></thead><tbody id="jobs"></tbody></table></div>
 
   <h2>Page ownership</h2>
   <div class="key"><span><i class="c-home"></i>home here</span><span><i class="c-modified"></i>held modified (M)</span><span><i class="c-shared"></i>held shared (S)</span><span><i class="c-empty"></i>neither</span></div>
