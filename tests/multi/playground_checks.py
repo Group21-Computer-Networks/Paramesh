@@ -159,4 +159,51 @@ begin = time.monotonic()
 while get("/api/node")["peers"]["member"] != "joined" and time.monotonic() - begin < 15:
     time.sleep(0.2)
 check("the node is back in the pool", get("/api/node")["peers"]["member"] == "joined")
+
+# A node that only gives its cores: it enters with an invite code, as the page does.
+node = get("/api/node")
+code = node["invite"]["code"]
+local = node["local"]
+check("this machine's use is real", 0 < local["ram_used"] < local["ram_total"] and local["cores"] > 0, local)
+other = "http://127.0.0.1:47082"
+def enter(code_given):
+    request = urllib.request.Request(other + "/api/enter", json.dumps({"code": code_given, "cap_cores": 1, "cap_ram": 128 << 20}).encode(), leave)
+    try:
+        with urllib.request.urlopen(request) as answer:
+            return answer.status
+    except urllib.error.HTTPError as answer:
+        return answer.code
+check("a mistyped code is refused", enter("nonsense") == 400)
+wrong = code[:-1] + ("A" if code[-1] != "A" else "B")
+check("a wrong code is refused", enter(wrong) == 403)
+with urllib.request.urlopen(other + "/api/node") as answer:
+    check("a refused code joins nothing", json.load(answer)["peers"]["member"] == "standby")
+check("the right code is accepted", enter(code.lower()) == 202)
+begin = time.monotonic()
+while time.monotonic() - begin < 15:
+    with urllib.request.urlopen(other + "/api/node") as answer:
+        third = json.load(answer)
+    if third["peers"]["member"] == "joined" and any(p["state"] == "alive" for p in third["peers"]["peers"]):
+        break
+    time.sleep(0.3)
+check("the node is in the pool, heard by others", third["peers"]["member"] == "joined" and third["peers"]["peers"], third["peers"])
+check("it took the pool's token", (Path(os.environ["STATE"]).parent / "3" / "playground.token").read_text() == (Path(os.environ["STATE"]) / "playground.token").read_text())
+begin = time.monotonic()
+while get("/api/cluster")["nodes"] != 3 and time.monotonic() - begin < 10:
+    time.sleep(0.3)
+check("the pool counts it", get("/api/cluster")["nodes"] == 3, get("/api/cluster"))
+status, started = post("/api/run", {"language": "c", "source": "#include <stdlib.h>\n#include <string.h>\nint main(void) { volatile char* big = malloc(32 << 20); memset((char*)big, 1, 32 << 20); for (;;) big[0]++; }", "nodes": 1})
+while get("/api/run/" + started["id"])["state"] != "running":
+    time.sleep(0.05)
+seen = {}
+measured = False
+for _ in range(30):
+    time.sleep(0.2)
+    seen = get("/api/node")["local"]
+    ours = [j for job, j in seen["jobs"].items() if int(job) >> 16 == 1]  # not another test's process
+    if any(j["rss_bytes"] > 16 << 20 and (j["cpu_percent"] or 0) > 30 for j in ours):
+        measured = True
+        break
+post("/api/stop/" + started["id"], {})
+check("a job's RAM and CPU are measured", measured, seen)
 sys.exit(1 if failures else 0)

@@ -6,24 +6,14 @@ standard library. The dashboard on port 47002 does not change.
 
 ## Running it
 
-The installer puts both under `/opt/paramesh`. A node needs `gcc` and `g++` to compile for the
-playground (`sudo apt install g++`), and Linux 6.7 or later for the sandbox. Join the pool first,
-then on every node:
+The installer puts both under `/opt/paramesh`, and runs the server on every node as a systemd user
+service, `paramesh-site`, open to the LAN. Allow TCP 47080 between the nodes. A node needs `g++` to
+compile for the playground (`sudo apt install g++`), and Linux 6.7 or later for the sandbox.
 
-```bash
-python3 /opt/paramesh/tools/playground/server.py --public
-```
-
-The first node prints an access code and a node token. Start the other nodes with that token, so
-they accept the program from it:
-
-```bash
-python3 /opt/paramesh/tools/playground/server.py --public --token THE_TOKEN
-```
-
-Then open `http://ADDRESS:47080/` on any machine of the LAN, or `http://127.0.0.1:47080/`. Run
-needs the access code; give it to the people you are supervising. Without `--public` the server
-answers on 127.0.0.1 only and asks for no code. Allow TCP 47080 between the nodes.
+Open `http://127.0.0.1:47080/dashboard` on the first node and join. It shows an invite code for the
+other nodes and the playground's access code; give that to the people you are supervising. The
+site is `http://ADDRESS:47080/` from any machine of the LAN. To keep it to one machine, stop the
+service and run `python3 /opt/paramesh/tools/playground/server.py`, which answers on 127.0.0.1 only.
 
 ## What a run does
 
@@ -104,6 +94,24 @@ Anyone who can open the site can read this, addresses included. Join and Leave w
 machine itself: from a browser on `127.0.0.1` or `localhost`, with the `X-ParaMesh` header. A visitor
 on the LAN sees no buttons, and the server refuses the request if it is sent anyway.
 
+## Adding a laptop with an invite code
+
+A laptop can join only to give its cores and RAM. On a node in the pool, the dashboard shows an
+invite code. On the new laptop, open its own dashboard, enter the code, choose the cores and RAM,
+and press the button. Its server asks the inviter for the node token, keeps it, and joins with the
+inviter as its lead node. It can then receive and run other nodes' programs, and need run nothing.
+
+The code holds the inviter's address and port and four bytes derived from the token. It is a
+convenience, not a lock: `pmd` lets any node on the LAN join with or without it.
+
+The installed service does the rest: it is how the other nodes send this laptop their programs.
+
+## What this machine is doing
+
+The dashboard also shows the machine's CPU and RAM, and the CPU and RAM of ParaMesh's job processes
+here, once a second for the last 60 seconds. They come from `/proc`: `/proc/stat`, `/proc/meminfo`,
+and each process with `PARAMESH_JOB_ID` in its environment. So jobs started with `pmrun` count too.
+
 ## API
 
 | Request | Meaning |
@@ -114,5 +122,6 @@ on the LAN sees no buttons, and the server refuses the request if it is sent any
 | `POST /api/stop/<id>` | Stops it. |
 | `GET /api/runs` | Past runs. |
 | `GET /api/node` | All the dashboard shows, and `can_manage`. `{"online": false}` without `pmd`. |
+| `POST /api/enter` | `{"code", "cap_cores", "cap_ram"}`: join with an invite code. From the machine itself. |
 | `POST /api/join`, `POST /api/leave` | Passed to `pmd`, as in docs/STATUS_API.md. 403 unless from the machine itself. |
 | `POST /node/stage`, `GET /node/log`, `POST /node/clean` | Between nodes, with `X-Token`. |
