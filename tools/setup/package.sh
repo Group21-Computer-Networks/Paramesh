@@ -22,11 +22,14 @@ mkdir -p "$stage"/{bin,lib/pkgconfig,include,apps,tools/dashboard,share/doc/para
 cp "$build/src/pmd/pmd" "$build/src/tools/pm" "$build/src/tools/pmrun" "$stage/bin/"
 cp "$root/include/paramesh.h" "$stage/include/"
 cp "$root/tools/dashboard/index.html" "$stage/tools/dashboard/"  # where pmd looks for it
+mkdir -p "$stage/tools/playground" "$stage/tools/site"  # the website and the C playground
+cp "$root/tools/playground/server.py" "$stage/tools/playground/"
+cp "$root"/tools/site/* "$stage/tools/site/"
 for app in "$build"/apps/*/; do
     name="$(basename "$app")"
     [ -x "$app/$name" ] && cp "$app/$name" "$stage/apps/"
 done
-cp "$root"/docs/API.md "$stage/share/doc/paramesh/" 2>/dev/null || true
+cp "$root"/docs/API.md "$root"/docs/PLAYGROUND.md "$stage/share/doc/paramesh/" 2>/dev/null || true
 
 # The library's eight archives, in link order, as one: -lparamesh.
 mri="CREATE $stage/lib/libparamesh.a"

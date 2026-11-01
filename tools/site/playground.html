@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Playground: ParaMesh</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&family=Young+Serif&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/site.css">
+</head>
+<body class="play">
+<header class="nav"><div class="wrap">
+  <a class="mark" href="/">ParaMesh</a>
+  <a href="/#top">Home</a>
+  <a href="/#how">How It Works</a>
+  <a href="/#architecture">Architecture</a>
+  <a href="/dashboard">Dashboard</a>
+  <a href="https://github.com/Group21-Computer-Networks/Paramesh">GitHub</a>
+  <span class="status"><i class="dot" id="dot"></i><span id="pool">Asking the pool</span></span>
+</div></header>
+
+<div class="toolbar">
+  <button class="button solid" id="run">Run Code</button>
+  <button class="button" id="stop" disabled>Stop</button>
+  <label>Nodes <select id="nodes"><option>1</option></select></label>
+  <label id="code-field" hidden>Access code <input id="code" autocomplete="off" spellcheck="false"></label>
+  <span class="spacer"></span>
+  <label>Example <select id="examples"></select></label>
+  <button class="button quiet" id="reset">Reset to example</button>
+  <button class="button quiet" id="clear">Clear</button>
+  <button class="button quiet" id="copy">Copy code</button>
+  <button class="button quiet" id="theme">Dark editor</button>
+</div>
+
+<main class="bench">
+  <div id="editor"></div>
+  <div class="results">
+    <div class="tabs" role="tablist">
+      <button role="tab" id="tab-output" aria-selected="true">Output</button>
+      <button role="tab" id="tab-analytics" aria-selected="false">Analytics</button>
+      <button role="tab" id="tab-history" aria-selected="false">Past runs</button>
+      <button class="icon" id="clear-output">Clear output</button>
+      <button class="icon" id="copy-output">Copy</button>
+      <button class="icon" id="download-output">Download</button>
+    </div>
+    <div class="pane" id="pane-output"></div>
+    <div class="pane" id="pane-analytics" hidden></div>
+    <div class="pane" id="pane-history" hidden></div>
+  </div>
+</main>
+<script src="/examples.js"></script>
+<script src="/playground.js"></script>
+</body>
+</html>

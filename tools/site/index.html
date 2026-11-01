@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ParaMesh: one program, multiple machines</title>
+<meta name="description" content="ParaMesh turns a few Linux laptops on a LAN into one computer for a C program, with shared memory kept coherent by page faults.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&family=Young+Serif&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/site.css">
+</head>
+<body>
+<header class="nav"><div class="wrap">
+  <a class="mark" href="/">ParaMesh</a>
+  <a href="#top">Home</a>
+  <a href="#how">How It Works</a>
+  <a href="#architecture">Architecture</a>
+  <a href="/dashboard">Dashboard</a>
+  <a href="https://github.com/Group21-Computer-Networks/Paramesh">GitHub</a>
+  <a class="button solid" href="/playground">Playground</a>
+</div></header>
+
+<main id="top">
+<div class="wrap hero">
+  <div>
+    <h1>One Program.<br>Multiple Machines.<br>Shared Memory.</h1>
+    <p class="lede">Turn a collection of Linux machines into a unified computing environment. Write ordinary C programs and let ParaMesh distribute computation across your network.</p>
+    <div class="actions">
+      <a class="button" href="#what">Explore ParaMesh</a>
+      <a class="button solid" href="/playground">Try the Playground</a>
+    </div>
+  </div>
+  <div>
+    <svg viewBox="0 0 560 470" role="img" aria-label="Two laptops, each holding copies of pages from one shared memory region between them">
+      <rect x="150" y="150" width="260" height="170" rx="16" fill="#14233f"/>
+      <g id="pages"></g>
+      <text x="280" y="346" text-anchor="middle" font-family="Instrument Sans, sans-serif" font-size="15" fill="#46546c">One shared region, in 4 KiB pages</text>
+      <g fill="none" stroke="#14233f" stroke-width="2.4">
+        <rect x="26" y="26" width="196" height="108" rx="10" fill="#fbf8f1"/><path d="M8 146h232l-12-12H20z" fill="#ebe3d3"/>
+        <rect x="338" y="26" width="196" height="108" rx="10" fill="#fbf8f1"/><path d="M320 146h232l-12-12H332z" fill="#ebe3d3"/>
+      </g>
+      <g font-family="IBM Plex Mono, monospace" font-size="12.5" fill="#14233f">
+        <text x="44" y="56">sum += a[i];</text><text x="44" y="78" fill="#47698f">page fault</text><text x="44" y="100" fill="#46546c">page 212 fetched</text>
+        <text x="356" y="56">a[j] = j * j;</text><text x="356" y="78" fill="#47698f">write fault</text><text x="356" y="100" fill="#46546c">page 84 held here</text>
+      </g>
+      <path d="M124 146 V235 H150 M436 146 V235 H410" fill="none" stroke="#a98a5c" stroke-width="2" stroke-dasharray="3 6"/>
+      <rect class="page-move" x="236" y="212" width="22" height="22" rx="4" fill="#c3d8e8" stroke="#14233f" stroke-width="1.5" style="--dx:-120px;--dy:-110px"/>
+      <rect class="page-move b" x="304" y="256" width="22" height="22" rx="4" fill="#e3d5bc" stroke="#14233f" stroke-width="1.5" style="--dx:130px;--dy:-152px"/>
+      <rect x="150" y="372" width="260" height="62" rx="12" fill="#ebe3d3"/>
+      <text x="280" y="399" text-anchor="middle" font-family="Instrument Sans, sans-serif" font-size="15" fill="#14233f">Tasks run on whichever laptop asks</text>
+      <text x="280" y="420" text-anchor="middle" font-family="Instrument Sans, sans-serif" font-size="13" fill="#46546c">pm_parallel_for()</text>
+    </svg>
+    <p class="figure-note">An illustration. The figures further down the page are live.</p>
+  </div>
+</div>
+
+<section id="what"><div class="wrap">
+  <div class="section-head">
+    <h2>What is ParaMesh?</h2>
+    <p>It makes separate laptops behave like one computer for your program. You write C as if all the memory were in one place, and ParaMesh moves the data for you.</p>
+  </div>
+  <div class="wall">
+    <article class="plate navy tall">
+      <svg viewBox="0 0 300 130" aria-hidden="true"><g fill="none" stroke="#c3d8e8" stroke-width="2"><rect x="8" y="12" width="118" height="106" rx="8"/><rect x="174" y="12" width="118" height="106" rx="8"/></g><path d="M126 65h48" stroke="#a98a5c" stroke-width="2" stroke-dasharray="3 6"/><g fill="#c3d8e8"><rect x="24" y="28" width="26" height="26" rx="4"/><rect x="58" y="28" width="26" height="26" rx="4" opacity=".4"/><rect x="24" y="62" width="26" height="26" rx="4" opacity=".4"/><rect x="190" y="28" width="26" height="26" rx="4" opacity=".4"/><rect x="224" y="62" width="26" height="26" rx="4"/></g></svg>
+      <h3>Distributed shared memory</h3>
+      <p>Every laptop sees the same addresses. If the page your program touches is on another machine, ParaMesh pauses that thread, fetches the page and carries on. Your code never mentions the network.</p>
+    </article>
+    <article class="plate sky">
+      <h3>Memory coherence</h3>
+      <p>Many laptops can read a page at once, but only one can write it. Before a write, the other copies are invalidated, so nobody reads stale data.</p>
+    </article>
+    <article class="plate">
+      <svg viewBox="0 0 300 92" aria-hidden="true"><g fill="#47698f"><rect y="4" width="74" height="22" rx="5"/><rect y="34" width="118" height="22" rx="5"/><rect y="64" width="54" height="22" rx="5"/></g><g fill="#a98a5c"><rect x="84" y="4" width="120" height="22" rx="5"/><rect x="128" y="34" width="70" height="22" rx="5"/><rect x="64" y="64" width="176" height="22" rx="5"/></g><g fill="#c3d8e8"><rect x="214" y="4" width="80" height="22" rx="5"/><rect x="208" y="34" width="86" height="22" rx="5"/><rect x="250" y="64" width="44" height="22" rx="5"/></g></svg>
+      <h3>Parallel task execution</h3>
+      <p>Split a loop into chunks and worker threads take them as they finish, so a faster laptop simply does more.</p>
+    </article>
+    <article class="plate tan">
+      <h3>Transparent communication</h3>
+      <p>There is no socket code in your program. The runtime catches page faults with <code>userfaultfd</code> and talks to the other laptops over TCP.</p>
+    </article>
+    <article class="plate">
+      <h3>Shared computing resources</h3>
+      <p>Each laptop chooses how many cores and how much RAM to give. Its own jobs come first on its own cores. A ledger values a peer's work at what the same work costs here, so nothing a peer claims counts.</p>
+    </article>
+  </div>
+</div></section>
+
+<section id="how"><div class="wrap">
+  <div class="section-head"><h2>How it works</h2></div>
+  <div class="steps">
+    <div class="step"><b>1</b><h3>Connect machines</h3><p>Linux laptops on one network join the same pool from their dashboards.</p></div>
+    <div class="step"><b>2</b><h3>Write a program</h3><p>Ordinary C, using the ParaMesh interface.</p><pre>#include &lt;paramesh.h&gt;
+PM_TASK(square) { ... }</pre></div>
+    <div class="step"><b>3</b><h3>Distribute computation</h3><p><code>pmrun -n N</code> uses this machine and the peers with the most free capacity. Tasks wait in a queue here, and each machine takes chunks.</p><pre>pm_parallel_for("square",
+  0, n, 0, &amp;a, sizeof a);</pre></div>
+    <div class="step"><b>4</b><h3>Access shared memory</h3><p>Every node reads and writes one coherent region. Pages move when they are needed.</p></div>
+    <div class="step"><b>5</b><h3>Obtain results</h3><p>The program finishes on the machine that started it, and prints its output.</p></div>
+  </div>
+</div></section>
+
+<section id="architecture"><div class="wrap">
+  <div class="section-head"><h2>Architecture</h2><p>The same program runs on every node. These are the parts, as they are in the code.</p></div>
+  <div class="arch">
+    <svg viewBox="0 0 760 500" role="img" aria-label="Two nodes. Each runs a daemon called pmd and a process of the same program, linked with the ParaMesh library. The launcher holds the task queue. Together they keep one shared region.">
+      <style>.t{font:15px "Instrument Sans",sans-serif;fill:#14233f}.s{font:12.5px "Instrument Sans",sans-serif;fill:#46546c}.m{font:12.5px "IBM Plex Mono",monospace;fill:#14233f}.b{fill:#fbf8f1;stroke:#14233f;stroke-width:1.6}.d{fill:none;stroke:#47698f;stroke-width:1.8}</style>
+      <rect x="24" y="24" width="340" height="356" rx="16" fill="#ebe3d3"/><rect x="396" y="24" width="340" height="356" rx="16" fill="#ebe3d3"/>
+      <text class="t" x="44" y="54">Node 1</text><text class="t" x="416" y="54">Node 2</text>
+      <rect class="b" x="44" y="70" width="300" height="214" rx="12"/><text class="t" x="60" y="96">Launcher process</text>
+      <rect class="b" x="416" y="70" width="300" height="214" rx="12"/><text class="t" x="432" y="96">Worker process</text>
+      <rect x="60" y="108" width="268" height="36" rx="8" fill="#c3d8e8"/><text class="t" x="74" y="131">Your application, main()</text>
+      <rect x="432" y="108" width="268" height="36" rx="8" fill="#c3d8e8"/><text class="t" x="446" y="131">The same program, its tasks</text>
+      <rect x="60" y="152" width="268" height="36" rx="8" fill="#e3d5bc"/><text class="m" x="74" y="175">paramesh.h, the API</text>
+      <rect x="432" y="152" width="268" height="36" rx="8" fill="#e3d5bc"/><text class="m" x="446" y="175">paramesh.h, the API</text>
+      <text class="s" x="60" y="212">Task scheduler: the queue of chunks; locks and barriers</text>
+      <text class="s" x="60" y="234">Coherence: node and home state machines</text>
+      <text class="s" x="60" y="256">Fault handler: userfaultfd</text>
+      <text class="s" x="432" y="212">Worker threads ask the launcher for chunks</text>
+      <text class="s" x="432" y="234">Coherence: node and home state machines</text>
+      <text class="s" x="432" y="256">Fault handler: userfaultfd</text>
+      <rect class="b" x="44" y="306" width="300" height="52" rx="12"/><text class="m" x="60" y="337">pmd</text><text class="s" x="100" y="337">daemon: pool, admission, ledger</text>
+      <rect class="b" x="416" y="306" width="300" height="52" rx="12"/><text class="m" x="432" y="337">pmd</text><text class="s" x="472" y="337">daemon: starts the worker</text>
+      <path class="d" d="M344 332h72"/><text class="s" x="380" y="325" text-anchor="middle">TCP</text>
+      <path class="d" d="M344 200h72"/><text class="s" x="380" y="193" text-anchor="middle">TCP</text>
+      <text class="s" x="380" y="218" text-anchor="middle">pages</text><text class="s" x="380" y="350" text-anchor="middle">control</text>
+      <rect x="24" y="404" width="712" height="72" rx="16" fill="#14233f"/>
+      <text x="380" y="434" text-anchor="middle" font-family="Instrument Sans,sans-serif" font-size="16" fill="#f5f0e6">Shared-memory region</text>
+      <text x="380" y="458" text-anchor="middle" font-family="Instrument Sans,sans-serif" font-size="13" fill="#c9d3e0">The same addresses on every node, in 2 MiB segments, each with a home node</text>
+    </svg>
+    <dl>
+      <dt><code>pmrun</code></dt><dd>Starts the launcher and asks the local <code>pmd</code> for N nodes.</dd>
+      <dt><code>pmd</code></dt><dd>One daemon on each machine. It finds the other daemons, admits jobs and picks the peers with the most free capacity, each of which may decline. It starts the worker processes.</dd>
+      <dt>Launcher and workers</dt><dd>The same executable. <code>main()</code> runs on the launcher, which also holds the task queue and manages locks and barriers. Tasks run everywhere.</dd>
+      <dt>Coherence</dt><dd>Each page has a home node that tracks who holds it and hands out read or write access.</dd>
+      <dt>Lost nodes</dt><dd>If a node disappears the job ends with a message. ParaMesh never makes up the lost data.</dd>
+    </dl>
+  </div>
+</div></section>
+
+<section id="cluster"><div class="wrap"><div class="live">
+  <div class="live-head"><h2>The pool right now</h2><span class="status"><i class="dot" id="dot"></i><span id="state">Asking this node's daemon</span></span><a class="button on-navy" href="/dashboard">Open the dashboard</a></div>
+  <dl class="counts" id="counts">
+    <div><dt>Connected nodes</dt><dd id="c-nodes">–</dd></div>
+    <div><dt>Total cores given</dt><dd id="c-cores">–</dd></div>
+    <div><dt>Free cores on peers</dt><dd id="c-free">–</dd></div>
+    <div><dt>Active jobs here</dt><dd id="c-jobs">–</dd></div>
+  </dl>
+</div></div></section>
+</main>
+
+<footer><div class="wrap">
+  <span>ParaMesh, by Group 21, a computer networks project.</span>
+  <nav>
+    <a href="https://github.com/Group21-Computer-Networks/Paramesh">GitHub</a>
+    <a href="https://github.com/Group21-Computer-Networks/Paramesh/blob/main/docs/API.md">Documentation</a>
+    <a href="/playground">Playground</a>
+    <a href="/dashboard">Dashboard</a>
+  </nav>
+</div></footer>
+<script src="/home.js"></script>
+</body>
+</html>
