@@ -63,6 +63,7 @@ enum class Opcode : std::uint8_t {
     kSegMigrate = 0x70,
     kSegMigrateDone = 0x71,
     kLeaveDone = 0x72,
+    kRehomeHint = 0x73,
     kLRegister = 0x80,
     kLAdmitReq = 0x81,
     kLAdmitOk = 0x82,

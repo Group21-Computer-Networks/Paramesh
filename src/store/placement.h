@@ -7,6 +7,7 @@
 #include "platform/ids.h"
 #include "platform/result.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 
@@ -28,6 +29,12 @@ struct PlacementMember {
 // Errc::kInvalidArgument if no member has a weight above 0.
 Result<void> store_place_segments(std::span<const PlacementMember> members, std::span<Slot> homes,
                                   std::span<const NodeId> keep = {});
+
+// True if slot `to` may be made home for one segment more (X-rehome): it stays within twice the
+// even share of `homes` among `members`. A hint comes from another node, so it can move a
+// segment, never a weight, and this bound is what stops hints from gathering the homes on a node.
+[[nodiscard]] bool store_may_rehome(std::span<const Slot> homes, Slot to,
+                                    std::size_t members) noexcept;
 
 }  // namespace paramesh
 

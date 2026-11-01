@@ -597,6 +597,14 @@ TEST_CASE("the leave payloads: REDIRECT, LEAVE_INTENT, L_LEAVE, SEG_MIGRATE and 
     CHECK(paramesh::wire_decode_seg_migrate_done(hex("00 00 00 05")).value().segment ==
           paramesh::SegmentId{5});
     CHECK(encoded(paramesh::LeaveDonePayload{12}) == hex("00 00 00 0C"));
+    const auto hint =
+        encoded(paramesh::RehomeHintPayload{paramesh::SegmentId{5}, paramesh::NodeId{3}});
+    CHECK(hint == hex("00 00 00 05 00 03 00 00"));
+    const auto hint_back = paramesh::wire_decode_rehome_hint(hint);
+    REQUIRE(hint_back.ok());
+    CHECK(hint_back.value().segment.value == 5);
+    CHECK(hint_back.value().node.value == 3);
+    CHECK(!paramesh::wire_decode_rehome_hint(std::span{hint}.first(7)).ok());
     CHECK(paramesh::wire_decode_leave_done(hex("00 00 00 0C")).value().segments == 12);
     CHECK(encoded(paramesh::LLeaveReqPayload{true}) == hex("01 00 00 00"));
     CHECK(paramesh::wire_decode_l_leave_req(hex("01 00 00 00")).value().force);

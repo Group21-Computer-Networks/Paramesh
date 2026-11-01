@@ -41,7 +41,7 @@ constexpr std::array kOpcodes = {
     Opcode::kLAdmitRefused, Opcode::kLChunk,       Opcode::kLSegments,    Opcode::kLJobEnd,
     Opcode::kLQuota,        Opcode::kLLeave,       Opcode::kLAbort,       Opcode::kLLeaveIntent,
     Opcode::kLMember,       Opcode::kLRunReq,      Opcode::kLRunOk,       Opcode::kLRunRefused,
-    Opcode::kLLeaveReq,     Opcode::kLLeaveReply,  Opcode::kLStats,
+    Opcode::kLLeaveReq,     Opcode::kLLeaveReply,  Opcode::kLStats,       Opcode::kRehomeHint,
 };
 
 // Appends big-endian values to a buffer. Writing past the end is remembered, not done.
@@ -1084,6 +1084,26 @@ Result<std::size_t> wire_encode(const LeaveDonePayload& payload, std::span<std::
 Result<LeaveDonePayload> wire_decode_leave_done(std::span<const std::byte> in) {
     Reader r{in};
     const LeaveDonePayload payload{static_cast<std::uint32_t>(r.get(4))};
+    if (!r.exact()) {
+        return kMalformed;
+    }
+    return payload;
+}
+
+Result<std::size_t> wire_encode(const RehomeHintPayload& payload, std::span<std::byte> out) {
+    Writer w{out};
+    w.put(payload.segment.value, 4);
+    w.put(payload.node.value, 2);
+    w.put(0, 2);  // reserved
+    return w.done();
+}
+
+Result<RehomeHintPayload> wire_decode_rehome_hint(std::span<const std::byte> in) {
+    Reader r{in};
+    RehomeHintPayload payload;
+    payload.segment = SegmentId{static_cast<std::uint32_t>(r.get(4))};
+    payload.node = NodeId{static_cast<std::uint16_t>(r.get(2))};
+    r.get(2);  // reserved
     if (!r.exact()) {
         return kMalformed;
     }

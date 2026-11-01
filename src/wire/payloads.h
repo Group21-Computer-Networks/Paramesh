@@ -319,6 +319,11 @@ struct SegMigrateDonePayload {
 struct LeaveDonePayload {
     std::uint32_t segments = 0;
 };
+// REHOME_HINT: the node that uses a segment most, and may take it.
+struct RehomeHintPayload {
+    SegmentId segment;
+    NodeId node;
+};
 // L_LEAVE_REQ, from `pm leave`. L_LEAVE_REPLY has the layout of SPAWN_DECLINE.
 struct LLeaveReqPayload {
     bool force = false;
@@ -402,6 +407,7 @@ Result<std::size_t> wire_encode(const LLeavePayload& payload, std::span<std::byt
 Result<std::size_t> wire_encode(const SegMigratePayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const SegMigrateDonePayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const LeaveDonePayload& payload, std::span<std::byte> out);
+Result<std::size_t> wire_encode(const RehomeHintPayload& payload, std::span<std::byte> out);
 Result<std::size_t> wire_encode(const LLeaveReqPayload& payload, std::span<std::byte> out);
 Result<RedirectPayload> wire_decode_redirect(std::span<const std::byte> in);
 Result<LeaveIntentPayload> wire_decode_leave_intent(std::span<const std::byte> in);
@@ -420,6 +426,7 @@ Result<LLeavePayload> wire_decode_l_leave(std::span<const std::byte> in);
 Result<SegMigratePayload> wire_decode_seg_migrate(std::span<const std::byte> in);
 Result<SegMigrateDonePayload> wire_decode_seg_migrate_done(std::span<const std::byte> in);
 Result<LeaveDonePayload> wire_decode_leave_done(std::span<const std::byte> in);
+Result<RehomeHintPayload> wire_decode_rehome_hint(std::span<const std::byte> in);
 Result<LLeaveReqPayload> wire_decode_l_leave_req(std::span<const std::byte> in);
 Result<LAdmitRefusedPayload> wire_decode_l_admit_refused(std::span<const std::byte> in);
 Result<LRegisterPayload> wire_decode_l_register(std::span<const std::byte> in);

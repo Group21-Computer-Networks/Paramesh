@@ -119,6 +119,12 @@ struct Settings {
     // PARAMESH_CFG_THRASH_THRESHOLD sets the count; 0 turns the window off.
     HomeConfig thrash{8, std::chrono::milliseconds{100}, std::chrono::milliseconds{1},
                       std::chrono::milliseconds{64}, true};
+    // X-rehome. rehome.period_ms: how often a home looks at who uses its segments; 0, the
+    // default, turns it off. A segment moves if one other node made rehome.min_requests of
+    // its requests and rehome.share percent of them in that time.
+    Nanos rehome_period{};
+    std::uint64_t rehome_min_requests = 256;
+    std::uint64_t rehome_share = 60;
 };
 
 // "127.0.0.1:47100" -> endpoint. False if it is not that.
@@ -143,6 +149,18 @@ const char* env(const char* name) {
 }
 
 // task.*, thrash.hold_initial, thrash.hold_max and cache.* from PARAMESH_CFG_*.
+void read_rehome(Settings& s) {
+    if (const char* period = env("PARAMESH_CFG_REHOME_PERIOD_MS")) {
+        s.rehome_period = std::chrono::milliseconds{std::strtol(period, nullptr, 10)};
+    }
+    if (const char* requests = env("PARAMESH_CFG_REHOME_MIN_REQUESTS")) {
+        s.rehome_min_requests = std::strtoull(requests, nullptr, 10);
+    }
+    if (const char* share = env("PARAMESH_CFG_REHOME_SHARE")) {
+        s.rehome_share = std::strtoull(share, nullptr, 10);
+    }
+}
+
 void read_waits_and_grain(Settings& s) {
     if (const char* policy = env("PARAMESH_CFG_CACHE_POLICY");
         policy != nullptr && std::string_view{policy} == "cost") {
@@ -266,6 +284,7 @@ bool read_settings(Settings& s) {
             static_cast<std::uint8_t>(std::min(2UL, std::strtoul(affinity, nullptr, 10)));
     }
     read_waits_and_grain(s);
+    read_rehome(s);
     if (socket != nullptr) {
         s.pmd_socket = socket;
         // Any address, a port the system chooses. The launcher is the first member: a worker
@@ -1434,6 +1453,9 @@ private:
         }
         early_leavers_.clear();
         on_network_thread([this] { try_join(); });  // a node offered while the job started
+        if (s_.rehome_period > Nanos{}) {
+            on_network_thread([this] { after(s_.rehome_period, [this] { rehome_tick(); }); });
+        }
         if (pmd_fd_ >= 0) {
             on_network_thread([this] { send_stats(); });  // and then once a second
         }
@@ -1472,6 +1494,10 @@ private:
             abort_job(Status::kInternal, kNoNode, "cannot place the segments");
             return;
         }
+        if (rehome_) {
+            map.homes[rehome_->first] = rehome_->second;
+            rehome_.reset();
+        }
         acks_ = 0;
         dropping_ = drop;
         apply_map(Epoch{epoch_.value + 1}, map);
@@ -1494,6 +1520,7 @@ private:
             up_if_room();
             return;
         }
+        rehoming_ = false;
         if (join_sent_) {  // the newest map names the node that joined: it may take chunks
             platform_.logger->log(LogLevel::kInfo, "member_joined",
                                   JsonObject{{"node", JsonValue{std::int64_t{joining_.value}}}});
@@ -1990,6 +2017,71 @@ private:
                 {"latency", JsonValue{std::move(latency)}}});
     }
 
+    // ---- moving a segment to the node that uses it (X-rehome) -----------------------------
+
+    // Every rehome.period_ms, as a home: the segment one other node uses most, if it uses it
+    // enough, is offered to that node. One at a time, and none while a segment is moving.
+    // ponytail: one segment a period, and no memory of past moves: a pattern that changes every
+    // period moves a segment every period. A cooldown per segment if that shows up.
+    void rehome_tick() noexcept {
+        after(s_.rehome_period, [this] { rehome_tick(); });
+        auto counts = std::exchange(requests_seen_, {});
+        if (std::any_of(seg_.begin(), seg_.end(),
+                        [](Seg seg) { return seg == Seg::kFrozen || seg == Seg::kArriving; })) {
+            return;
+        }
+        RehomeHintPayload best{SegmentId{0}, kNoNode};
+        std::uint64_t most = 0;
+        for (const auto& [segment, by_node] : counts) {
+            std::uint64_t total = 0;
+            for (const auto& [node, count] : by_node) {
+                total += count;
+            }
+            for (const auto& [node, count] : by_node) {
+                if (node != s_.self.value && count >= s_.rehome_min_requests &&
+                    count * 100 >= total * s_.rehome_share && count > most &&
+                    seg_.at(segment) == Seg::kServing) {
+                    most = count;
+                    best = RehomeHintPayload{SegmentId{segment}, NodeId{node}};
+                }
+            }
+        }
+        if (best.node != kNoNode) {
+            std::array<std::byte, 8> hint{};
+            static_cast<void>(wire_encode(best, hint));
+            post(best.node, Opcode::kRehomeHint, hint);
+        }
+    }
+
+    // REHOME_HINT, from the home to the node it names, which passes it to the launcher if it
+    // has room (a segment it could not hold would stop the move and end the job), and from
+    // there to the launcher, which moves the segment if nothing has changed.
+    void rehome_hint(const FrameHeader& header, const RehomeHintPayload& hint,
+                     std::span<const std::byte> payload) noexcept {
+        if (header.src != hint.node) {
+            const auto homed =
+                static_cast<std::uint64_t>(std::count(homes_.begin(), homes_.end(), my_slot_));
+            if (ram_ == 0 || (homed + 1) * kSegmentSize <= ram_ - cache_bytes_ + spill_) {
+                post(s_.members.front().node, Opcode::kRehomeHint, payload);
+            }
+            return;
+        }
+        const NodeId from = slot_node_.at(homes_[hint.segment.value].value);
+        const auto slot = slots_.find(hint.node.value);
+        if (!up_ || rehoming_ || !leavers_.empty() || joining_ != kNoNode || from == hint.node ||
+            slot == slots_.end() || no_homes_.contains(hint.node.value) ||
+            !store_may_rehome(homes_, slot->second, s_.members.size())) {
+            return;  // a hint is only that: the next period sends another
+        }
+        rehoming_ = true;
+        rehome_ = std::pair{hint.segment.value, slot->second};
+        platform_.logger->log(LogLevel::kInfo, "segment_rehomed",
+                              JsonObject{{"segment", JsonValue{std::int64_t{hint.segment.value}}},
+                                         {"from", JsonValue{std::int64_t{from.value}}},
+                                         {"to", JsonValue{std::int64_t{hint.node.value}}}});
+        send_map(kNoNode, false);
+    }
+
     // The frames of maps, of segments on the move and of leaving. True if it was one of them.
     template <typename Bad>
     bool handle_map_or_move(const FrameHeader& header, std::span<const std::byte> payload,
@@ -2041,6 +2133,17 @@ private:
                     return true;
                 }
                 segment_gone(done.value().segment);
+                return true;
+            }
+            case Opcode::kRehomeHint: {
+                const Result<RehomeHintPayload> hint = wire_decode_rehome_hint(payload);
+                if (!hint.ok() || hint.value().segment.value >= seg_.size() ||
+                    (header.src == hint.value().node ? !is_launcher()
+                                                     : hint.value().node != s_.self)) {
+                    bad();
+                    return true;
+                }
+                rehome_hint(header, hint.value(), payload);
                 return true;
             }
             case Opcode::kLeaveDone: {
@@ -2477,6 +2580,9 @@ private:
                 return;
             }
         }
+        if (s_.rehome_period > Nanos{} && request && kind != HomeEventKind::kWriteback) {
+            requests_seen_[segment][header.src.value]++;
+        }
         HomeEvent event;
         event.kind = kind;
         event.page = page;
@@ -2791,7 +2897,13 @@ private:
     std::deque<SegMapMember> joiners_;               // launcher: spawned for it, not yet members
     std::unordered_set<std::uint16_t> no_homes_;     // launcher: members that joined mid-run
     NodeId joining_ = kNoNode;                       // launcher: the one joining now
-    bool join_sent_ = false;                         // and the map naming it is out
+    // X-rehome: requests by segment and node since the last look; launcher: the move the next
+    // map makes, and whether that map is still being acknowledged.
+    std::unordered_map<std::uint32_t, std::unordered_map<std::uint16_t, std::uint64_t>>
+        requests_seen_;
+    std::optional<std::pair<std::uint32_t, Slot>> rehome_;
+    bool rehoming_ = false;
+    bool join_sent_ = false;        // and the map naming it is out
     bool leave_early_ = false;      // this process was told to leave before it was up
     bool dropping_ = false;         // launcher: the map without it is out
     bool leaving_ = false;          // this process is leaving

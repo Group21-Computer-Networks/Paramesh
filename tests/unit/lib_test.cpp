@@ -1056,6 +1056,31 @@ TEST_CASE("the hold window: a read-write fight costs far fewer page transfers wi
     ::unsetenv("PARAMESH_CFG_TASK_PREFETCH");
 }
 
+TEST_CASE("a segment two other nodes fight over moves to one of them, and no write is lost" *
+          doctest::skip(!can_run())) {
+    // Hold window off, so the requests go on; a low bar, since one of two has half of them.
+    for (const auto& [name, value] : {std::pair{"PARAMESH_CFG_TASK_AFFINITY", "0"},
+                                      std::pair{"PARAMESH_CFG_TASK_PREFETCH", "0"},
+                                      std::pair{"PARAMESH_CFG_THRASH_THRESHOLD", "0"},
+                                      std::pair{"PARAMESH_CFG_REHOME_MIN_REQUESTS", "16"},
+                                      std::pair{"PARAMESH_CFG_REHOME_SHARE", "40"}}) {
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): no other thread of this process is running
+        ::setenv(name, value, 1);
+    }
+    std::string on_log;
+    std::string off_log;
+    CHECK(page_transfers("PARAMESH_CFG_REHOME_PERIOD_MS=20", read_fight_program, &on_log) > 0);
+    CHECK(page_transfers("PARAMESH_CFG_REHOME_PERIOD_MS=0", read_fight_program, &off_log) > 0);
+    for (const char* name : {"PARAMESH_CFG_TASK_AFFINITY", "PARAMESH_CFG_TASK_PREFETCH",
+                             "PARAMESH_CFG_THRASH_THRESHOLD", "PARAMESH_CFG_REHOME_MIN_REQUESTS",
+                             "PARAMESH_CFG_REHOME_SHARE"}) {
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): as above
+        ::unsetenv(name);
+    }
+    CHECK(on_log.find("\"event\":\"segment_rehomed\"") != std::string::npos);
+    CHECK(off_log.find("\"event\":\"segment_rehomed\"") == std::string::npos);
+}
+
 // ---- the prefetcher (X-prefetch) ----------------------------------------------------------------
 
 using Pages = std::vector<std::uint64_t>;

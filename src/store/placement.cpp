@@ -4,6 +4,7 @@
 
 #include "store/placement.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -74,6 +75,15 @@ Result<void> store_place_segments(std::span<const PlacementMember> members, std:
         load[best]++;
     }
     return {};
+}
+
+bool store_may_rehome(std::span<const Slot> homes, Slot to, std::size_t members) noexcept {
+    if (members == 0) {
+        return false;
+    }
+    const auto homed = static_cast<std::size_t>(
+        std::count_if(homes.begin(), homes.end(), [to](Slot home) { return home == to; }));
+    return homed + 1 <= 2 * ((homes.size() + members - 1) / members);
 }
 
 }  // namespace paramesh
