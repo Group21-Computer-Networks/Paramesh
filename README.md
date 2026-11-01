@@ -8,6 +8,9 @@ fault handler, with no socket code in the application.
 the pool from the dashboard, write and run a program, every function of `paramesh.h`. To give
 others an installer, run `tools/setup/package.sh` and share the one file it writes.
 
+**Seeing it:** [`docs/PLAYGROUND.md`](docs/PLAYGROUND.md): the website and the C playground, what
+a run does, and what its sandbox does not stop.
+
 **How it is built** (for contributors):
 
 - Plan and task cards: [`docs/PLAN.md`](docs/PLAN.md)

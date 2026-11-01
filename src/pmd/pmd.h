@@ -106,6 +106,7 @@ public:
     void leave() const noexcept;
 
 private:
+    static bool from_sandbox(int fd);
     struct Connection {
         std::uint64_t id = 0;
         int fd = -1;

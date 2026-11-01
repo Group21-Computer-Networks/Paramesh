@@ -1,8 +1,10 @@
 #include "pmd/pmd.h"
 
 #include "net/frame_io.h"
+#include "platform/sandbox.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -552,8 +554,27 @@ bool Pmd::read_from(Connection& connection) {
     return true;
 }
 
+// True if the other end of a local connection is a playground job: it may take part in its own
+// job, but must not ask for one, which would run outside the sandbox, or make the node leave.
+bool Pmd::from_sandbox(int fd) {
+    ucred peer{};
+    socklen_t size = sizeof peer;
+    std::error_code ignored;
+    return ::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &size) == 0 &&
+           sandbox_path(
+               std::filesystem::read_symlink("/proc/" + std::to_string(peer.pid) + "/exe", ignored)
+                   .string());
+}
+
 void Pmd::handle(Connection& connection, const FrameHeader& header,
                  std::span<const std::byte> payload) {
+    if (connection.local &&
+        (header.opcode == Opcode::kLRunReq || header.opcode == Opcode::kLLeaveReq) &&
+        from_sandbox(connection.fd)) {
+        reply(connection.id, Opcode::kLRunRefused, JobId{0}, kNoNode, kNoReq,
+              StatusTextPayload{Status::kDeclined, "a playground job may not do that"});
+        return;
+    }
     if (!connection.local && header.opcode == Opcode::kSpawnReq) {
         on_spawn_req(connection, header, payload);
     } else if (!connection.local &&
@@ -657,6 +678,14 @@ void Pmd::on_spawn_req(Connection& connection, const FrameHeader& header,
     environment.push_back("PARAMESH_PMD_SOCKET=" + socket_path_);
     environment.push_back("PARAMESH_LAUNCHER=" + dotted(request.launcher_addr) + ":" +
                           std::to_string(request.launcher_port));
+    // A playground job: its output, with its job_pages line, goes to a log beside it for the
+    // playground to collect, and it runs confined (X-playground). Fails closed.
+    const bool sandboxed = sandbox_path(request.path);
+    const std::string directory = request.path.substr(0, request.path.rfind('/'));
+    if (sandboxed) {
+        environment.emplace_back("PARAMESH_CFG_LOG_LEVEL=info");
+        environment.push_back("PARAMESH_CFG_SPILL_DIR=" + directory);
+    }
     std::vector<char*> argv;
     std::vector<char*> envp;
     argv.reserve(arguments.size() + 1);
@@ -670,8 +699,16 @@ void Pmd::on_spawn_req(Connection& connection, const FrameHeader& header,
     argv.push_back(nullptr);
     envp.push_back(nullptr);
 
+    const std::string log = directory + "/worker.log";
     spawn.pid = ::fork();
     if (spawn.pid == 0) {
+        if (sandboxed) {
+            const int out = ::open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+            if (out < 0 || ::dup2(out, STDOUT_FILENO) < 0 || ::dup2(out, STDERR_FILENO) < 0 ||
+                !sandbox_enter(directory.c_str(), SandboxProfile::kJob)) {
+                ::_exit(126);
+            }
+        }
         if (request.cwd.empty() || ::chdir(request.cwd.c_str()) == 0) {
             ::execve(request.path.c_str(), argv.data(), envp.data());
         }
