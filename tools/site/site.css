@@ -256,8 +256,6 @@ th.group, th.group:last-child { font-weight: 600; padding-top: 18px; text-align:
 @keyframes rise { from { transform: translateY(105%); } }
 .moves .reveal { opacity: 0; transform: translateY(20px); transition: opacity 0.7s var(--ease) var(--wait, 0ms), transform 0.8s var(--ease) var(--wait, 0ms); }
 .moves .reveal.in { opacity: 1; transform: none; }
-.moves .arch .d { stroke-dasharray: 72; stroke-dashoffset: 72; transition: stroke-dashoffset 0.9s var(--ease) 0.4s; }
-.moves .arch.in .d { stroke-dashoffset: 0; }
 .stream, .kpi, .notice { animation: arrive 0.35s var(--ease) both; }
 @keyframes arrive { from { opacity: 0; transform: translateY(6px); } }
 .tabs button { transition: background 0.2s, color 0.2s; }
@@ -267,4 +265,35 @@ th.group, th.group:last-child { font-weight: 600; padding-top: 18px; text-align:
   .rise > span > span, .stream, .kpi, .notice { animation: none; }
   .gauge { transition: none; }
   @view-transition { navigation: none; }
+}
+
+/* the interactive architecture */
+.arch-map { min-width: 0; }
+.arch-stories { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.arch-stories[hidden], .arch-panel[hidden], .arch-controls[hidden], .arch-side dl[hidden] { display: none; }
+.arch-stories button { font: inherit; font-size: 0.95rem; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 999px; padding: 7px 15px; cursor: pointer; transition: background 0.2s, color 0.2s, border-color 0.2s; }
+.arch-stories button:hover { border-color: var(--ink); }
+.arch-stories button[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--card); }
+.arch .part { cursor: pointer; outline: none; transition: opacity 0.35s var(--ease); }
+.arch .part > rect { transition: filter 0.25s, stroke-width 0.25s; }
+.arch .part:hover > rect:first-child, .arch .part:focus-visible > rect:first-child { filter: brightness(0.93); }
+.arch .part:focus-visible > rect:first-child { stroke: #a88a5e; stroke-width: 3; }
+.arch .part.dim { opacity: 0.42; }
+.arch .part.lit > rect:first-child { stroke: #a88a5e; stroke-width: 2.5; }
+.arch .frame.lit > rect:first-child { stroke: #a88a5e; }
+#arch-packet { pointer-events: none; transition: transform 0.9s var(--ease), opacity 0.3s; filter: drop-shadow(0 0 5px rgba(168, 138, 94, 0.9)); }
+.arch .link { stroke-dasharray: 5 6; animation: flow 1.4s linear infinite; }
+@keyframes flow { to { stroke-dashoffset: -22; } }
+.tile-page { transition: fill 0.4s; }
+.tile-page.hot { fill: #e0b872; }
+.arch-panel { background: var(--card); border-radius: var(--radius); padding: 24px; min-height: 220px; }
+.arch-kicker { color: var(--blue); font-size: 0.9rem; margin: 0 0 6px; }
+.arch-panel h3 { font-size: 1.5rem; margin: 0 0 8px; }
+.arch-panel #arch-text { color: var(--ink-soft); margin: 0; }
+.arch-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+.arch-controls button { cursor: pointer; font: inherit; padding: 8px 18px; }
+.arch-controls button:disabled { opacity: 0.4; cursor: default; }
+@media (prefers-reduced-motion: reduce) {
+  #arch-packet { transition: none; }
+  .arch .link { animation: none; }
 }

@@ -52,6 +52,7 @@ PAGES = {
     "/dashboard": ("dashboard.html", "text/html; charset=utf-8"),
     "/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
     "/site.css": ("site.css", "text/css; charset=utf-8"),
+    "/arch.js": ("arch.js", "text/javascript; charset=utf-8"),
     "/home.js": ("home.js", "text/javascript; charset=utf-8"),
     "/playground.js": ("playground.js", "text/javascript; charset=utf-8"),
     "/examples.js": ("examples.js", "text/javascript; charset=utf-8"),

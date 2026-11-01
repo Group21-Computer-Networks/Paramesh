@@ -78,6 +78,9 @@ and the next step.
   `cmake --build --preset tidy --target pmd` printed `[7/7] Linking CXX executable src/pmd/pmd`.
 - At the person's request, motion: the headline rises, the hero's code types itself, content rises as
   it scrolls in, the live figures count up to their real value, pages fade. Off under reduced motion.
+- At the person's request, the architecture is interactive: every part can be chosen, and five stories
+  walk a packet through a job's start, a task, a page fetch, a write and a lost node. `arch.js` added.
+  Checked in the browser at 1280x800 and 375 wide: stories play, no sideways scroll. Without the script the list stays.
 - NOT tested: the real two laptops. The new `pmd` and server need installing on both, which needs
   the person's sudo. Running on 127.0.0.1, peers skip staging; POST /node/stage is unexercised.
 - Next: the person installs on both laptops and runs a two-node job.
