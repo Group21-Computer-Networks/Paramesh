@@ -50,6 +50,11 @@ and the next step.
 - At the person's request: the comment on `log_level()` in `src/pmd/main.cpp` said the job
   processes default to `info`. They default to `warn`. Comment only, so no build beyond CI's.
 
+### 2026-11-02 — session (fix): an unexplained failure in CI
+
+- CI on this fix failed once in `pmd_test`, which a comment cannot cause: see docs/TODO.md. The
+  person chose to add it there and re-run. 16 local runs of the test passed.
+
 ## Files touched
 
 <!--
@@ -111,4 +116,4 @@ Documents only, so no build. Every key in `src/` and `tools/` is now in a table,
 <!--
 Anything left undone, each also added to docs/TODO.md in this same pull request. "None" if nothing.
 -->
-None
+- An unexplained `pmd_test` failure in CI. In docs/TODO.md.
