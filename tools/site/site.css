@@ -246,3 +246,25 @@ th.group, th.group:last-child { font-weight: 600; padding-top: 18px; text-align:
 .tile h3 { font-size: 1.35rem; }
 .tile p { color: var(--ink-soft); font-size: 1rem; margin-top: 6px; }
 @media (prefers-reduced-motion: reduce) { .frame svg { transition: none; } }
+
+/* motion: one rise for the headline, one for what scrolls in, and a fade between pages */
+@view-transition { navigation: auto; }
+.rise > span { display: block; overflow: hidden; padding-bottom: 0.08em; }
+.rise > span > span { display: block; animation: rise 0.9s var(--ease) both; }
+.rise > span:nth-child(2) > span { animation-delay: 0.12s; }
+.rise > span:nth-child(3) > span { animation-delay: 0.24s; }
+@keyframes rise { from { transform: translateY(105%); } }
+.moves .reveal { opacity: 0; transform: translateY(20px); transition: opacity 0.7s var(--ease) var(--wait, 0ms), transform 0.8s var(--ease) var(--wait, 0ms); }
+.moves .reveal.in { opacity: 1; transform: none; }
+.moves .arch .d { stroke-dasharray: 72; stroke-dashoffset: 72; transition: stroke-dashoffset 0.9s var(--ease) 0.4s; }
+.moves .arch.in .d { stroke-dashoffset: 0; }
+.stream, .kpi, .notice { animation: arrive 0.35s var(--ease) both; }
+@keyframes arrive { from { opacity: 0; transform: translateY(6px); } }
+.tabs button { transition: background 0.2s, color 0.2s; }
+.gauge { transition: transform 0.4s var(--ease); }
+.gauge:hover { transform: translateY(-2px); }
+@media (prefers-reduced-motion: reduce) {
+  .rise > span > span, .stream, .kpi, .notice { animation: none; }
+  .gauge { transition: none; }
+  @view-transition { navigation: none; }
+}

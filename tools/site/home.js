@@ -16,6 +16,67 @@ for (let row = 0; row < 5; row++) {
 
 const shown = (id, value) => { document.getElementById(id).textContent = value; };
 
+const calm = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+// A live figure runs up to its value the first time, and changes plainly after that.
+const counted = new Set();
+function count(id, value) {
+  if (calm || counted.has(id) || !value) {
+    counted.add(id);
+    shown(id, value);
+    return;
+  }
+  counted.add(id);
+  const begin = performance.now();
+  const step = (now) => {
+    const done = Math.min(1, (now - begin) / 700);
+    shown(id, Math.round(value * (1 - (1 - done) ** 3)));
+    if (done < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+// The code on the laptops types itself, line after line, a laptop at a time.
+function typeOut() {
+  if (calm) return;
+  const lines = [...document.querySelectorAll("text.type")];
+  const words = lines.map((line) => line.textContent);
+  lines.forEach((line) => { line.textContent = ""; });
+  let at = 0;
+  let letter = 0;
+  const next = () => {
+    if (at === lines.length) return;
+    letter += 1;
+    lines[at].textContent = words[at].slice(0, letter);
+    const finished = letter === words[at].length;
+    if (finished) {
+      at += 1;
+      letter = 0;
+    }
+    setTimeout(next, finished ? 240 : 34);
+  };
+  setTimeout(next, 500);
+}
+typeOut();
+
+// What comes into view rises into place. Without this script everything simply shows.
+if (!calm && "IntersectionObserver" in window) {
+  document.documentElement.classList.add("moves");
+  const watcher = new IntersectionObserver((seen) => {
+    for (const entry of seen) {
+      if (entry.isIntersecting) {
+        entry.target.classList.add("in");
+        watcher.unobserve(entry.target);
+      }
+    }
+  }, { threshold: 0.15 });
+  document.querySelectorAll(".tile, .step, .arch, .live").forEach((item, index) => {
+    item.classList.add("reveal");
+    item.style.setProperty("--wait", `${(index % 3) * 90}ms`);
+    watcher.observe(item);
+  });
+}
+
 async function refresh() {
   let cluster = { online: false };
   try {
@@ -29,10 +90,10 @@ async function refresh() {
     return;
   }
   shown("state", cluster.member === "joined" ? `Live from node ${cluster.node}` : `Node ${cluster.node} has not joined the pool`);
-  shown("c-nodes", cluster.nodes);
-  shown("c-cores", cluster.cores);
-  shown("c-free", cluster.free_cores);
-  shown("c-jobs", cluster.jobs);
+  count("c-nodes", cluster.nodes);
+  count("c-cores", cluster.cores);
+  count("c-free", cluster.free_cores);
+  count("c-jobs", cluster.jobs);
 }
 refresh();
 setInterval(refresh, 3000);
