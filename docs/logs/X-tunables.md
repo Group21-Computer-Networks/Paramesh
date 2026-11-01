@@ -45,6 +45,16 @@ and the next step.
   and `info` for `pmd`, as `src/lib/job.cpp` and `src/pmd/main.cpp` do, and row 21 of the Changes table says what `COMPRESSED` means since X-page-encoding. The
   TODO.md wording about row 21 is gone. The `spill.budget` row stays open.
 
+### 2026-11-01 — session (fix): a comment in pmd
+
+- At the person's request: the comment on `log_level()` in `src/pmd/main.cpp` said the job
+  processes default to `info`. They default to `warn`. Comment only, so no build beyond CI's.
+
+### 2026-11-02 — session (fix): an unexplained failure in CI
+
+- CI on this fix failed once in `pmd_test`, which a comment cannot cause: see docs/TODO.md. The
+  person chose to add it there and re-run. 16 local runs of the test passed.
+
 ## Files touched
 
 <!--
@@ -55,6 +65,7 @@ Example:  - `src/net/epoll_loop.cpp` — epoll wrapper and timer wheel
 -->
 - `docs/PLAN.md` — the second Tunables table
 - `docs/TODO.md` — rows that asked for it
+- `src/pmd/main.cpp` — (fix) a comment
 
 ## Decisions
 
@@ -105,4 +116,4 @@ Documents only, so no build. Every key in `src/` and `tools/` is now in a table,
 <!--
 Anything left undone, each also added to docs/TODO.md in this same pull request. "None" if nothing.
 -->
-None
+- An unexplained `pmd_test` failure in CI. In docs/TODO.md.
