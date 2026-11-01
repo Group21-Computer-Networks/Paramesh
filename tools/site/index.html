@@ -7,7 +7,7 @@
 <meta name="description" content="ParaMesh turns a few Linux laptops on a LAN into one computer for a C program, with shared memory kept coherent by page faults.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&family=Young+Serif&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Karla:wght@400;500;600;700&family=Prata&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/site.css">
 </head>
 <body>
@@ -24,7 +24,7 @@
 <main id="top">
 <div class="wrap hero">
   <div>
-    <h1>One Program.<br>Multiple Machines.<br>Shared Memory.</h1>
+    <h1 class="rise"><span><span>One Program.</span></span><span><span>Multiple Machines.</span></span><span><span>Shared Memory.</span></span></h1>
     <p class="lede">Turn a collection of Linux machines into a unified computing environment. Write ordinary C programs and let ParaMesh distribute computation across your network.</p>
     <div class="actions">
       <a class="button" href="#what">Explore ParaMesh</a>
@@ -33,56 +33,54 @@
   </div>
   <div>
     <svg viewBox="0 0 560 470" role="img" aria-label="Two laptops, each holding copies of pages from one shared memory region between them">
-      <rect x="150" y="150" width="260" height="170" rx="16" fill="#14233f"/>
+      <rect x="150" y="150" width="260" height="170" rx="16" fill="#1e3550"/>
       <g id="pages"></g>
-      <text x="280" y="346" text-anchor="middle" font-family="Instrument Sans, sans-serif" font-size="15" fill="#46546c">One shared region, in 4 KiB pages</text>
-      <g fill="none" stroke="#14233f" stroke-width="2.4">
-        <rect x="26" y="26" width="196" height="108" rx="10" fill="#fbf8f1"/><path d="M8 146h232l-12-12H20z" fill="#ebe3d3"/>
-        <rect x="338" y="26" width="196" height="108" rx="10" fill="#fbf8f1"/><path d="M320 146h232l-12-12H332z" fill="#ebe3d3"/>
+      <text x="280" y="346" text-anchor="middle" font-family="Karla, sans-serif" font-size="15" fill="#4f5a57">One shared region, in 4 KiB pages</text>
+      <g fill="none" stroke="#1e3550" stroke-width="2.4">
+        <rect x="26" y="26" width="196" height="108" rx="10" fill="#fbf7ee"/><path d="M8 146h232l-12-12H20z" fill="#ece3d0"/>
+        <rect x="338" y="26" width="196" height="108" rx="10" fill="#fbf7ee"/><path d="M320 146h232l-12-12H332z" fill="#ece3d0"/>
       </g>
-      <g font-family="IBM Plex Mono, monospace" font-size="12.5" fill="#14233f">
-        <text x="44" y="56">sum += a[i];</text><text x="44" y="78" fill="#47698f">page fault</text><text x="44" y="100" fill="#46546c">page 212 fetched</text>
-        <text x="356" y="56">a[j] = j * j;</text><text x="356" y="78" fill="#47698f">write fault</text><text x="356" y="100" fill="#46546c">page 84 held here</text>
+      <g font-family="IBM Plex Mono, monospace" font-size="12.5" fill="#1e3550">
+        <text class="type" x="44" y="56">sum += a[i];</text><text class="type" x="44" y="78" fill="#3f6386">page fault</text><text class="type" x="44" y="100" fill="#4f5a57">page 212 fetched</text>
+        <text class="type" x="356" y="56">a[j] = j * j;</text><text class="type" x="356" y="78" fill="#3f6386">write fault</text><text class="type" x="356" y="100" fill="#4f5a57">page 84 held here</text>
       </g>
-      <path d="M124 146 V235 H150 M436 146 V235 H410" fill="none" stroke="#a98a5c" stroke-width="2" stroke-dasharray="3 6"/>
-      <rect class="page-move" x="236" y="212" width="22" height="22" rx="4" fill="#c3d8e8" stroke="#14233f" stroke-width="1.5" style="--dx:-120px;--dy:-110px"/>
-      <rect class="page-move b" x="304" y="256" width="22" height="22" rx="4" fill="#e3d5bc" stroke="#14233f" stroke-width="1.5" style="--dx:130px;--dy:-152px"/>
-      <rect x="150" y="372" width="260" height="62" rx="12" fill="#ebe3d3"/>
-      <text x="280" y="399" text-anchor="middle" font-family="Instrument Sans, sans-serif" font-size="15" fill="#14233f">Tasks run on whichever laptop asks</text>
-      <text x="280" y="420" text-anchor="middle" font-family="Instrument Sans, sans-serif" font-size="13" fill="#46546c">pm_parallel_for()</text>
+      <path d="M124 146 V235 H150 M436 146 V235 H410" fill="none" stroke="#a88a5e" stroke-width="2" stroke-dasharray="3 6"/>
+      <rect class="page-move" x="236" y="212" width="22" height="22" rx="4" fill="#c8d8e2" stroke="#1e3550" stroke-width="1.5" style="--dx:-120px;--dy:-110px"/>
+      <rect class="page-move b" x="304" y="256" width="22" height="22" rx="4" fill="#e6d9c1" stroke="#1e3550" stroke-width="1.5" style="--dx:130px;--dy:-152px"/>
+      <rect x="150" y="372" width="260" height="62" rx="12" fill="#ece3d0"/>
+      <text x="280" y="399" text-anchor="middle" font-family="Karla, sans-serif" font-size="15" fill="#1e3550">Tasks run on whichever laptop asks</text>
+      <text x="280" y="420" text-anchor="middle" font-family="Karla, sans-serif" font-size="13" fill="#4f5a57">pm_parallel_for()</text>
     </svg>
     <p class="figure-note">An illustration. The figures further down the page are live.</p>
   </div>
 </div>
 
 <section id="what"><div class="wrap">
-  <div class="section-head">
+  <div class="section-head centred">
     <h2>What is ParaMesh?</h2>
     <p>It makes separate laptops behave like one computer for your program. You write C as if all the memory were in one place, and ParaMesh moves the data for you.</p>
   </div>
   <div class="wall">
-    <article class="plate navy tall">
-      <svg viewBox="0 0 300 130" aria-hidden="true"><g fill="none" stroke="#c3d8e8" stroke-width="2"><rect x="8" y="12" width="118" height="106" rx="8"/><rect x="174" y="12" width="118" height="106" rx="8"/></g><path d="M126 65h48" stroke="#a98a5c" stroke-width="2" stroke-dasharray="3 6"/><g fill="#c3d8e8"><rect x="24" y="28" width="26" height="26" rx="4"/><rect x="58" y="28" width="26" height="26" rx="4" opacity=".4"/><rect x="24" y="62" width="26" height="26" rx="4" opacity=".4"/><rect x="190" y="28" width="26" height="26" rx="4" opacity=".4"/><rect x="224" y="62" width="26" height="26" rx="4"/></g></svg>
-      <h3>Distributed shared memory</h3>
-      <p>Every laptop sees the same addresses. If the page your program touches is on another machine, ParaMesh pauses that thread, fetches the page and carries on. Your code never mentions the network.</p>
-    </article>
-    <article class="plate sky">
-      <h3>Memory coherence</h3>
-      <p>Many laptops can read a page at once, but only one can write it. Before a write, the other copies are invalidated, so nobody reads stale data.</p>
-    </article>
-    <article class="plate">
-      <svg viewBox="0 0 300 92" aria-hidden="true"><g fill="#47698f"><rect y="4" width="74" height="22" rx="5"/><rect y="34" width="118" height="22" rx="5"/><rect y="64" width="54" height="22" rx="5"/></g><g fill="#a98a5c"><rect x="84" y="4" width="120" height="22" rx="5"/><rect x="128" y="34" width="70" height="22" rx="5"/><rect x="64" y="64" width="176" height="22" rx="5"/></g><g fill="#c3d8e8"><rect x="214" y="4" width="80" height="22" rx="5"/><rect x="208" y="34" width="86" height="22" rx="5"/><rect x="250" y="64" width="44" height="22" rx="5"/></g></svg>
-      <h3>Parallel task execution</h3>
-      <p>Split a loop into chunks and worker threads take them as they finish, so a faster laptop simply does more.</p>
-    </article>
-    <article class="plate tan">
-      <h3>Transparent communication</h3>
-      <p>There is no socket code in your program. The runtime catches page faults with <code>userfaultfd</code> and talks to the other laptops over TCP.</p>
-    </article>
-    <article class="plate">
-      <h3>Shared computing resources</h3>
-      <p>Each laptop chooses how many cores and how much RAM to give. Its own jobs come first on its own cores. A ledger values a peer's work at what the same work costs here, so nothing a peer claims counts.</p>
-    </article>
+    <figure class="tile">
+      <div class="frame navy"><svg viewBox="0 0 300 300" aria-hidden="true"><g fill="none" stroke="#c8d8e2" stroke-width="2"><rect x="24" y="74" width="112" height="152" rx="8"/><rect x="164" y="74" width="112" height="152" rx="8"/></g><path d="M136 150h28" stroke="#a88a5e" stroke-width="2" stroke-dasharray="3 6"/><g fill="#c8d8e2"><rect x="42" y="94" width="30" height="30" rx="3"/><rect x="82" y="94" width="30" height="30" rx="3" opacity=".35"/><rect x="42" y="134" width="30" height="30" rx="3" opacity=".35"/><rect x="82" y="134" width="30" height="30" rx="3"/><rect x="42" y="174" width="30" height="30" rx="3" opacity=".35"/><rect x="182" y="94" width="30" height="30" rx="3" opacity=".35"/><rect x="222" y="134" width="30" height="30" rx="3"/><rect x="182" y="174" width="30" height="30" rx="3"/></g></svg></div>
+      <figcaption><h3>Distributed shared memory</h3><p>Every laptop sees the same addresses. If a page is on another machine, ParaMesh pauses that thread, fetches it and carries on. Your code never mentions the network.</p></figcaption>
+    </figure>
+    <figure class="tile">
+      <div class="frame short tan"><svg viewBox="0 0 300 150" aria-hidden="true"><g fill="#3f6386"><rect x="20" y="30" width="62" height="20" rx="3"/><rect x="20" y="64" width="108" height="20" rx="3"/><rect x="20" y="98" width="44" height="20" rx="3"/></g><g fill="#5f6b38"><rect x="90" y="30" width="110" height="20" rx="3"/><rect x="136" y="64" width="62" height="20" rx="3"/><rect x="72" y="98" width="150" height="20" rx="3"/></g><g fill="#fbf7ee"><rect x="208" y="30" width="72" height="20" rx="3"/><rect x="206" y="64" width="74" height="20" rx="3"/><rect x="230" y="98" width="50" height="20" rx="3"/></g></svg></div>
+      <figcaption><h3>Parallel task execution</h3><p>Split a loop into chunks. Worker threads take them as they finish, so a faster laptop simply does more.</p></figcaption>
+    </figure>
+    <figure class="tile">
+      <div class="frame olive"><svg viewBox="0 0 300 260" aria-hidden="true"><rect x="118" y="26" width="64" height="64" rx="4" fill="#f4eee1"/><text x="150" y="66" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="20" fill="#49532b">W</text><g fill="none" stroke="#dde0c4" stroke-width="2"><rect x="30" y="172" width="64" height="64" rx="4"/><rect x="118" y="172" width="64" height="64" rx="4"/><rect x="206" y="172" width="64" height="64" rx="4"/></g><g stroke="#dde0c4" stroke-width="2" stroke-dasharray="3 6"><path d="M130 90 62 172M150 90v82M170 90l68 82"/></g><g font-family="IBM Plex Mono, monospace" font-size="15" fill="#dde0c4" text-anchor="middle"><text x="62" y="210">stale</text><text x="150" y="210">stale</text><text x="238" y="210">stale</text></g></svg></div>
+      <figcaption><h3>Memory coherence</h3><p>Many laptops can read a page, but only one can write it. Before a write, the other copies are invalidated, so nobody reads stale data.</p></figcaption>
+    </figure>
+    <figure class="tile">
+      <div class="frame short sky"><svg viewBox="0 0 300 150" aria-hidden="true"><g font-family="IBM Plex Mono, monospace" font-size="15" fill="#1e3550"><text x="28" y="48">a[i] = 1;</text><text x="28" y="78" opacity=".55">// no sockets</text><text x="28" y="108" opacity=".55">// no messages</text></g><path d="M196 74h76" stroke="#1e3550" stroke-width="2" stroke-dasharray="3 6"/><rect x="178" y="56" width="36" height="36" rx="3" fill="#1e3550"/></svg></div>
+      <figcaption><h3>Transparent communication</h3><p>There is no socket code in your program. The runtime catches page faults with <code>userfaultfd</code> and talks to the other laptops over TCP.</p></figcaption>
+    </figure>
+    <figure class="tile">
+      <div class="frame paper"><svg viewBox="0 0 300 230" aria-hidden="true"><g fill="#3f6386"><rect x="40" y="110" width="44" height="90" rx="3"/><rect x="128" y="60" width="44" height="140" rx="3"/><rect x="216" y="130" width="44" height="70" rx="3"/></g><g fill="#a88a5e"><rect x="40" y="70" width="44" height="34" rx="3"/><rect x="128" y="30" width="44" height="24" rx="3"/><rect x="216" y="84" width="44" height="40" rx="3"/></g></svg></div>
+      <figcaption><h3>Shared computing resources</h3><p>Each laptop chooses the cores and RAM it gives, and its own jobs come first. A ledger values a peer's work at what it costs here, so nothing a peer claims counts.</p></figcaption>
+    </figure>
   </div>
 </div></section>
 
@@ -103,15 +101,15 @@ PM_TASK(square) { ... }</pre></div>
   <div class="section-head"><h2>Architecture</h2><p>The same program runs on every node. These are the parts, as they are in the code.</p></div>
   <div class="arch">
     <svg viewBox="0 0 760 500" role="img" aria-label="Two nodes. Each runs a daemon called pmd and a process of the same program, linked with the ParaMesh library. The launcher holds the task queue. Together they keep one shared region.">
-      <style>.t{font:15px "Instrument Sans",sans-serif;fill:#14233f}.s{font:12.5px "Instrument Sans",sans-serif;fill:#46546c}.m{font:12.5px "IBM Plex Mono",monospace;fill:#14233f}.b{fill:#fbf8f1;stroke:#14233f;stroke-width:1.6}.d{fill:none;stroke:#47698f;stroke-width:1.8}</style>
-      <rect x="24" y="24" width="340" height="356" rx="16" fill="#ebe3d3"/><rect x="396" y="24" width="340" height="356" rx="16" fill="#ebe3d3"/>
+      <style>.t{font:15px "Karla",sans-serif;fill:#1e3550}.s{font:12.5px "Karla",sans-serif;fill:#4f5a57}.m{font:12.5px "IBM Plex Mono",monospace;fill:#1e3550}.b{fill:#fbf7ee;stroke:#1e3550;stroke-width:1.6}.d{fill:none;stroke:#3f6386;stroke-width:1.8}</style>
+      <rect x="24" y="24" width="340" height="356" rx="16" fill="#ece3d0"/><rect x="396" y="24" width="340" height="356" rx="16" fill="#ece3d0"/>
       <text class="t" x="44" y="54">Node 1</text><text class="t" x="416" y="54">Node 2</text>
       <rect class="b" x="44" y="70" width="300" height="214" rx="12"/><text class="t" x="60" y="96">Launcher process</text>
       <rect class="b" x="416" y="70" width="300" height="214" rx="12"/><text class="t" x="432" y="96">Worker process</text>
-      <rect x="60" y="108" width="268" height="36" rx="8" fill="#c3d8e8"/><text class="t" x="74" y="131">Your application, main()</text>
-      <rect x="432" y="108" width="268" height="36" rx="8" fill="#c3d8e8"/><text class="t" x="446" y="131">The same program, its tasks</text>
-      <rect x="60" y="152" width="268" height="36" rx="8" fill="#e3d5bc"/><text class="m" x="74" y="175">paramesh.h, the API</text>
-      <rect x="432" y="152" width="268" height="36" rx="8" fill="#e3d5bc"/><text class="m" x="446" y="175">paramesh.h, the API</text>
+      <rect x="60" y="108" width="268" height="36" rx="8" fill="#c8d8e2"/><text class="t" x="74" y="131">Your application, main()</text>
+      <rect x="432" y="108" width="268" height="36" rx="8" fill="#c8d8e2"/><text class="t" x="446" y="131">The same program, its tasks</text>
+      <rect x="60" y="152" width="268" height="36" rx="8" fill="#e6d9c1"/><text class="m" x="74" y="175">paramesh.h, the API</text>
+      <rect x="432" y="152" width="268" height="36" rx="8" fill="#e6d9c1"/><text class="m" x="446" y="175">paramesh.h, the API</text>
       <text class="s" x="60" y="212">Task scheduler: the queue of chunks; locks and barriers</text>
       <text class="s" x="60" y="234">Coherence: node and home state machines</text>
       <text class="s" x="60" y="256">Fault handler: userfaultfd</text>
@@ -123,9 +121,9 @@ PM_TASK(square) { ... }</pre></div>
       <path class="d" d="M344 332h72"/><text class="s" x="380" y="325" text-anchor="middle">TCP</text>
       <path class="d" d="M344 200h72"/><text class="s" x="380" y="193" text-anchor="middle">TCP</text>
       <text class="s" x="380" y="218" text-anchor="middle">pages</text><text class="s" x="380" y="350" text-anchor="middle">control</text>
-      <rect x="24" y="404" width="712" height="72" rx="16" fill="#14233f"/>
-      <text x="380" y="434" text-anchor="middle" font-family="Instrument Sans,sans-serif" font-size="16" fill="#f5f0e6">Shared-memory region</text>
-      <text x="380" y="458" text-anchor="middle" font-family="Instrument Sans,sans-serif" font-size="13" fill="#c9d3e0">The same addresses on every node, in 2 MiB segments, each with a home node</text>
+      <rect x="24" y="404" width="712" height="72" rx="16" fill="#1e3550"/>
+      <text x="380" y="434" text-anchor="middle" font-family="Karla,sans-serif" font-size="16" fill="#f4eee1">Shared-memory region</text>
+      <text x="380" y="458" text-anchor="middle" font-family="Karla,sans-serif" font-size="13" fill="#cdd8dd">The same addresses on every node, in 2 MiB segments, each with a home node</text>
     </svg>
     <dl>
       <dt><code>pmrun</code></dt><dd>Starts the launcher and asks the local <code>pmd</code> for N nodes.</dd>

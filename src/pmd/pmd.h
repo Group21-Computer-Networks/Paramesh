@@ -107,6 +107,9 @@ public:
 
 private:
     static bool from_sandbox(int fd);
+    static constexpr std::size_t kMaxAnswered = 64;
+    void answer_beacons(std::uint32_t address, std::uint16_t port);
+    std::vector<std::pair<std::uint32_t, std::uint16_t>> answered_;  // address and port heard from
     struct Connection {
         std::uint64_t id = 0;
         int fd = -1;

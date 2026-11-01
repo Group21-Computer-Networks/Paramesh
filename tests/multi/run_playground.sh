@@ -15,7 +15,7 @@ cleanup() {
     rm -rf "$work"
 }
 trap cleanup EXIT
-mkdir -p "$work/1" "$work/2" "$work/prefix/lib" "$work/prefix/include"
+mkdir -p "$work/1" "$work/2" "$work/3" "$work/prefix/lib" "$work/prefix/include"
 cp include/paramesh.h "$work/prefix/include/"
 {
     echo "CREATE $work/prefix/lib/libparamesh.a"
@@ -29,6 +29,9 @@ cp include/paramesh.h "$work/prefix/include/"
     --http-port 47212 --state-dir "$work/2" --cap-cores 2 --cap-ram 512M \
     --peers 127.0.0.1:47201:47200 >"$work/pmd2.log" 2>&1 &
 daemons+=($!)
+"$build/src/pmd/pmd" --node-id 3 --no-multicast --control-port 47221 --discovery-port 47220 \
+    --http-port 47222 --state-dir "$work/3" --standby >"$work/pmd3.log" 2>&1 &
+daemons+=($!)
 "$build/src/pmd/pmd" --node-id 1 --no-multicast --control-port 47201 --discovery-port 47200 \
     --http-port 47202 --state-dir "$work/1" --cap-cores 2 --cap-ram 512M \
     --peers 127.0.0.1:47211:47210 >"$work/pmd1.log" 2>&1 &
@@ -36,7 +39,10 @@ daemons+=($!)
 sleep 3
 python3 tools/playground/server.py --port 47081 --pmd-http 47202 --state-dir "$work/1" \
     --bin "$build/src/tools" --prefix "$work/prefix" --timeout 4 --code letmein --public \
-    >"$work/site.log" 2>&1 &
+    --advertise 127.0.0.1 --pmd-ports 47201:47200 >"$work/site.log" 2>&1 &
+daemons+=($!)
+python3 tools/playground/server.py --port 47082 --pmd-http 47222 --state-dir "$work/3" \
+    --bin "$build/src/tools" --prefix "$work/prefix" >"$work/site3.log" 2>&1 &
 daemons+=($!)
 sleep 2
 export PMRUN="$build/src/tools/pmrun" STATE="$work/1"
