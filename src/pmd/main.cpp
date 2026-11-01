@@ -43,7 +43,7 @@ sigset_t stop_signals() {
     return set;
 }
 
-// log.level, as the job processes take it: info unless set.
+// log.level: info unless set. A job process defaults to warn.
 paramesh::LogLevel log_level() {
     const char* set = std::getenv("PARAMESH_CFG_LOG_LEVEL");  // NOLINT(concurrency-mt-unsafe)
     const std::string_view name = set != nullptr ? set : "info";

@@ -45,6 +45,11 @@ and the next step.
   and `info` for `pmd`, as `src/lib/job.cpp` and `src/pmd/main.cpp` do, and row 21 of the Changes table says what `COMPRESSED` means since X-page-encoding. The
   TODO.md wording about row 21 is gone. The `spill.budget` row stays open.
 
+### 2026-11-01 — session (fix): a comment in pmd
+
+- At the person's request: the comment on `log_level()` in `src/pmd/main.cpp` said the job
+  processes default to `info`. They default to `warn`. Comment only, so no build beyond CI's.
+
 ## Files touched
 
 <!--
@@ -55,6 +60,7 @@ Example:  - `src/net/epoll_loop.cpp` — epoll wrapper and timer wheel
 -->
 - `docs/PLAN.md` — the second Tunables table
 - `docs/TODO.md` — rows that asked for it
+- `src/pmd/main.cpp` — (fix) a comment
 
 ## Decisions
 
