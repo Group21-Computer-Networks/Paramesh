@@ -55,6 +55,18 @@ and the next step.
 - CI on this fix failed once in `pmd_test`, which a comment cannot cause: see docs/TODO.md. The
   person chose to add it there and re-run. 16 local runs of the test passed.
 
+### 2026-11-02 — session (fix): spill.budget, and the two failures looked at
+
+- At the person's request, `spill.budget` in the Tunables table now says what the code allows:
+  about 1.75 times the caps with the default. Removed from docs/TODO.md.
+- The `pmd_test` failure: 16 runs at clang Release, 36 with 9 processes on 4 cores, and 32 with
+  12 on 2 cores all passed. Reading the code found a gap: `home_drop_member` leaves the
+  leaver's bit in `pending`. A throwaway test in `coh_home_test.cpp` (not committed) sent two
+  `INV`s, dropped one member, acknowledged the other, and the home stayed waiting. That matches
+  CI's failure just after a leave, but CI's run was not seen to take this path. In TODO.md; the
+  fix needs the person's approval.
+- The `node lost` abort of X-rehome: nothing further found.
+
 ## Files touched
 
 <!--

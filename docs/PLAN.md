@@ -284,7 +284,7 @@ The values in the first table are my proposals and need your review; none has be
 | `thrash.threshold` | 8 ownership transfers of one page in 100 ms | Well above what ordinary hand-over produces. |
 | `thrash.hold_initial` and `thrash.hold_max` | 1 ms, doubling to 64 ms | Starts near one round trip and grows only while the fight lasts. |
 | `mem.cache_share` | 25% of `--cap-ram` for the local cache, 75% for the home store | The home store holds the only copy of a page, so it gets most of the cap. |
-| `spill.budget` | Equal to `--cap-ram` | Lets a region reach about twice the RAM caps, which is what the FR-8.1 test needs. |
+| `spill.budget` | Equal to `--cap-ram` | With 75% of the cap for home copies, a node holds at most 1.75 times its cap, so a fully written region can reach about 1.75 times the caps, not twice. The FR-8.1 test sets the budget to twice the cap. |
 | `task.default_grain` | Range length / (4 x total worker slots), rounded to a page boundary | About four chunks per slot, so fast nodes can take more. Used when the caller passes 0. |
 | `task.prefetch` | 1 chunk | As the HLD says. |
 | `fuzz.schedules` | 2,000 in Actions, 100,000 at the M2 gate | Keeps each push fast while the gate meets FR-5.1's stated count. |
