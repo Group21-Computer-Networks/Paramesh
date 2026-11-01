@@ -192,15 +192,18 @@ begin = time.monotonic()
 while get("/api/cluster")["nodes"] != 3 and time.monotonic() - begin < 10:
     time.sleep(0.3)
 check("the pool counts it", get("/api/cluster")["nodes"] == 3, get("/api/cluster"))
-status, started = post("/api/run", {"language": "c", "source": "int main(void) { volatile char big[32 << 20] = {1}; for (;;) big[0]++; }", "nodes": 1})
+status, started = post("/api/run", {"language": "c", "source": "#include <stdlib.h>\n#include <string.h>\nint main(void) { volatile char* big = malloc(32 << 20); memset((char*)big, 1, 32 << 20); for (;;) big[0]++; }", "nodes": 1})
 while get("/api/run/" + started["id"])["state"] != "running":
     time.sleep(0.05)
 seen = {}
+measured = False
 for _ in range(30):
     time.sleep(0.2)
     seen = get("/api/node")["local"]
-    if seen["paramesh_rss"] > 16 << 20 and seen["paramesh_cpu_percent"] > 30:
+    ours = [j for job, j in seen["jobs"].items() if int(job) >> 16 == 1]  # not another test's process
+    if any(j["rss_bytes"] > 16 << 20 and (j["cpu_percent"] or 0) > 30 for j in ours):
+        measured = True
         break
 post("/api/stop/" + started["id"], {})
-check("a job's RAM and CPU are measured", seen["paramesh_rss"] > 16 << 20 and seen["paramesh_cpu_percent"] > 30, seen)
+check("a job's RAM and CPU are measured", measured, seen)
 sys.exit(1 if failures else 0)
