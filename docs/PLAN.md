@@ -288,7 +288,26 @@ The values in the first table are my proposals and need your review; none has be
 | `task.default_grain` | Range length / (4 x total worker slots), rounded to a page boundary | About four chunks per slot, so fast nodes can take more. Used when the caller passes 0. |
 | `task.prefetch` | 1 chunk | As the HLD says. |
 | `fuzz.schedules` | 2,000 in Actions, 100,000 at the M2 gate | Keeps each push fast while the gate meets FR-5.1's stated count. |
-| `log.level` | `info` |  |
+| `log.level` | `warn` for job processes, `info` for `pmd` | A job process prints nothing on a good run, and a test holds it to that; `info` adds what the evaluation reads, such as `job_pages`. The daemon logs what it does at `info`. |
+
+These keys were added after the M0 gate, by the task named in each row, and added here on 2026-11-01. Each default is the one in the code.
+
+| Key | Default | Added by | What it does, and why that default |
+| --- | --- | --- | --- |
+| `job.start_timeout` | 10 s | M0-5, M1-7 | How long a job may take to come up. Then the launcher ends it with `START_TIMEOUT`. |
+| `task.affinity` | 2 | M3-3, X-locality-sched | 0 first in, first out; 1 first-page affinity; 2 locality and capacity. |
+| `cache.policy` | `fifo` | X-cache-policy | `fifo`, or `cost`, which picks the cheapest page to lose. On matmul `cost` fetches about 12% fewer pages but runs about twice as long, so `fifo` stays. |
+| `cache.victim_window` | 8 | X-cache-policy | How many of the oldest pages `cost` chooses among. Has no effect under `fifo`. |
+| `prefetch.depth` | 8 pages | X-prefetch | How far ahead a stream is fetched; 0 turns prefetching off. |
+| `prefetch.streams` | 4 | X-prefetch | How many access streams are followed at once. |
+| `page.encoding` | `auto` | X-page-encoding | `off`, `on`, or `auto`, which sends any saving on a slow link and only large ones on a fast link. |
+| `page.slow_wait_us` | 500 us | X-page-encoding | Average page wait at or above which `auto` treats a link as slow. |
+| `page.fast_min_saving` | 50% | X-page-encoding | The saving `auto` asks for on a fast link. |
+| `page.diff_pages` | 256 pages | X-page-encoding | Copies kept for diffs, as a home and as an owner each: at most 2 MiB a process, not counted against `--cap-ram`. |
+| `thrash.hold_readers` | on | X-adaptive-coherence | Holds readers too in a read-write fight, up to `thrash.hold_max`. 0 turns it off. On a read-write fight, about 0.5 s against 9.6 s with no hold window. |
+| `rehome.period_ms` | 0 (off) | X-rehome | How often a home looks at who uses its segments. Off because only a segment one other node dominates gains. |
+| `rehome.min_requests` | 256 | X-rehome | Requests one node must make in a period before its segment moves. |
+| `rehome.share` | 60% | X-rehome | Share of a segment's requests that node must make. Above half, so two equal users do not pass a segment back and forth. |
 
 These values are fixed by the SRS and HLD and are not proposals: reply timeout 2 s with one retry; `HEARTBEAT` every 1 s, abort after 3 s; `HELLO` every 1 s, suspect after 3 missed, removed after 5; leave grace 10 s; admission headroom 90%; weight floor 0.25; region 4 GB at `0x600000000000`; segment 2 MB; page 4 KB; at most 8 nodes.
 
@@ -354,7 +373,7 @@ This plan departs from the earlier documents in 30 places; the earlier documents
 
 | # | Earlier documents said | The plan does | Why | Where to update |
 | --- | --- | --- | --- | --- |
-| 21 | The `COMPRESSED` flag means LZ4 page data (HLD, frame header). | The flag is reserved and never set. | Avoids another library this semester. | HLD page-payload sentence. |
+| 21 | The `COMPRESSED` flag means LZ4 page data (HLD, frame header). | No LZ4. The flag means the page is sent as its non-zero bytes or as a diff against a kept copy, with a CRC of the rebuilt page (X-page-encoding, `docs/PROTOCOL.md` 7.2). | Avoids another library, and these encodings suit pages better. | HLD page-payload sentence. |
 | 22 | A stride prefetcher after 3 sequential faults (Doc 1, rejected-mechanisms table). | Deferred to `docs/TODO.md`. | Decided once the M3 speed-up is measured. | Doc 1 table. |
 | 23 | Spill at the home or at the origin listed as open (Doc 1, Open questions). | At the home. | Closes the open question. | Doc 1 Open questions. |
 
