@@ -37,7 +37,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from translate import translate
+from translate import readable, translate
 
 JOBS = Path("/var/tmp/paramesh-play")  # kSandboxRoot in src/platform/sandbox.h
 PORT = 47080  # within what a job cannot reach (kFirstDaemonPort)
@@ -636,7 +636,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         service = self.server.service
         path, query = self.path_and_query()
-        if path == "/api/run":
+        if path == "/api/translate":
+            try:
+                source = json.loads(self.body(MAX_SOURCE * 2))["source"]
+            except (TypeError, ValueError, KeyError):
+                self.reply(400, {"error": "send JSON with source"})
+                return
+            if not self.code_ok():
+                self.reply(403, {"error": "the access code is not right"})
+            elif not isinstance(source, str) or len(source.encode()) > MAX_SOURCE:
+                self.reply(400, {"error": f"the program must be text, at most {MAX_SOURCE} bytes"})
+            else:
+                translated, notes = translate(source, service.args.region_mb << 20)
+                self.reply(200, {"source": readable(translated), "changed": translated != source, "notes": notes})
+        elif path == "/api/run":
             if not self.code_ok():
                 self.reply(403, {"error": "the access code is not right"})
                 return

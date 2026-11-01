@@ -206,4 +206,7 @@ for _ in range(30):
         break
 post("/api/stop/" + started["id"], {})
 check("a job's RAM and CPU are measured", measured, seen)
+status, shown = post("/api/translate", {"source": "#include <stdio.h>\nint main(void){long s=0;\nfor(int i=0;i<9;i++){s+=i;}\nprintf(\"%ld\\n\",s);return 0;}\n"})
+check("Convert shows the program and where its loop runs", status == 200 and "PM_TASK" in shown["source"]
+      and "#line" not in shown["source"] and "runs on the pool" in shown["notes"][0], shown)
 sys.exit(1 if failures else 0)

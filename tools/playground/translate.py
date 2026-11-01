@@ -456,7 +456,7 @@ def generate(program, number, loop):
     if not loop.index_type:
         site.append(f"{loop.index} = pm_a.pm_from + (pm_count > 0 ? pm_count : 0);")
     site.append("}")
-    return "\n".join(task), " ".join(site)
+    return "\n".join(task), "\n".join(site)
 
 
 def edits_for_memory(program):
@@ -568,13 +568,18 @@ def translate(source, region_bytes=DEFAULT_REGION):
         edits.append((main.start(1), main.end(1), "int argc, char** argv"))
     start = [f"const pm_config pm_config_ = {{.region_bytes = {region_bytes}ULL}};",
              f"pm_must(pm_init(&{argc}, &{argv}, &pm_config_));", *start_up, *program.cells]
-    edits.append((program.open + 1, program.open + 1, " " + " ".join(start)))
+    edits.append((program.open + 1, program.open + 1, "\n" + "\n".join(start) + "\n"))
     task_text = "\n".join(tasks)
     edits.append((main.start(), main.start(), f'{task_text}\n#line {line_of(masked, main.start())} "main.c"\n'))
     out = source
     for begin, end, text in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
         out = out[:begin] + text + out[end:]
     return f'{HEADER}#include <string.h>\n#line 1 "main.c"\n{out}', notes
+
+
+def readable(program):
+    """The program to show a person: the line markers are for the compiler."""
+    return re.sub(r'^#line \d+ "main\.c"\n', "", program, flags=re.M)
 
 
 def main():

@@ -24,6 +24,8 @@ stays on the laptop that started the program. If an outer loop cannot be split, 
 are tried. Output shows where each loop ran and why. Totals are found by themselves: a variable the
 loop only adds to, or only multiplies.
 
+Convert shows the converted program without running it, and Run shows it first when Nodes is 2 or more.
+
 A loop stays if it prints or allocates, uses `rand()` or `break`, depends on an earlier step, writes
 one place from two steps, uses a struct, or calls a function that may have side effects. Loops in
 other functions stay. If the translated program does not compile, the original runs on one laptop.
