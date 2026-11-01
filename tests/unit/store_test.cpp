@@ -400,6 +400,21 @@ TEST_CASE(
     CHECK(tiny.value()->full());
 }
 
+// X-rehome. A hint comes from another node: it cannot take a node past twice its even share, and
+// nothing about it touches a weight, which store_place_segments alone reads.
+TEST_CASE("a rehoming hint cannot gather the homes on one node") {
+    using paramesh::Slot;
+    // Six segments on three nodes, an even share of two.
+    const std::array<Slot, 6> even{Slot{0}, Slot{0}, Slot{1}, Slot{1}, Slot{2}, Slot{2}};
+    CHECK(paramesh::store_may_rehome(even, Slot{0}, 3));
+    const std::array<Slot, 6> three{Slot{0}, Slot{0}, Slot{0}, Slot{1}, Slot{1}, Slot{2}};
+    CHECK(paramesh::store_may_rehome(three, Slot{0}, 3));
+    const std::array<Slot, 6> four{Slot{0}, Slot{0}, Slot{0}, Slot{0}, Slot{1}, Slot{2}};
+    CHECK(!paramesh::store_may_rehome(four, Slot{0}, 3));  // twice the share already
+    CHECK(paramesh::store_may_rehome(four, Slot{2}, 3));
+    CHECK(!paramesh::store_may_rehome(four, Slot{0}, 0));
+}
+
 TEST_CASE("the cost-aware cache gives up, of its oldest pages, the one cheapest to lose") {
     const auto page = [](std::uint64_t n) { return paramesh::PageId{n}; };
     // A cache of `pages` pages that chooses among its `window` oldest.

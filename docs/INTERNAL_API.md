@@ -286,6 +286,7 @@ enum class Opcode : std::uint8_t {
     kSegMigrate = 0x70,
     kSegMigrateDone = 0x71,
     kLeaveDone = 0x72,
+    kRehomeHint = 0x73,
     kLRegister = 0x80,
     kLAdmitReq = 0x81,
     kLAdmitOk = 0x82,
@@ -815,6 +816,7 @@ struct PlacementMember {
 // Errc::kInvalidArgument if no member has a weight above 0.
 Result<void> store_place_segments(std::span<const PlacementMember> members, std::span<Slot> homes,
                                   std::span<const NodeId> keep = {});
+bool store_may_rehome(std::span<const Slot> homes, Slot to, std::size_t members) noexcept;  // X-rehome
 ```
 
 **[GATE I6]** M1-6's card lists both `src/store/` and `src/rt/` for the hashing of segments to

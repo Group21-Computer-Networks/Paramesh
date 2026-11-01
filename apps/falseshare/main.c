@@ -1,6 +1,6 @@
 /* falseshare: two tasks write neighbouring numbers, which share a page they do not mean to.
  *
- *     falseshare [writes] [pairs] [read]
+ *     falseshare [writes] [pairs] [read] [skip]
  *
  * Chunk i of the task write_left adds 1, `writes` times (default 2000000), to number 2i of an
  * array; chunk i of write_right does the same to number 2i + 1. There are `pairs` chunks of
@@ -19,7 +19,9 @@
  * nodes) and the launcher logs which task ran on which node (task_on_node).
  *
  * With a third argument, `read`, the right-hand chunks read their neighbour `writes` times
- * instead of writing: a read-write fight, which PARAMESH_CFG_THRASH_HOLD_READERS=1 holds too. */
+ * instead of writing: a read-write fight, which PARAMESH_CFG_THRASH_HOLD_READERS=1 holds too.
+ * A fourth, `skip`, puts the page that many 2 MiB segments on, so that its home is another node
+ * (for PARAMESH_CFG_REHOME_PERIOD_MS, which moves it to one of the two that fight over it). */
 
 #include <paramesh.h>
 #include <stdint.h>
@@ -83,16 +85,22 @@ int main(int argc, char** argv) {
     const uint64_t writes = argc > 1 ? strtoull(argv[1], NULL, 10) : 2000000;
     const uint64_t pairs = argc > 2 ? strtoull(argv[2], NULL, 10) : 16;
     const int read = argc > 3;
+    const uint64_t skip = argc > 4 ? strtoull(argv[4], NULL, 10) : 0;
     if (writes == 0 || pairs == 0 || pairs > MAX_PAIRS) {
         fprintf(stderr, "usage: falseshare [writes, 1 or more] [pairs, 1 to %d]\n", MAX_PAIRS);
         return 2;
     }
     /* A read fight needs the reader on another node: one thread a node, so two chunks cannot
      * run side by side on one. */
-    const pm_config config = {.region_bytes = (uint64_t)4 << 20, .threads_per_node = read ? 1 : 0};
+    const pm_config config = {.region_bytes = (uint64_t)(4 + 2 * skip) << 20,
+                              .threads_per_node = read ? 1 : 0};
     const int status = pm_init(&argc, &argv, &config); /* a worker does not return from this */
     if (status != PM_OK) {
         fprintf(stderr, "falseshare: pm_init: %s\n", pm_strerror(status));
+        return 1;
+    }
+    if (skip != 0 && pm_malloc(skip * ((uint64_t)2 << 20)) == NULL) {
+        fprintf(stderr, "falseshare: could not set up the shared data\n");
         return 1;
     }
     const struct WriteArgs args = {.numbers = pm_malloc(PM_PAGE_SIZE),

@@ -22,6 +22,12 @@
 #   coherence   apps/falseshare, a write-write and a read-write fight over one page, with
 #               matmul and apps/sweep beside them, with the hold window off, for writers
 #               only, and for readers too (X-adaptive-coherence), three runs each: coherence.csv
+#   rehome      dynamic home reassignment (X-rehome), off and every 500 ms, FIFO chunk
+#               placement, 1 ms delay, for a read-write fight over one page with no hold
+#               window, matrix multiply and apps/sweep (16 MB, 4 rounds), with the segments
+#               moved in the last column: rehome.csv. The page of the fight is homed off the
+#               fighting nodes (REHOME_SKIP segments on). A run that aborts leaves its logs in
+#               abort-<time> under the results directory.
 #
 #   -s   matrix size (default 256)
 #   -t   worker threads a node (default 1)
@@ -54,7 +60,7 @@ while getopts "s:t:b:o:h" opt; do
     b) build="$OPTARG" ;;
     o) results="$OPTARG" ;;
     h)
-        sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     *) exit 2 ;;
@@ -110,6 +116,7 @@ run_job() {
     if [ "$status" -ne 0 ]; then  # why, for aborts.log
         { echo "== ${RUN:-run}: pmrun exit $status"; grep -h 'aborted' "$work/out" "$work"/pmd-*.log |
             grep -v '"event"' | sort -u; } >>"$results/aborts.log"
+        cp -r "$work" "$results/abort-$(date +%s)"  # every process's log, for the reason
     fi
     sleep 1  # the workers end on JOB_END
     for pid in "${daemons[@]}"; do { kill "$pid" && wait "$pid"; } 2>/dev/null; done
@@ -274,6 +281,33 @@ experiment_coherence() {
             done
         done
     done
+}
+
+experiment_rehome() {
+    local file="$results/rehome.csv"
+    echo "workload,rehome_ms,run,$HEADER,moves" >"$file"
+    local row workload app rehome run moves threshold
+    impair 1 0 0
+    for workload in ${REHOME_WORKLOADS:-fight matmul sweep}; do
+        threshold=8
+        case "$workload" in
+        fight) app="$build/apps/falseshare/falseshare 200000000 1 read ${REHOME_SKIP:-2}"; threshold=0 ;;
+        matmul) app="$build/apps/matmul/matmul $size $threads" ;;
+        sweep) app="$build/apps/sweep/sweep 16 4 $threads" ;;
+        esac
+        for rehome in ${REHOME_PERIODS:-0 500}; do
+            for run in 1 2 3; do
+                row="$(APP="$app" PARAMESH_CFG_TASK_AFFINITY=0 PARAMESH_CFG_TASK_PREFETCH=0 \
+                    PARAMESH_CFG_THRASH_THRESHOLD=$threshold \
+                    PARAMESH_CFG_REHOME_PERIOD_MS=$rehome PARAMESH_CFG_REHOME_MIN_REQUESTS=16 \
+                    PARAMESH_CFG_REHOME_SHARE=50 run_job)"
+                note_abort "$row"
+                moves="$(cat "$work"/out "$work"/pmd-*.log | grep -c '"event":"segment_rehomed"')"
+                echo "$workload,$rehome,$run,$row,$moves" | tee -a "$file"
+            done
+        done
+    done
+    impair 0 0 0
 }
 
 experiment_histogram() {

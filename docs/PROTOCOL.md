@@ -141,6 +141,7 @@ The High-Level Design lists 39 opcodes and all of them are here. `SPAWN_DECLINE`
 | `0x70` | `SEG_MIGRATE` | Data | leaver → new home | `SEG_MIGRATE_DONE` after the last batch |
 | `0x71` | `SEG_MIGRATE_DONE` | Data | new home → leaver | is a reply |
 | `0x72` | `LEAVE_DONE` | Data | leaver → launcher | `JOB_END` with status `LEFT` |
+| `0x73` | `REHOME_HINT` | Data | home → busiest node → launcher | `SEG_MAP`, or none |
 | `0x80`–`0x87` | `L_REGISTER` … `L_STATS` | Local | job process → `pmd`, and its replies | section 9 |
 | `0x90`–`0x94` | `L_QUOTA` … `L_MEMBER` | Local | `pmd` → job process | section 9 |
 | `0xA0`–`0xA4` | `L_RUN_REQ` … `L_LEAVE_REPLY` | Local | tool ↔ `pmd` | section 9 |
@@ -717,6 +718,36 @@ Fixed size: 4 bytes.
 The launcher replies `JOB_END` with status `LEFT` once every remaining process has
 acknowledged the map without the leaver. The leaver then closes its connections and exits.
 A connection closed by a node that has sent `LEAVE_DONE` is not a lost node.
+
+### `REHOME_HINT` — 0x73
+
+Offers a segment to the node that uses it most (X-rehome). Added with the person's approval,
+2026-10-31; off unless `rehome.period_ms` is set.
+
+| Offset | Size | Field | Meaning |
+| --- | --- | --- | --- |
+| 0 | 4 | `segment_id` | The segment. |
+| 4 | 2 | `node` | The node that would take it. |
+| 6 | 2 | reserved | |
+
+Fixed size: 8 bytes.
+
+Each `rehome.period_ms`, a home with no segment on the move counts the requests of that period.
+For the segment where one other node made the most requests, at least `rehome.min_requests`
+and `rehome.share` percent of those for the segment, it sends `REHOME_HINT` to that node. A node
+named by a hint from another node passes it on to the launcher if it has room for one more
+segment, and otherwise drops it. So the sender the launcher sees is `node`.
+
+The launcher ignores the hint unless the job is up, no node is joining or leaving, the last
+rehoming map has been acknowledged, `node` may host segments, is not already the home, and stays
+within twice the even share of segments. It then sends `SEG_MAP` with only that segment's home
+changed, and the segment moves as in section 8.2: the old home freezes it, finishes what is in
+progress, sends `SEG_MIGRATE`, and requests meet `REDIRECT` until the new home has it. Versions
+and directory entries move with it, so a page has one home and one owner throughout.
+
+A hint is a suggestion from another node: it moves a segment, and is never an input to a weight,
+a quota or an admission decision. A hint that names neither its sender nor this process, or
+reaches a worker from its own `node`, ends the job as a protocol error.
 
 ## 8. Sequences
 
