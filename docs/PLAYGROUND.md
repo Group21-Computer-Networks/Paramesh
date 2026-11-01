@@ -15,6 +15,26 @@ other nodes and the playground's access code; give that to the people you are su
 site is `http://ADDRESS:47080/` from any machine of the LAN. To keep it to one machine, stop the
 service and run `python3 /opt/paramesh/tools/playground/server.py`, which answers on 127.0.0.1 only.
 
+## Plain C, split for you
+
+With Nodes at 2 or more, a program that does not call `pm_init()` goes through
+`tools/playground/translate.py` first. Every `for` loop in `main()` of the form
+`for (i = first; i < last; i++)` is checked, and one shown safe runs on the pool. Everything else
+stays on the laptop that started the program. If an outer loop cannot be split, the loops inside it
+are tried. Output shows where each loop ran and why. Totals are found by themselves: a variable the
+loop only adds to, or only multiplies.
+
+A loop stays if it prints or allocates, uses `rand()` or `break`, depends on an earlier step, writes
+one place from two steps, uses a struct, or calls a function that may have side effects. Loops in
+other functions stay. If the translated program does not compile, the original runs on one laptop.
+
+- A split program's shared memory is `--region-mb` of the server, 512 by default. A program that
+  needs more stops with a message.
+- A `double` total adds up in any order, so its last digits can differ between runs.
+- The checks read C with patterns. They see no aliasing they cannot find in `main()`, such as a
+  pointer changed through another pointer.
+- A loop that updates an array (`c[i][j] += x`) counts twice if a laptop leaves in the middle.
+
 ## What a run does
 
 1. The server checks the request: C only, 64 KiB at most, 1 to 8 nodes, one run at a time.

@@ -9,6 +9,34 @@ int main(void) {
     return 0;
 }
 ` },
+  { name: "Plain C, split for you: set Nodes to 2", source: `#include <stdio.h>
+#include <stdlib.h>
+#define MOD 1000000007ULL
+
+int main(void) {
+    int n = 20000;
+    unsigned long long *answers = malloc(n * sizeof(unsigned long long));
+    unsigned long long total = 0;
+
+    /* Each step stands alone, so this loop runs across the pool. */
+    for (int i = 0; i < n; i++) {
+        unsigned long long f = 1;
+        for (unsigned long long k = 2; k <= i; k++) {
+            f = f * k % MOD;
+        }
+        answers[i] = f;
+        total += f;
+    }
+
+    /* This one prints in order, so it stays on this laptop. */
+    for (int i = 5; i <= 10; i++) {
+        printf("%d! = %llu\\n", i, answers[i]);
+    }
+    printf("checksum: %llu\\n", total);
+    free(answers);
+    return 0;
+}
+` },
   { name: "pm_init and pm_finalize", source: `#include <paramesh.h>
 #include <stdio.h>
 

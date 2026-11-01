@@ -114,6 +114,7 @@ function showTab(name) {
 
 function outputText(run) {
   const parts = [];
+  if (run.translator?.length) parts.push(`--- where each loop ran ---\n${run.translator.join("\n")}`);
   if (run.compiler_output) parts.push(`--- compiler ---\n${run.compiler_output}`);
   if (run.stdout) parts.push(`--- standard output ---\n${run.stdout}`);
   if (run.stderr) parts.push(`--- standard error ---\n${run.stderr}`);
@@ -151,6 +152,7 @@ function renderOutput(run) {
   if (run.stopped) nodes.push(html("p", { className: "notice", textContent: "Stopped before the program started." }));
   if (run.timed_out) nodes.push(html("p", { className: "notice bad", textContent: "Stopped: the program went past the time limit." }));
   if (run.compile_ok === false) nodes.push(html("p", { className: "notice bad", textContent: "Compilation failed, so nothing ran." }));
+  if (run.translator?.length) nodes.push(stream("Where each loop ran", run.translator.join("\n"), "compiler"));
   if (run.compiler_output) nodes.push(stream("Compiler", run.compiler_output, "compiler"));
   const stdout = run.stdout ?? run.live_stdout;
   if (stdout) nodes.push(stream("Standard output", stdout, "stdout"));
