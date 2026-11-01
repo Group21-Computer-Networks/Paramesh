@@ -63,6 +63,15 @@ sudo mkdir -p /usr/local/bin /usr/local/lib/pkgconfig
 for tool in pmd pm pmrun; do sudo ln -sf "$PREFIX/bin/$tool" /usr/local/bin/$tool; done
 sudo ln -sf "$PREFIX/lib/pkgconfig/paramesh.pc" /usr/local/lib/pkgconfig/paramesh.pc
 
+# Health check: something on this machine accepts connections on the port, within 10 s.
+answers() {
+    for _ in $(seq 1 50); do
+        (: </dev/tcp/127.0.0.1/"$1") 2>/dev/null && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
 # ---- pmd, in standby, at every login
 if [ "$SERVICE" -eq 1 ] && command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
     mkdir -p "$(dirname "$UNIT")"
@@ -81,12 +90,7 @@ EOF
     systemctl --user daemon-reload
     systemctl --user enable paramesh.service >/dev/null 2>&1
     systemctl --user restart paramesh.service
-    for _ in $(seq 1 50); do  # health check: the status API answers
-        curl -fs http://127.0.0.1:47002/v1/peers >/dev/null 2>&1 && break
-        sleep 0.2
-    done
-    curl -fs http://127.0.0.1:47002/v1/peers >/dev/null 2>&1 ||
-        die "pmd did not start; see: journalctl --user -u paramesh.service"
+    answers 47002 || die "pmd did not start; see: journalctl --user -u paramesh.service"
     say "pmd is running in standby (systemctl --user status paramesh)."
     cat >"$SITE_UNIT" <<EOF
 [Unit]
@@ -103,6 +107,7 @@ EOF
     systemctl --user daemon-reload
     systemctl --user enable paramesh-site.service >/dev/null 2>&1
     systemctl --user restart paramesh-site.service
+    answers 47080 || die "the website did not start; see: journalctl --user -u paramesh-site.service"
     say "the website is running: http://127.0.0.1:47080/ (systemctl --user status paramesh-site)."
     command -v g++ >/dev/null || say "to compile for the playground on this node: sudo apt install g++"
 else

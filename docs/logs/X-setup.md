@@ -67,6 +67,19 @@ and the next step.
   alone (22:32); `POST /v1/join` -> `{"member":"joining"}`; `matmul 256` then ran on both
   (21:4 22:124).
 - PR #80 merged; rebased on `main`. No C++ change here: CI's build jobs cover the tree. Next: the pull request.
+### 2026-11-02 — session (fix): what a real install gets
+
+- `/opt/paramesh` installed as mode 700 and owned by the packager: tar carried `mktemp`'s mode and
+  the build user. The package now holds a 755 root and root-owned files; `apps` stays the user's.
+- The health check needed `curl`, so a machine without it reported that pmd did not start. It now
+  uses bash's `/dev/tcp`. The website gets the same check: it was called running unchecked.
+- Commands: `tools/setup/package.sh` printed `(4.8M)`; `tar -tzv` shows `drwxr-xr-x root/root ./`.
+  `objdump -T` on `bin/*` and `apps/*`: newest is `GLIBC_2.38`, so Ubuntu 24.04 (2.39) can load them.
+- `install.sh --no-service` run at a scratch prefix with a stand-in `sudo`: exit 0. From that
+  prefix on private ports: `pmrun -n 2 matmul 256` printed chunks on nodes 1 and 2, `/api/cluster`
+  said 2 nodes, and `quickstart` linked by hand printed its right answer.
+- NOT tested: the real paths and the systemd units. They need the person's sudo.
+
 ## Files touched
 
 <!--

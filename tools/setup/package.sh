@@ -51,6 +51,7 @@ EOF
 
 file="$out/paramesh-setup-$version.sh"
 sed "s/@ARCH@/$(uname -m)/" "$root/tools/setup/install.sh" >"$file"
-tar -czf - -C "$stage" . >>"$file"
+chmod 755 "$stage"  # mktemp made it private, and tar would carry that to /opt/paramesh
+tar -czf - --owner=0 --group=0 -C "$stage" . >>"$file"
 chmod +x "$file"
 echo "$file ($(du -h "$file" | cut -f1))"
