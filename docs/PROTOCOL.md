@@ -971,8 +971,9 @@ committed to the job (section 6, `SPAWN_REQ`); they only ever grow.
 | 2 | 2 | `flags` | `0x0001` `NO_HOMES`: all of `ram_bytes` is the local cache; the process joined mid-run and is home for nothing. Added by X-node-commit, with the person's approval. |
 | 4 | 8 | `ram_bytes` | The most RAM the process may hold page data in: its home store and its local cache together, split by `mem.cache_share`. 0 for no cap. Added by M4-2, with the person's approval. |
 | 12 | 8 | `spill_bytes` | The most its spill file may hold. Added by X-node-commit, with the person's approval. |
+| 20 | 8 | `cache_bytes` | The part of `ram_bytes` that is the local cache; 0 leaves the split to `mem.cache_share`. Added by the M4-2 fix, with the person's approval. |
 
-Fixed size: 20 bytes.
+Fixed size: 28 bytes.
 
 ### `L_LEAVE` — 0x91
 

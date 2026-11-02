@@ -1164,6 +1164,7 @@ Result<std::size_t> wire_encode(const LQuotaPayload& payload, std::span<std::byt
     w.put(payload.flags, 2);
     w.put(payload.ram_bytes, 8);
     w.put(payload.spill_bytes, 8);
+    w.put(payload.cache_bytes, 8);
     return w.done();
 }
 
@@ -1173,6 +1174,7 @@ Result<LQuotaPayload> wire_decode_l_quota(std::span<const std::byte> in) {
     payload.flags = static_cast<std::uint16_t>(r.get(2));
     payload.ram_bytes = r.get(8);
     payload.spill_bytes = r.get(8);
+    payload.cache_bytes = r.get(8);
     if (!r.exact()) {
         return kMalformed;
     }
