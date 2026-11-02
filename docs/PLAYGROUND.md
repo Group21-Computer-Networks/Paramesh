@@ -38,16 +38,16 @@ other functions stay. If the translated program does not compile, the original r
 - A loop that updates an array (`c[i][j] += x`) stays: its part could count twice if a laptop left.
 - The translator runs sandboxed and is stopped after 5 s; a program it cannot read runs as written.
 
-## People and turns
+## Access and turns
 
-With `--public`, people register themselves with a name, a password and the access code, then sign in
-with the name and password. Each node's site has one line. A person, and an address on the LAN, each hold
-one place in it, so someone who runs again goes behind everyone waiting. Runs, past runs and Stop belong
-to their owner. Five wrong passwords or invite codes from one address wait a minute.
+With `--public`, Run and Convert need the access code shown on the dashboard, except on the machine that
+runs the site. A person here is a machine, by its address. Each node's site has one line, and a machine holds
+one place in it, so one that runs again goes behind everyone waiting. Runs, past runs and Stop belong to the
+machine that started them. Five wrong access or invite codes from one address wait a minute.
 
-Limits: someone with two machines, or several addresses, can hold more than one place. Two sites are two
-lines; `pmd`'s ledger then shares cores between the jobs, by node and not by person. Sessions end when
-the server restarts.
+Limits: everyone with the code is equal, and several people behind one address share one place. A machine
+with several addresses can hold more. Two sites are two lines; `pmd`'s ledger then shares cores between the
+jobs, by node and not by person.
 
 ## What a run does
 
@@ -93,7 +93,7 @@ Read this before letting anyone run code.
   touches the ledger. Its own job is the only one it can end.
 - `pmd` trusts its peers: anyone on the LAN who can reach TCP 47001 can already ask it to start a
   program. That is true of ParaMesh with or without the playground. Run it on a network you trust.
-- Passwords, the access code and the token cross the LAN in plain HTTP.
+- The access code and the token cross the LAN in plain HTTP.
 - On kernels below 6.7, or with Landlock off, jobs do not run: the sandbox fails closed.
 
 ## Statistics

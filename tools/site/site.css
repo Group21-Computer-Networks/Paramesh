@@ -294,15 +294,6 @@ th.group, th.group:last-child { font-weight: 600; padding-top: 18px; text-align:
   .arch .link { animation: none; }
 }
 
-/* signing in */
-#signin { border: 0; border-radius: 22px; padding: 28px; background: var(--card); color: var(--ink); width: min(420px, calc(100vw - 32px)); }
-#signin::backdrop { background: rgba(30, 53, 80, 0.45); }
-#signin h2 { font-size: 1.7rem; margin-bottom: 6px; }
-#signin p { color: var(--ink-soft); font-size: 0.95rem; margin: 0 0 14px; }
-#signin label { display: block; font-size: 0.88rem; margin-bottom: 10px; }
-#signin input { display: block; width: 100%; box-sizing: border-box; margin-top: 4px; padding: 9px 12px; font: inherit; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); color: var(--ink); }
-#signin .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
-#signin .notice.bad { color: var(--bad); }
 /* the analytics board: cards of different heights, as on a pinboard */
 .pinboard { columns: 3 190px; column-gap: 14px; }
 .pin { break-inside: avoid; display: block; margin-bottom: 14px; padding: 18px; border-radius: 22px; background: var(--card); color: var(--ink); animation: pin-in 0.7s var(--ease) both; animation-delay: calc(var(--i) * 70ms); transition: transform 0.35s var(--ease); }

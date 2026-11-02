@@ -25,7 +25,7 @@
   <button class="button" id="convert">Convert</button>
   <button class="button" id="stop" disabled>Stop</button>
   <label>Nodes <select id="nodes"><option>1</option></select></label>
-  <button class="button quiet" id="who" hidden>Sign in</button>
+  <label id="code-field" hidden>Access code <input id="code" autocomplete="off" spellcheck="false"></label>
   <span class="spacer"></span>
   <label>Example <select id="examples"></select></label>
   <button class="button quiet" id="reset">Reset to example</button>
@@ -52,21 +52,6 @@
     <div class="pane" id="pane-history" hidden></div>
   </div>
 </main>
-<dialog id="signin">
-  <form method="dialog" id="signin-form">
-    <h2>Join the playground</h2>
-    <p>Pick a name and password. Your runs are yours: no one else sees or stops them.</p>
-    <label>Name <input id="who-name" autocomplete="username" spellcheck="false" required></label>
-    <label>Password <input id="who-password" type="password" autocomplete="current-password" required></label>
-    <label>Access code, only to register <input id="code" autocomplete="off" spellcheck="false"></label>
-    <p class="notice bad" id="who-problem" hidden></p>
-    <div class="actions">
-      <button class="button solid" type="button" id="who-register">Register</button>
-      <button class="button" type="button" id="who-login">Sign in</button>
-      <button class="button quiet" type="button" id="who-cancel">Not now</button>
-    </div>
-  </form>
-</dialog>
 
 <script src="/examples.js"></script>
 <script src="/playground.js"></script>
