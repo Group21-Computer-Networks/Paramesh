@@ -44,18 +44,16 @@ flowchart LR
 
 Both laptops need Linux 6.7 or later for the playground, and must reach each other on the network.
 
-1. On one laptop, build the installer once:
+1. On every laptop, install or update with one line:
 
    ```bash
-   bash tools/setup/package.sh
+   curl -fsSL https://github.com/Group21-Computer-Networks/Paramesh/releases/latest/download/install.sh | bash
    ```
 
-2. Install **that same file** on every laptop. Do not build it again on the others: a job checks
-   that its program is identical everywhere.
+   It asks for your password, and checks the download's SHA-256.
 
-   ```bash
-   bash build/dist/paramesh-setup-*.sh
-   ```
+2. Every laptop must run the same release, because a job checks that its program is identical
+   everywhere. After a new release, run the line above on all of them.
 
 3. For the playground, install a compiler on each laptop:
 
@@ -80,7 +78,14 @@ Both laptops need Linux 6.7 or later for the playground, and must reach each oth
    Register with a name, a password and the access code, set Nodes to 2, and run an example.
 
 If nodes cannot see each other, allow the pool through the firewall, for example
-`sudo ufw allow from 10.0.0.0/8`. To remove everything, run the installer with `--uninstall`.
+`sudo ufw allow from 10.0.0.0/8`. To remove everything:
+
+```bash
+bash ~/.local/share/paramesh/paramesh-setup.sh --uninstall
+```
+
+To package your own build instead, run `tools/setup/package.sh` once and give that one file to every
+laptop.
 
 ## Features
 
