@@ -719,7 +719,7 @@ public:
         } else if (why == Errc::kProtocol) {
             reason = "bad frame";
         }
-        platform_.logger->log(LogLevel::kInfo, "peer_lost",
+        platform_.logger->log(LogLevel::kInfo, "peer_gone",
                               JsonObject{{"peer", JsonValue{std::int64_t{peer.value}}},
                                          {"why", JsonValue{std::string{reason}}}});
         const std::string message = "node " + std::to_string(peer.value) + " lost";
