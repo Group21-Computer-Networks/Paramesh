@@ -108,23 +108,7 @@ bash ~/.local/share/paramesh/paramesh-setup.sh --uninstall
 Each laptop runs one daemon, `pmd`. A job is the same program on each node: the **launcher** runs
 `main()`, and **workers** run its tasks.
 
-```mermaid
-flowchart TB
-    subgraph A["Laptop A"]
-        PR["pmrun"] --> PA["pmd"]
-        L["Launcher: main(), task queue, locks"]
-        PA -. starts .-> L
-    end
-    subgraph B["Laptop B"]
-        PB["pmd"]
-        W["Worker: the same program, its tasks"]
-        PB -. starts .-> W
-    end
-    PA <-- "control: TCP 47001, beacons: UDP 47000" --> PB
-    L <-- "pages and tasks: TCP" --> W
-    L --- M[("Shared memory: same addresses on every node")]
-    W --- M
-```
+![ParaMesh on two laptops](docs/images/architecture.png)
 
 ### What happens when you run a program
 
@@ -167,17 +151,7 @@ sequenceDiagram
 With Nodes at 2 or more, a program that does not call `pm_init()` goes through the translator. It splits
 only what it can show to be safe.
 
-```mermaid
-flowchart TD
-    A["Each for loop in main()"] --> B{"Safe to split?"}
-    B -- Yes --> C["Becomes a task: runs on the pool"]
-    B -- No --> D["Stays on your laptop"]
-    D --> E["Try the loops inside it"]
-    E --> B
-    C --> F{"Does it compile?"}
-    F -- Yes --> G["Run on the pool"]
-    F -- No --> H["Run your original on one laptop"]
-```
+![How plain C is split](docs/images/translator.png)
 
 ### What happens when a laptop goes away
 
@@ -314,18 +288,38 @@ Tunables table of [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Features
 
-| Area | What you get |
-| --- | --- |
-| Shared memory | One address space across nodes, kept coherent by page faults through `userfaultfd`. |
-| Tasks | `PM_TASK`, `pm_parallel_for`, `pm_wait_all`, locks, barriers and atomic add. |
-| Plain C | Safe loops split by themselves, with the converted program shown. |
-| Pool | Discovery, invite codes across subnets, caps on cores and RAM, spill to disk. |
-| Changing pool | A planned `pm leave`, joining a running job, optional re-homing of segments. |
-| Performance | Prefetching, page diffs and compression, a hold window against page fights. |
-| Fairness | A ledger per node weights free slots. What a peer claims never changes a weight. |
-| Sharing | An access code, one line per laptop, turns between machines, private runs. |
-| Safety | Compiles and jobs run in a sandbox. Only a node with the pool token can start a job. |
-| Seeing it | Website, playground, live dashboard, Analytics, Compare, `pm status`, `pm top`. |
+Checked against the code at v0.1.2. **Tested on** says how far each has gone: **unit** tests, **script** runs on one
+machine or in network namespaces, **bench** scripts, or **laptops**, meaning our two real laptops.
+
+| Area | Feature | What the code does | Tested on |
+| --- | --- | --- | --- |
+| Memory | Shared region | Up to 4 GB at one address on each node; 4 KB pages, 2 MiB segments | unit, laptops |
+| Memory | Coherence | Write-invalidate: many readers or one writer, ordered by a home per page | unit, fuzzer, laptops |
+| Memory | Caps and spill | `--cap-ram` split 25/75 between cache and home store; CLOCK eviction to a spill file | unit, script |
+| Memory | Cache policy | FIFO, or cost-based over the 8 oldest pages (`cache.policy`) | unit, bench |
+| Tasks | Task API | `PM_TASK`, `pm_parallel_for`, `pm_parallel_for_data`, `pm_wait_all`, `pm_touch` | unit, laptops |
+| Tasks | Locality scheduling | A node gets the chunk with most of its pages, or helps the slowest home | unit, bench |
+| Tasks | Sync | Locks, barriers and atomic add, as messages | unit |
+| Plain C | Translator | Splits safe `for` loops in `main()`, finds totals and scratch variables | script, laptops |
+| Plain C | Convert | Shows the converted program and why each loop moved or stayed | laptops |
+| Pool | Discovery | Beacons by multicast and to seeds; answers reach other subnets | unit, laptops |
+| Pool | Invite codes | Join from the dashboard; wrong codes lock out for a minute | script, laptops |
+| Pool | Admission | Each node commits its share with 90% headroom; a job that cannot fit is refused | unit |
+| Changing pool | Graceful leave | 10 s for tasks, pages written back, segments migrate, the job carries on | unit, script |
+| Changing pool | Mid-run join | A new peer joins a job short of nodes, as a cache | unit, script |
+| Changing pool | Abort on loss | Silence, reset, no reply or a bad frame ends the job with a message | unit, script |
+| Performance | Stride prefetch | Up to 4 streams, up to 8 pages ahead | unit, bench |
+| Performance | Page encoding | Leaves out zero words, of a page or its XOR with a kept copy | unit, bench, laptops |
+| Performance | Hold window | Stops page fights: 8 transfers in 100 ms, then 1 to 64 ms | unit, bench |
+| Performance | Re-homing | Optional: a segment moves to the node using it most | unit, bench |
+| Fairness | Ledger and weights | Starved jobs first, then own jobs, then lowest share over weight | unit, script |
+| Fairness | Turns | One line per site, one place per machine | script |
+| Safety | Sandbox | Landlock, seccomp and limits on compile, job and translator; fails closed | unit, script, laptops |
+| Safety | Pool token | A node with a token declines an unsigned `SPAWN_REQ` | unit, laptops |
+| Safety | Never zero-fill | Lost data ends the job | unit, fuzzer |
+| Seeing it | Website | Interactive architecture, playground, dashboard, Compare, Analytics | laptops |
+| Seeing it | Tools | `pm status`, `pm top`, status API, Wireshark dissector | unit, script |
+| Delivery | Releases | A tag builds one installer; one line installs and updates | laptops |
 
 ## Known limits
 
@@ -355,8 +349,17 @@ Tunables table of [`docs/PLAN.md`](docs/PLAN.md).
 
 **Measured results**
 
-- Speedup on two real laptops has not been recorded yet: that gate check was waived. See
-  [`docs/logs/M3-gate.md`](docs/logs/M3-gate.md).
+Two real laptops over Wi-Fi, about 58 ms round trip, at v0.1.1 and v0.1.2:
+
+| Program | One laptop | Two laptops |
+| --- | --- | --- |
+| Primes below 20,000,000, plain C | 6.44 s as written; about 0.95 s on 13 cores | 0.73 s, 16 cores |
+| Factorials, plain C, 5 runs each | 584 ms as written | 343 ms |
+| `matmul 512` | 0.12 s | 7.9 to 10.8 s |
+| `matmul 1024` | 3.7 s | over 110 s, stopped |
+
+Most of the primes gain comes from using many cores, not from the second laptop. Work that moves many pages
+is far slower over Wi-Fi. Ethernet has not been measured, and the two-laptop gate checks were waived.
 
 ## Build from source
 
@@ -397,6 +400,7 @@ A tag `v*` publishes a release: GitHub builds the installer on Ubuntu 24.04.
 | [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | Every message on the wire |
 | [`docs/STATE_MACHINES.md`](docs/STATE_MACHINES.md) | The coherence state machines |
 | [`docs/INTERNAL_API.md`](docs/INTERNAL_API.md) | Interfaces between source directories |
+| [`docs/DESIGN.md`](docs/DESIGN.md) | The design: HLD and LLD |
 | [`docs/PLAN.md`](docs/PLAN.md) | The implementation plan and tunables |
 | [`docs/TODO.md`](docs/TODO.md) | Deferred work and open failures |
 | [`docs/logs/`](docs/logs/) | What was built and how it was checked |
