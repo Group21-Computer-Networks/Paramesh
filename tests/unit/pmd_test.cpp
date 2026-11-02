@@ -160,7 +160,15 @@ struct Daemon {
         ::close(control);
         pmd.stop();
         thread.join();
-        std::filesystem::remove_all(state_dir);
+        // A worker may still be writing here, and a destructor that throws ends the whole run.
+        std::error_code failed;
+        for (int tries = 0; tries < 50; tries++) {
+            std::filesystem::remove_all(state_dir, failed);
+            if (!failed) {
+                break;
+            }
+            ::usleep(20000);
+        }
     }
 
     // A SPAWN_REQ for this very executable as the worker, which then writes what it saw to
