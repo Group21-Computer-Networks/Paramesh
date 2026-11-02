@@ -848,9 +848,10 @@ TEST_CASE("a job process started by pmd receives its quota, and the peer that as
         ::usleep(100000);
     }
     // What node 5 commits to a job of one segment on one node: the segment divided by the 90%
-    // headroom, in RAM, and spill for the part of the segment the cache's 25% leaves out.
+    // headroom, in RAM, spill for the part of the segment the cache's 25% leaves out, and
+    // RAM for a cache of the whole region, which the node's cap allows (M4-2 fix).
     CHECK(contents(report) ==
-          "quota=3\nram=2330624\nspill=352256\njob=77\nrole=worker\njob_id=77\nnode_id=5\n"
+          "quota=3\nram=3842048\nspill=352256\njob=77\nrole=worker\njob_id=77\nnode_id=5\n"
           "launcher=10.1.2.3:5000\nlisten=(unset)\ncwd=" +
               daemon.state_dir + "\nlast_argument=an argument with spaces\n");
 }
@@ -2576,6 +2577,27 @@ TEST_CASE(
     CHECK_FALSE(paramesh::grow_commit(short_of, 40 * kMb, kMb, 20 * kMb));
     CHECK(short_of.ram == made.ram);  // as it was
     CHECK(short_of.spill == made.spill);
+}
+
+// M4-2 fix: matmul 1024 took 122 s on two laptops with gigabytes free, its cache a quarter of its
+// small commitment, so that the pages it read went over the network again and again.
+TEST_CASE("a job's cache is a share of the node's cap, up to the region, from what is free") {
+    constexpr std::uint64_t kMb = 1ULL << 20U;
+    constexpr std::uint64_t kCap = 8000 * kMb;
+    const auto roomy = paramesh::job_commit(32 * kMb, 2, kCap, kCap, 25, kCap);
+    REQUIRE(roomy.has_value());
+    CHECK(roomy.value_or(paramesh::JobCommit{}).cache == 32 * kMb);  // the whole region
+    const auto joiner = paramesh::joiner_commit(32 * kMb, 2, kCap, 25, kCap);
+    REQUIRE(joiner.has_value());
+    CHECK(joiner.value_or(paramesh::JobCommit{}).cache == 32 * kMb);
+    const auto big = paramesh::job_commit(4096 * kMb, 2, kCap, kCap, 25, kCap);
+    REQUIRE(big.has_value());
+    CHECK(big.value_or(paramesh::JobCommit{}).cache >= 1999 * kMb);  // the share of the cap
+    const auto tight = paramesh::job_commit(4096 * kMb, 2, 3000 * kMb, kCap, 25, kCap);
+    REQUIRE(tight.has_value());
+    const paramesh::JobCommit made = tight.value_or(paramesh::JobCommit{});
+    CHECK(made.ram <= 3000 * kMb);  // never more than is free
+    CHECK(made.ram - made.cache + made.spill >= paramesh::job_share(4096 * kMb, 2));
 }
 
 TEST_CASE("a node that joins a running job commits a cache, and no spill") {

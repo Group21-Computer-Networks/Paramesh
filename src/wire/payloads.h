@@ -345,6 +345,8 @@ struct LQuotaPayload {
     std::uint64_t ram_bytes = 0;    // home store and local cache together; 0 for no cap
     std::uint64_t spill_bytes = 0;  // its spill file's budget
     std::uint16_t flags = 0;        // kQuotaNoHomes
+    std::uint64_t cache_bytes =
+        0;  // the part of ram_bytes that is the local cache; 0: use the share
 };
 // L_QUOTA flags: all of ram_bytes is the local cache, the process being home for nothing.
 inline constexpr std::uint16_t kQuotaNoHomes = 0x0001;

@@ -112,7 +112,8 @@ std::string mb(std::uint64_t bytes) {
 
 // L_QUOTA: a share of the slots and what this node committed to the job.
 LQuotaPayload quota_of(std::uint16_t slots, const JobCommit& commit) {
-    return {slots, commit.ram, commit.spill, commit.no_homes ? kQuotaNoHomes : std::uint16_t{0}};
+    return {slots, commit.ram, commit.spill, commit.no_homes ? kQuotaNoHomes : std::uint16_t{0},
+            commit.cache};
 }
 
 std::string dotted(std::uint32_t ipv4) {
@@ -642,9 +643,10 @@ void Pmd::on_spawn_req(Connection& connection, const FrameHeader& header,
         const JobCommit free = free_now();
         const bool joining = (request.flags & kSpawnMidRun) != 0;  // home for nothing: a cache
         const std::optional<JobCommit> commit =
-            joining ? joiner_commit(request.region_bytes, request.nodes, free.ram, cache_share_)
+            joining ? joiner_commit(request.region_bytes, request.nodes, free.ram, cache_share_,
+                                    config_.cap_ram)
                     : job_commit(request.region_bytes, request.nodes, free.ram, free.spill,
-                                 cache_share_);
+                                 cache_share_, config_.cap_ram);
         if (!commit) {
             decline(spawn, Status::kNoCapacity,
                     "node " + std::to_string(config_.node.value) + " cannot commit " +
@@ -1339,8 +1341,9 @@ void Pmd::on_admit_req(Connection& connection, const FrameHeader& header,
         return;
     }
     if (!run->unlimited) {  // this node's own share, as each peer commits its own
-        const std::optional<JobCommit> commit = job_commit(
-            run->wants.region_bytes, run->request.nodes, free.ram, free.spill, cache_share_);
+        const std::optional<JobCommit> commit =
+            job_commit(run->wants.region_bytes, run->request.nodes, free.ram, free.spill,
+                       cache_share_, config_.cap_ram);
         if (!commit) {
             refuse(*run, free.ram + free.spill,
                    "node " + std::to_string(config_.node.value) + " cannot commit its share, " +

@@ -397,7 +397,10 @@ public:
         // The RAM cap from pmd, split between the local cache and the home store
         // (mem.cache_share). Without pmd there is no cap.
         // A node that joined mid-run is home for nothing: all of it is the cache.
-        cache_bytes_ = (quota_flags_ & kQuotaNoHomes) != 0 ? ram_ : ram_ * s_.cache_share / 100;
+        cache_bytes_ = quota_cache_ != 0 ? quota_cache_ : ram_ * s_.cache_share / 100;
+        if ((quota_flags_ & kQuotaNoHomes) != 0) {
+            cache_bytes_ = ram_;
+        }
         const std::uint64_t cache_bytes = cache_bytes_;
         // The spill file (M4-3), of the spill pmd committed: no cap, no file. It is made beside
         // pmd's socket, in the daemon's state directory.
@@ -1174,6 +1177,7 @@ private:
         ram_ = quota.value().ram_bytes;
         spill_ = quota.value().spill_bytes;
         quota_flags_ = quota.value().flags;
+        quota_cache_ = quota.value().cache_bytes;
 
         if (is_launcher()) {
             const auto bound = static_cast<std::uint16_t>(std::min<std::uint32_t>(threads, 65535));
@@ -1207,6 +1211,7 @@ private:
             ram_ = own.value().ram_bytes;
             spill_ = own.value().spill_bytes;
             quota_flags_ = own.value().flags;
+            quota_cache_ = own.value().cache_bytes;
             for (const SegMapMember& member : admitted.value().members) {
                 if (member.node != s_.self) {
                     s_.members.push_back(Member{member.node,
@@ -2852,6 +2857,7 @@ private:
     std::uint64_t spill_ = 0;        // the spill budget pmd gave
     std::uint64_t cache_bytes_ = 0;  // the part of ram_ that is the local cache
     std::uint16_t quota_flags_ = 0;  // L_QUOTA's flags
+    std::uint64_t quota_cache_ = 0;  // L_QUOTA's cache_bytes
     std::size_t segments_ = 0;
     RegionAllocator allocator_{0};
     std::atomic<std::uint64_t> chunks_done_{0};    // on the launcher, every chunk of the job
