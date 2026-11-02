@@ -274,6 +274,10 @@ function renderAnalytics(run) {
   }
   board.append(pin("sky", ...who));
 
+  if (m.chunks_done) board.append(stat("chunks of work finished", m.chunks_done, whole, "sky"));
+  if (m.cpu_ms && run.run_ms) board.append(stat("cores busy, on average", Number((m.cpu_ms / run.run_ms).toFixed(1)), (value) => value.toFixed(1), "olive"));
+  if (m.shared_bytes) board.append(stat("shared memory allocated", m.shared_bytes, bytes, "tan"));
+  if (m.invalidations) board.append(stat("copies invalidated", m.invalidations, whole));
   if (m.page_faults) board.append(stat("page faults", m.page_faults, whole, "olive"));
   if (run.launcher_peak_kib) board.append(stat("peak memory, launcher", run.launcher_peak_kib * 1024, bytes, "tan"));
   if (m.pages_received) board.append(stat("pages received", m.pages_received, whole));
@@ -305,13 +309,14 @@ function renderAnalytics(run) {
       ["CPU time, summed over processes", ms(m.cpu_ms)], ["CPU time, launcher and pmrun", ms(run.launcher_cpu_ms)], ["Exit status", run.exit_code ?? NA]]],
     ["Distribution", [["Processes that reported", number(m.processes_reported)], ["Nodes that ran tasks", nodes ? nodes.join(", ") : NA],
       ["Worker threads on this node", number(m.worker_threads)],
-      ...chunks.map(([peer, value]) => [`Chunks run by peer ${peer}`, number(value)])]],
+      ...chunks.map(([peer, value]) => [`Chunks run by peer ${peer}`, number(value)]), ["Chunks finished", number(m.chunks_done)]]],
     ["Memory and network", [["Peak memory, launcher", run.launcher_peak_kib ? bytes(run.launcher_peak_kib * 1024) : NA],
+      ["Peak memory, largest process", m.peak_kib ? bytes(m.peak_kib * 1024) : NA], ["Shared memory allocated", bytes(m.shared_bytes)],
       ["Page data sent", bytes(m.page_bytes)], ["Page data if sent plain", bytes(m.page_bytes_plain)]]],
     ["Runtime", [["Page faults", number(m.page_faults)], ["Pages received", number(m.pages_received)], ["Pages sent", number(m.pages_sent)],
       ["Pages prefetched", number(m.pages_prefetched)], ["Requests sent again", number(m.requests_sent_again)], ["Pages sent encoded", number(m.pages_encoded)],
-      ["Pages sent as diffs", number(m.pages_as_diffs)]]],
-  ]), html("p", { className: "unmeasured", textContent: "Not measured by the runtime: tasks scheduled and completed, invalidations, CPU utilisation, workers' peak memory, shared memory allocated." }));
+      ["Pages sent as diffs", number(m.pages_as_diffs)], ["Copies invalidated", number(m.invalidations)]]],
+  ]));
   pane.replaceChildren(board, details);
 }
 

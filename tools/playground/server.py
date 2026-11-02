@@ -37,7 +37,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from translate import readable, translate
+from translate import readable
 
 JOBS = Path("/var/tmp/paramesh-play")  # kSandboxRoot in src/platform/sandbox.h
 PORT = 47080  # within what a job cannot reach (kFirstDaemonPort)
@@ -52,6 +52,8 @@ NAME = re.compile(r"[A-Za-z0-9_-]{2,24}")
 TRIES = 5  # wrong passwords or invite codes from one address before it must wait
 TRIES_WAIT = 60
 LOCAL = "this machine"
+TRANSLATE_SECONDS = 5
+TRANSLATOR = Path(__file__).resolve().parent / "translate.py"
 SITE = Path(__file__).resolve().parent.parent / "site"
 PAGES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -384,7 +386,7 @@ class Service:
         try:
             JOBS.mkdir(mode=0o755, exist_ok=True)
             directory.mkdir(mode=0o700)
-            translated, notes = translate(source, self.args.region_mb << 20) if nodes > 1 else (source, [])
+            translated, notes = self.convert(source, directory) if nodes > 1 else (source, [])
             (directory / "main.c").write_text(translated)
             run["program"] = hashlib.sha256(source.encode()).hexdigest()[:16]
             run["nodes_asked"] = nodes
@@ -413,6 +415,22 @@ class Service:
             with self.lock:
                 self.busy = False
                 self.next_run()
+
+    def convert(self, source, directory):
+        """The translator reads a stranger's text, so it runs as the compiler does: sandboxed, and
+        stopped if it takes too long. If it fails, the program runs as it was written."""
+        (directory / "input.c").write_text(source)
+        shutil.copy(TRANSLATOR, directory / "translator.py")
+        command = [str(self.bin / "pm"), "sandbox", str(directory), "python3", "-I", "translator.py",
+                   "--json", str(self.args.region_mb << 20), "input.c"]
+        environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8", "HOME": str(directory)}
+        try:
+            done = subprocess.run(command, cwd=directory, env=environment, capture_output=True,
+                                  text=True, timeout=TRANSLATE_SECONDS)
+            answer = json.loads(done.stdout)
+            return answer["program"], answer["notes"]
+        except (subprocess.TimeoutExpired, ValueError, KeyError):
+            return source, ["the translator could not read this program, so it runs on one laptop"]
 
     def compile(self, run, directory):
         begin = time.monotonic()
@@ -644,6 +662,10 @@ def metrics(run, chunks):
         "nodes_ran_tasks": participants,
         "worker_threads": sum(run.get("slots", {}).get(str(job)) or 0 for job in jobs) or None,
         "cpu_ms": total("cpu_ms"),
+        "chunks_done": max((p.get("chunks_done", 0) for p in processes.values()), default=None),
+        "invalidations": total("invalidations"),
+        "peak_kib": max((p.get("peak_kib", 0) for p in processes.values()), default=None),
+        "shared_bytes": max((p.get("shared_bytes", 0) for p in processes.values()), default=None),
         "page_faults": total("faults"),
         "pages_received": total("received"),
         "pages_sent": total("sent"),
@@ -782,7 +804,13 @@ class Handler(BaseHTTPRequestHandler):
             elif not isinstance(source, str) or len(source.encode()) > MAX_SOURCE:
                 self.reply(400, {"error": f"the program must be text, at most {MAX_SOURCE} bytes"})
             else:
-                translated, notes = translate(source, service.args.region_mb << 20)
+                directory = JOBS / f"convert-{uuid.uuid4().hex}"
+                try:
+                    JOBS.mkdir(mode=0o755, exist_ok=True)
+                    directory.mkdir(mode=0o700)
+                    translated, notes = service.convert(source, directory)
+                finally:
+                    shutil.rmtree(directory, ignore_errors=True)
                 self.reply(200, {"source": readable(translated), "changed": translated != source, "notes": notes})
         elif path == "/api/run":
             if self.person() is None:

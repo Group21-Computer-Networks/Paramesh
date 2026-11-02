@@ -33,6 +33,9 @@ public:
         return start;
     }
 
+    // The bytes handed out so far, with what alignment left between them.
+    [[nodiscard]] std::uint64_t used() const noexcept { return next_; }
+
 private:
     std::uint64_t next_ = 0;
     std::uint64_t end_;
