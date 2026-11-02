@@ -35,7 +35,8 @@ other functions stay. If the translated program does not compile, the original r
 - A `double` total adds up in any order, so its last digits can differ between runs.
 - The checks read C with patterns. They see no aliasing they cannot find in `main()`, such as a
   pointer changed through another pointer.
-- A loop that updates an array (`c[i][j] += x`) counts twice if a laptop leaves in the middle.
+- A loop that updates an array (`c[i][j] += x`) stays: its part could count twice if a laptop left.
+- The translator runs sandboxed and is stopped after 5 s; a program it cannot read runs as written.
 
 ## People and turns
 
@@ -97,9 +98,8 @@ Read this before letting anyone run code.
 
 ## Statistics
 
-Every number comes from a measurement. What nothing measures reads "Not available": tasks
-scheduled and completed, invalidations, CPU utilisation, shared memory allocated, and workers'
-peak memory.
+Every number comes from a measurement. Each process reports chunks finished, copies invalidated,
+peak memory and shared memory as it exits. "Cores busy" is CPU time over wall clock.
 
 | Figure | Source |
 | --- | --- |

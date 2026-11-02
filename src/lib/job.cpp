@@ -638,6 +638,7 @@ public:
     // log says so: with the thrash report, which names nodes, it tells which tasks fought.
     void chunk_finished(NodeId ran_by, std::uint64_t task_id, std::uint64_t indexes,
                         Nanos cpu) noexcept override {
+        chunks_done_.fetch_add(1, std::memory_order_relaxed);
         report(Opcode::kLChunk,
                LChunkPayload{ran_by, task_id, indexes, static_cast<std::uint64_t>(cpu.count())});
         {
@@ -1989,6 +1990,12 @@ private:
     // pages, reached it from other nodes.
     // With this process's whole counts, as L_STATS has them (M6-5 reads them from here, since a
     // short job ends before its first report).
+    // This process's largest resident size so far, in KiB.
+    static std::int64_t peak_kib() noexcept {
+        rusage usage{};
+        return ::getrusage(RUSAGE_SELF, &usage) == 0 ? std::int64_t{usage.ru_maxrss} : 0;
+    }
+
     // This process's CPU time so far, user and system, in ms.
     static std::int64_t cpu_ms() noexcept {
         rusage usage{};
@@ -2019,6 +2026,10 @@ private:
                 {"encoded", JsonValue{static_cast<std::int64_t>(encoded_)}},
                 {"diffs", JsonValue{static_cast<std::int64_t>(diffs_)}},
                 {"cpu_ms", JsonValue{cpu_ms()}},
+                {"peak_kib", JsonValue{peak_kib()}},
+                {"chunks_done", JsonValue{static_cast<std::int64_t>(chunks_done_.load())}},
+                {"invalidations", JsonValue{static_cast<std::int64_t>(invalidations_.load())}},
+                {"shared_bytes", JsonValue{static_cast<std::int64_t>(allocator_.used())}},
                 {"latency", JsonValue{std::move(latency)}}});
     }
 
@@ -2218,6 +2229,7 @@ private:
                         node_event(NodeEventKind::kWritebackAck, page, header.req, {}, false);
                         break;
                     case Opcode::kInv:
+                        invalidations_.fetch_add(1, std::memory_order_relaxed);
                         node_event(NodeEventKind::kInv, page, header.req, {}, false, header.src);
                         break;
                     case Opcode::kFetch:
@@ -2839,6 +2851,8 @@ private:
     std::uint16_t quota_flags_ = 0;  // L_QUOTA's flags
     std::size_t segments_ = 0;
     RegionAllocator allocator_{0};
+    std::atomic<std::uint64_t> chunks_done_{0};    // on the launcher, every chunk of the job
+    std::atomic<std::uint64_t> invalidations_{0};  // INV received
 
     // Network thread only; joined_ is written under mutex_, which start() holds to read it.
     std::unordered_set<std::uint16_t> joined_;

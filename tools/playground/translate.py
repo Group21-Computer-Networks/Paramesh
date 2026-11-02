@@ -9,6 +9,7 @@ a wrong split would be a wrong answer with no error, and a loop left alone is on
 
     tools/playground/translate.py in.c > out.c
 """
+import json
 import re
 import sys
 
@@ -315,6 +316,8 @@ def study(program, loop):
         raise Stay(f"it uses {found[1]}")
     if re.search(r"\bbreak\b", outside_inner_loops(body)):
         raise Stay("it can stop early with break, so its steps cannot run at the same time")
+    if re.search(r"^[ \t]*#", program.source[begin:end], re.M):
+        raise Stay("it has preprocessor lines inside it")
     found = UNSAFE.search(body)
     if found:
         raise Stay(f"it calls {found[1]}(), which has to happen in order on this laptop")
@@ -324,8 +327,8 @@ def study(program, loop):
         raise Stay("it takes an address, so what it changes cannot be seen")
     for called in sorted(calls(body) - KNOWN):
         if called in program.macros:
-            if UNSAFE.search(program.macros[called]):
-                raise Stay(f"its macro {called} has side effects")
+            if UNSAFE.search(program.macros[called]) or re.search(rf"={UPDATE}|\+\+|--|[^=!<>]=[^=]", program.macros[called]):
+                raise Stay(f"its macro {called} may have side effects")
         elif not pure(program, called):
             raise Stay(f"it calls {called}(), which may have side effects")
     if re.search(rf"(?:\b{index}{UPDATE}|(?:\+\+|--)\s*\b{index}\b)", body) and \
@@ -369,6 +372,9 @@ def study_array(program, loop, body, v):
         raise Stay(f"it writes through *{name}")
     writes = re.search(rf"\b{name}\s*(?:\[[^\]]*\])+{UPDATE}|(?:\+\+|--)\s*\b{name}\s*\[", body)
     if writes:
+        if re.search(rf"\b{name}\s*(?:\[[^\]]*\])+\s*(?:[-+*/%&|^]=|\+\+|--)|(?:\+\+|--)\s*\b{name}\s*\[", body):
+            raise Stay(f"it updates {name} in place, which would count twice if a laptop left and its "
+                       "part ran again; add up in a local variable, then assign")
         for use in re.finditer(rf"\b{name}\s*\[([^\]]*)\]", body):
             if use[1].strip() != index:
                 raise Stay(f"{name} is written, and {name}[{use[1].strip()}] means one step depends "
@@ -402,8 +408,14 @@ def can_share(program, loop, v):
             raise Stay(f"{name} must get its memory once, straight from malloc() or calloc()")
         if program.depth(program.open + alloc.start()) != program.depth(program.open) + 1:
             raise Stay(f"{name} is allocated inside a block")
-        if re.search(rf"[=(,]\s*{name}\s*[;,)+]", text) and re.search(rf"=\s*{name}\s*[;+]", text):
+        if re.search(rf"=\s*(?:\([^)]*\)\s*)?&?\s*{name}\s*[;+\[-]", text):
             raise Stay(f"another pointer is set from {name}")
+    for call in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", text):
+        if call[1] in KNOWN or call[1] in ("free", "printf", "memset", "memcpy", "qsort") or call[1] in MATH:
+            continue
+        inside = text[call.end():closing(text, call.end() - 1)]
+        if re.search(rf"\b{name}\b(?!\s*\[)", inside) and not pure(program, call[1]):
+            raise Stay(f"{name} is passed to {call[1]}(), which could keep a copy of the pointer")
 
 
 def generate(program, number, loop):
@@ -516,10 +528,6 @@ def try_loops(program, begin, end, notes):
             floats = [n for n in loop.reductions if known[n].base in ("double", "float", "long double")]
             if floats:
                 note += f" ({floats[0]} adds up in any order, so its last digits can differ between runs)"
-            updated = [n for n in loop.captured if re.search(rf"\b{n}\s*(?:\[[^\]]*\])+\s*(?:[-+*/%]=|\+\+|--)",
-                                                              masked[loop.body[0]:loop.body[1]])]
-            if updated:
-                note += f" (if a laptop leaves mid-run, its part of {updated[0]} is counted twice)"
             notes.append(note)
             at = loop.end
         except Stay as stay:
@@ -583,6 +591,11 @@ def readable(program):
 
 
 def main():
+    if sys.argv[1] == "--json":  # how the website asks, from inside the sandbox
+        with open(sys.argv[3]) as file:
+            text, notes = translate(file.read(), int(sys.argv[2]))
+        print(json.dumps({"program": text, "notes": notes}))
+        return 0
     with open(sys.argv[1]) as file:
         text, notes = translate(file.read())
     print(text, end="")

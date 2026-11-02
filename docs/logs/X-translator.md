@@ -49,6 +49,16 @@ and the next step.
 - Check added to `playground_checks.py`. `tests/multi/run_playground.sh build/dev` printed PASS. The page
   itself was not opened in a browser.
 
+### 2026-11-02 — session 3 (fix): the loopholes the person chose
+
+- The translator now runs under `pm sandbox`, stopped after 5 s. A loop that updates an array in place stays,
+  in place of a warning, so nothing can count twice. A shared pointer handed to a function that might keep it
+  stays, and so do preprocessor lines in a loop and macros that change state. Four cases added.
+- The runtime reports `chunks_done`, `invalidations`, `peak_kib` and `shared_bytes` in `job_pages`. The check
+  "no figure is invented" named `invalidations` as absent; now it is measured, so the check requires it.
+- `tests/multi/run_playground.sh build/dev` printed PASS. `unit.lib`, `unit.rt` and the tidy build of the library
+  are in the Verification above this PR's CI. Not run on the two real laptops.
+
 ## Files touched
 
 <!--
@@ -68,6 +78,8 @@ Example:  - `src/net/epoll_loop.cpp` — epoll wrapper and timer wheel
 - `tests/multi/translate_checks.py` — each program run both ways
 - `tests/multi/run_playground.sh` — runs those checks
 - `docs/PLAYGROUND.md` — how it behaves
+- `src/lib/job.cpp` — four more figures
+- `src/rt/region_allocator.h` — bytes used
 - `docs/TODO.md` — its limits
 - `docs/logs/X-translator.md` — this log
 

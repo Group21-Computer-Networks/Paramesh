@@ -84,7 +84,8 @@ metric = state.get("metrics", {})
 check("two nodes both ran tasks and reported", sorted(metric.get("nodes_ran_tasks", [])) == [1, 2] and metric.get("processes_reported") == 2, metric)
 check("the output is right", state.get("stdout") == "8999997\n", state.get("stdout"))
 check("page counts come from the processes", metric.get("page_faults", 0) > 0 and metric.get("cpu_ms", 0) > 0, metric)
-check("no figure is invented", all(k not in metric for k in ("invalidations", "tasks_scheduled")))
+check("no figure is invented", "tasks_scheduled" not in metric and metric.get("chunks_done", 0) > 0
+      and metric.get("shared_bytes", 0) > 0 and metric.get("peak_kib", 0) > 0 and "invalidations" in metric, metric)
 check("chunks by peer come from the ledger", int(metric.get("chunks_by_peer", {}).get("2", 0)) > 0, metric.get("chunks_by_peer"))
 
 state = run("int main(void) { return x }")
