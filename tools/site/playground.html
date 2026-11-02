@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Karla:wght@400;500;600;700&family=Prata&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/site.css">
+<link rel="stylesheet" href="/playground.css">
 </head>
 <body class="play">
 <header class="nav"><div class="wrap">
@@ -23,6 +24,7 @@
 <div class="toolbar">
   <button class="button solid" id="run">Run Code</button>
   <button class="button" id="convert">Convert</button>
+  <button class="button" id="compare" title="Run it as written on one core, then across every node, and show the speedup">Compare</button>
   <button class="button" id="stop" disabled>Stop</button>
   <label>Nodes <select id="nodes"><option>1</option></select></label>
   <label id="code-field" hidden>Access code <input id="code" autocomplete="off" spellcheck="false"></label>
@@ -46,7 +48,8 @@
       <button class="icon" id="copy-output">Copy</button>
       <button class="icon" id="download-output">Download</button>
     </div>
-    <div class="pane" id="pane-output"></div>
+    <div class="live-strip" id="live-strip" aria-label="What each node is doing now" hidden></div>
+    <div class="pane" id="pane-output" aria-live="polite"></div>
     <div class="pane" id="pane-converted" hidden></div>
     <div class="pane" id="pane-analytics" hidden></div>
     <div class="pane" id="pane-history" hidden></div>

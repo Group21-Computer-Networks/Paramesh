@@ -91,6 +91,9 @@ and the next step.
   on two loopback nodes: left for the dashboard mid-run, came back, output and analytics were there.
 - At the person's request, the dashboard shows the whole pool: each site asks the others for their figures at
   `/node/usage`, with the pool token, and `/api/pool` gives them to the page. Live cards for each node.
+- The site's audit, the person's pick: `playground.css` and `dashboard.css` split from `site.css`, so a page's classes
+  cannot clash with another's, which caused two layout bugs. A live strip of nodes and a count against the time limit
+  during a run. Compare runs one node, then all, and gives the speedup and whether the outputs match.
 - NOT tested: the real two laptops. The new `pmd` and server need installing on both, which needs
   the person's sudo. Running on 127.0.0.1, peers skip staging; POST /node/stage is unexercised.
 - Next: the person installs on both laptops and runs a two-node job.

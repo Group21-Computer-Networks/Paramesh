@@ -60,6 +60,8 @@ PAGES = {
     "/dashboard": ("dashboard.html", "text/html; charset=utf-8"),
     "/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
     "/site.css": ("site.css", "text/css; charset=utf-8"),
+    "/playground.css": ("playground.css", "text/css; charset=utf-8"),
+    "/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
     "/arch.js": ("arch.js", "text/javascript; charset=utf-8"),
     "/home.js": ("home.js", "text/javascript; charset=utf-8"),
     "/playground.js": ("playground.js", "text/javascript; charset=utf-8"),
@@ -744,7 +746,8 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 self.reply(404, {"error": "no such page"})
         elif path == "/api/cluster":
-            self.reply(200, {**service.cluster(), "access_code": service.code is not None and not self.is_local()})
+            self.reply(200, {**service.cluster(), "access_code": service.code is not None and not self.is_local(),
+                              "run_seconds": service.args.timeout})
         elif path == "/api/pool":
             self.reply(200, service.pool())
         elif path == "/node/usage" and self.token_ok():
