@@ -826,12 +826,29 @@ TEST_CASE("an INV_ACK that arrives just after its sender left is ignored") {
     CHECK(home.does(kInvAck, 2) == "WRITE_GRANT>4:zero");
 }
 
-TEST_CASE("a leaver that owes the home the only copy of a page ends the job, with no zeros") {
+// Soak, run 10: the page was on its way over the leaver's connection when the map came over the
+// launcher's, and the home ended the job.
+TEST_CASE("a page a leaver sent before it left still arrives after the map that drops it") {
     Home home;
     home.send(kWrite, 3);
     REQUIRE(home.does(kRead, 2) == "FETCH>3");
     std::vector<HomeAction> out;
     paramesh::home_drop_member(*home.directory, paramesh::Slot{3}, home.now, out);
+    CHECK(out.empty());
+    CHECK(home.entry().wait == HomeWait::kFetch);
+    CHECK_FALSE(home.does(kFetchData, 3).empty());
+    CHECK(home.entry().wait == HomeWait::kIdle);
+    paramesh::home_member_closed(*home.directory, NodeId{3}, out);
+    CHECK(out.empty());  // it owes nothing now
+}
+
+TEST_CASE("a leaver's connection closing with a page still owed ends the job, with no zeros") {
+    Home home;
+    home.send(kWrite, 3);
+    REQUIRE(home.does(kRead, 2) == "FETCH>3");
+    std::vector<HomeAction> out;
+    paramesh::home_drop_member(*home.directory, paramesh::Slot{3}, home.now, out);
+    paramesh::home_member_closed(*home.directory, NodeId{3}, out);
     CHECK(text(out) == "abort");
 }
 
