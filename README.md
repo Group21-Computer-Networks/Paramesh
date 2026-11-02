@@ -30,8 +30,7 @@ number crunching. Small loops run slower, because a network hop costs far more t
 
 ```mermaid
 flowchart LR
-    A[Write C in the playground] --> B[Sign in]
-    B --> C[Convert: safe loops become tasks]
+    A[Write C in the playground] --> C[Convert: safe loops become tasks]
     C --> D[Wait your turn in line]
     D --> E[Compile in the sandbox]
     E --> F[Copy the program to the other laptops]
@@ -75,7 +74,7 @@ Both laptops need Linux 6.7 or later for the playground, and must reach each oth
    ```
 
 7. Open `http://127.0.0.1:47080/playground`, or `http://ADDRESS:47080/` from another machine.
-   Register with a name, a password and the access code, set Nodes to 2, and run an example.
+   From another machine, enter the access code. Set Nodes to 2 and run an example.
 
 If nodes cannot see each other, allow the pool through the firewall, for example
 `sudo ufw allow from 10.0.0.0/8`. To remove everything:
@@ -97,15 +96,15 @@ laptop.
 | Pool | Discovery, invite codes across subnets, caps on cores and RAM, and spill to disk. |
 | Changing pool | A planned `pm leave`, joining a running job, and optional re-homing of segments. |
 | Fairness | A ledger per node weights free slots, and what a peer claims never changes a weight. |
-| People | Self-registration, one line per laptop, turns, and private runs. |
+| Sharing | An access code, one line per laptop, turns between machines, and private runs. |
 | Sandbox | Compiles and jobs run under Landlock, a system-call filter and limits. |
 | Seeing it | A website, a playground, a live dashboard, Analytics, `pm status` and `pm top`. |
 
 ## Known limits
 
-- **Trusted network only.** Passwords, codes and the pool token cross the LAN in plain HTTP, and a
+- **Trusted network only.** The access code and the pool token cross the LAN in plain HTTP, and a
   captured start request can be replayed. Never put this on the internet.
-- **One person can hold more places** with several accounts on several machines.
+- **Turns are per machine,** so anyone with several machines can hold more places.
 - **Fairness between laptops is by node,** not by person, and each laptop has its own line.
 - **A laptop that crashes ends every job using it.** Only a planned leave is survived.
 - **The translator reads C with patterns,** not a parser. It handles counted `for` loops in `main()`,

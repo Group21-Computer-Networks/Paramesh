@@ -40,6 +40,13 @@ and the next step.
   With that stopped, `tests/multi/run_playground.sh build/dev` printed PASS.
 - The sign-in dialog itself has not been clicked through in a browser.
 
+### 2026-11-02 — session (fix): the access code again
+
+- The person dropped accounts: a normal access code, nothing else. Register, sign-in, sessions and the accounts
+  file are gone. A person is a machine, by address, and the site's own machine needs no code. Turns, private runs
+  and the lockout stay, keyed by address. `tests/multi/run_playground.sh build/dev` printed PASS, on the second try:
+  the first could not reach the test server, once, and did not repeat.
+
 ## Files touched
 
 <!--
@@ -55,6 +62,7 @@ Example:  - `src/net/epoll_loop.cpp` — epoll wrapper and timer wheel
 - `tools/site/site.css` — its look
 - `tests/multi/playground_checks.py` — checks
 - `docs/PLAYGROUND.md` — how it behaves
+- `README.md` — how to use it
 - `docs/logs/X-accounts.md` — this log
 
 ## Decisions

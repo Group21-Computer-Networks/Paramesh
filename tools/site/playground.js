@@ -86,9 +86,7 @@ async function poolStatus() {
     if (answer.ok) cluster = await answer.json();
   } catch { /* shown below */ }
   $("dot").classList.toggle("on", cluster.online && cluster.member === "joined");
-  needsSignIn = Boolean(cluster.access_code) && !session;
-  $("who").hidden = !cluster.access_code;
-  $("who").textContent = session ? `${who}, sign out` : "Sign in";
+  $("code-field").hidden = !cluster.access_code;
   if (!cluster.online) {
     $("pool").textContent = "pmd is not answering";
   } else if (cluster.member !== "joined") {
@@ -368,7 +366,6 @@ async function convert() {
   return true;
 }
 
-// Who is using this page. The session lasts until the server restarts or the person signs out.
 const remembered = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
 function remember(key, value) {
   try {
@@ -376,52 +373,12 @@ function remember(key, value) {
     else localStorage.setItem(key, value);
   } catch { /* it lasts as long as the page, then */ }
 }
-let session = remembered("pm-session");
-let who = remembered("pm-name");
-let needsSignIn = false;
 
 function asking() {
-  return { "Content-Type": "application/json", ...(session ? { "X-Session": session } : {}) };
-}
-
-function signedIn(token, name) {
-  session = token;
-  who = name;
-  needsSignIn = !token;
-  try {
-    if (token) {
-      localStorage.setItem("pm-session", token);
-      localStorage.setItem("pm-name", name);
-    } else {
-      localStorage.removeItem("pm-session");
-      localStorage.removeItem("pm-name");
-    }
-  } catch { /* it lasts as long as the page, then */ }
-  $("who").textContent = token ? `${name}, sign out` : "Sign in";
-}
-
-async function enter(path) {
-  const problem = $("who-problem");
-  problem.hidden = true;
-  try {
-    const answer = await fetch(path, { method: "POST",
-      headers: { "Content-Type": "application/json", "X-Access-Code": $("code").value.trim() },
-      body: JSON.stringify({ name: $("who-name").value.trim(), password: $("who-password").value }) });
-    const body = await answer.json();
-    if (!answer.ok) throw new Error(body.error);
-    signedIn(body.session, body.name);
-    $("signin").close();
-  } catch (failure) {
-    problem.textContent = failure.message || "The playground server is not answering.";
-    problem.hidden = false;
-  }
+  return { "Content-Type": "application/json", "X-Access-Code": $("code").value.trim() };
 }
 
 async function runProgram() {
-  if (needsSignIn) {
-    $("signin").showModal();
-    return;
-  }
   const headers = asking();
   if (Number($("nodes").value) > 1) {  // the converted code first, then the run
     showTab("converted");
@@ -501,10 +458,6 @@ $("reset").onclick = () => setCode(chosen().source);
 $("clear").onclick = () => setCode("");
 $("copy").onclick = () => navigator.clipboard?.writeText(code());
 $("run").onclick = runProgram;
-$("who").onclick = () => (session ? signedIn(null, null) : $("signin").showModal());
-$("who-register").onclick = () => enter("/api/register");
-$("who-login").onclick = () => enter("/api/login");
-$("who-cancel").onclick = () => $("signin").close();
 $("convert").onclick = async () => {
   showTab("converted");
   await convert();
@@ -532,6 +485,8 @@ $("download-output").onclick = () => {
 };
 
 $("nodes").onchange = () => remember("pm-nodes", $("nodes").value);
+$("code").value = remembered("pm-access") ?? "";
+$("code").oninput = () => remember("pm-access", $("code").value.trim());
 
 emptyPanes();
 startEditor();
