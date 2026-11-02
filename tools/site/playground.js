@@ -33,7 +33,8 @@ function fallbackEditor() {
     area.setRangeText("    ", area.selectionStart, area.selectionEnd, "end");
   });
   $("editor").replaceChildren(area);
-  area.value = examples[3].source;
+  area.value = remembered("pm-code") ?? examples[3].source;
+  area.addEventListener("input", () => remember("pm-code", area.value));
 }
 
 function startEditor() {
@@ -52,9 +53,10 @@ function startEditor() {
         { token: "comment", foreground: "8795a8" }, { token: "keyword", foreground: "9dc2de" },
         { token: "string", foreground: "dcc497" }],
         colors: { "editor.background": "#1e3550", "editor.lineHighlightBackground": "#28425f" } });
-      editor = api.editor.create($("editor"), { value: examples[3].source, language: "c", theme: "paramesh-paper",
+      editor = api.editor.create($("editor"), { value: remembered("pm-code") ?? examples[3].source, language: "c", theme: "paramesh-paper",
         automaticLayout: true, minimap: { enabled: false }, fontFamily: "IBM Plex Mono, monospace", fontSize: 14,
         tabSize: 4, insertSpaces: true, autoIndent: "full", matchBrackets: "always", scrollBeyondLastLine: false });
+      editor.onDidChangeModelContent(() => remember("pm-code", editor.getValue()));
       api.languages.registerCompletionItemProvider("c", { provideCompletionItems: (model, position) => {
         const word = model.getWordUntilPosition(position);
         const range = { startLineNumber: position.lineNumber, endLineNumber: position.lineNumber,
@@ -97,7 +99,7 @@ async function poolStatus() {
   const select = $("nodes");
   const count = Math.max(1, cluster.online ? cluster.nodes : 1);
   if (select.options.length !== count) {
-    const kept = select.value;
+    const kept = remembered("pm-nodes") ?? select.value;
     select.replaceChildren(...Array.from({ length: count }, (_, i) => html("option", { textContent: i + 1 })));
     select.value = Math.min(kept, count);
   }
@@ -107,6 +109,7 @@ async function poolStatus() {
 // ---- running ---------------------------------------------------------------------------------
 
 function showTab(name) {
+  remember("pm-tab", name);
   for (const tab of ["output", "converted", "analytics", "history"]) {
     $(`tab-${tab}`).setAttribute("aria-selected", tab === name);
     $(`pane-${tab}`).hidden = tab !== name;
@@ -367,6 +370,12 @@ async function convert() {
 
 // Who is using this page. The session lasts until the server restarts or the person signs out.
 const remembered = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
+function remember(key, value) {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  } catch { /* it lasts as long as the page, then */ }
+}
 let session = remembered("pm-session");
 let who = remembered("pm-name");
 let needsSignIn = false;
@@ -438,25 +447,40 @@ async function runProgram() {
     running(false);
     return;
   }
-  current = body.id;
+  remember("pm-run", body.id);
+  await follow(body.id);
+}
+
+// Shows a run until it ends. The run belongs to the server, so a page that was closed, or left
+// for the dashboard, comes back to it here.
+async function follow(id) {
+  current = id;
+  running(true);
   while (current) {
-    await new Promise((done) => setTimeout(done, 250));
     let state;
     try {
       state = await (await fetch(`/api/run/${current}`, { headers: asking() })).json();
     } catch {
+      await new Promise((done) => setTimeout(done, 250));
       continue;
+    }
+    if (!state.state) {  // gone: the server restarted, or someone else signed in
+      remember("pm-run", null);
+      current = null;
+      break;
     }
     last = state;
     if (state.state === "queued") {
       $("pane-output").replaceChildren(html("p", { className: "notice", textContent: `You are number ${state.place} in line. Everyone takes turns.` }));
-      continue;
+    } else {
+      renderOutput(state);
+      renderAnalytics(state);
     }
-    renderOutput(state);
-    renderAnalytics(state);
     if (state.state === "done") {
       markErrors(state.diagnostics);
       current = null;
+    } else {
+      await new Promise((done) => setTimeout(done, 250));
     }
   }
   running(false);
@@ -498,7 +522,7 @@ $("tab-analytics").onclick = () => {
   if (last?.state === "done") renderAnalytics(last);  // the board fills in as it comes into view
 };
 $("tab-history").onclick = () => showTab("history");
-$("clear-output").onclick = () => { last = null; emptyPanes(); };
+$("clear-output").onclick = () => { last = null; remember("pm-run", null); emptyPanes(); };
 $("copy-output").onclick = () => last && navigator.clipboard?.writeText(outputText(last));
 $("download-output").onclick = () => {
   if (!last) return;
@@ -507,7 +531,11 @@ $("download-output").onclick = () => {
   URL.revokeObjectURL(link.href);
 };
 
+$("nodes").onchange = () => remember("pm-nodes", $("nodes").value);
+
 emptyPanes();
 startEditor();
 poolStatus();
+if (remembered("pm-run")) follow(remembered("pm-run"));
+showTab(remembered("pm-tab") ?? "output");
 setInterval(poolStatus, 4000);

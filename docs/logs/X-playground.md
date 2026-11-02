@@ -86,6 +86,9 @@ and the next step.
   line under the full table, not rows of Not available. Checked in the browser with a real 2-node run on loopback.
 - The analytics board's class `.board` was the dashboard's too, so the dashboard fell into three columns on v0.1.0.
   The person saw it. It is `.pinboard` now; checked in the browser at 1440x900: two panels, no overlap.
+- At the person's request, the page keeps its place: code, nodes, tab and the run it follows are in localStorage, and
+  a page that comes back follows the run to its end. Dashboard opens in a new tab. Checked in the browser with a 6 s run
+  on two loopback nodes: left for the dashboard mid-run, came back, output and analytics were there.
 - NOT tested: the real two laptops. The new `pmd` and server need installing on both, which needs
   the person's sudo. Running on 127.0.0.1, peers skip staging; POST /node/stage is unexercised.
 - Next: the person installs on both laptops and runs a two-node job.
