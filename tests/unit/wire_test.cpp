@@ -367,6 +367,7 @@ TEST_CASE("the daemon payloads: SPAWN_REQ, SPAWN_OK, SPAWN_DECLINE, L_REGISTER a
     spawn.region_bytes = 0x10000000;
     spawn.binary_hash.fill(std::byte{0xAB});
     spawn.nodes = 3;
+    spawn.pool_tag.fill(std::byte{0xCD});
     spawn.path = "/a";
     spawn.cwd = "/b";
     spawn.argv = {"x", ""};
@@ -375,7 +376,10 @@ TEST_CASE("the daemon payloads: SPAWN_REQ, SPAWN_OK, SPAWN_DECLINE, L_REGISTER a
     // str16 "x", str16 "".
     Bytes expected = hex("00 03 00 01 0A 00 00 01 13 88 00 04 00 00 00 00 10 00 00 00");
     expected.insert(expected.end(), 32, std::byte{0xAB});
-    const Bytes tail = hex("00 03 00 00 00 02 2F 61 00 02 2F 62 00 02 00 01 78 00 00");
+    const Bytes middle = hex("00 03 00 00");
+    expected.insert(expected.end(), middle.begin(), middle.end());
+    expected.insert(expected.end(), 32, std::byte{0xCD});  // the pool tag
+    const Bytes tail = hex("00 02 2F 61 00 02 2F 62 00 02 00 01 78 00 00");
     expected.insert(expected.end(), tail.begin(), tail.end());
     CHECK(bytes == expected);
     const auto back = paramesh::wire_decode_spawn_req(bytes);
@@ -387,6 +391,7 @@ TEST_CASE("the daemon payloads: SPAWN_REQ, SPAWN_OK, SPAWN_DECLINE, L_REGISTER a
     CHECK(back.value().region_bytes == 0x10000000);
     CHECK(back.value().binary_hash == spawn.binary_hash);
     CHECK(back.value().nodes == 3);
+    CHECK(back.value().pool_tag == spawn.pool_tag);
     CHECK(back.value().path == "/a");
     CHECK(back.value().cwd == "/b");
     CHECK(back.value().argv == spawn.argv);

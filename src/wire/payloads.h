@@ -178,10 +178,11 @@ struct SpawnReqPayload {
     std::uint16_t threads_per_node = 0;
     std::uint64_t region_bytes = 0;
     std::array<std::byte, 32> binary_hash{};
-    std::uint16_t nodes = 0;        // the N the job asked for: each node commits region / N
-    std::string path;               // absolute, the same on every node
-    std::string cwd;                // the launcher's working directory
-    std::vector<std::string> argv;  // without the program name
+    std::uint16_t nodes = 0;               // the N the job asked for: each node commits region / N
+    std::array<std::byte, 32> pool_tag{};  // signed with the pool token, all zero without one
+    std::string path;                      // absolute, the same on every node
+    std::string cwd;                       // the launcher's working directory
+    std::vector<std::string> argv;         // without the program name
 };
 inline constexpr std::size_t kMaxSpawnReq = 65536;
 

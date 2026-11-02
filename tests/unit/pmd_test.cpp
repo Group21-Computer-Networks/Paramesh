@@ -12,6 +12,7 @@
 #include "pmd/ledger.h"
 #include "pmd/ledger_status.h"
 #include "pmd/peers.h"
+#include "pmd/pool_key.h"
 #include "pmd/scheduler.h"
 #include "tools/pm.h"
 #include "wire/payloads.h"
@@ -863,6 +864,54 @@ TEST_CASE("a binary with a different hash is refused with \"binary mismatch\"") 
           "binary mismatch: " + own_path() + " on node 5 is not the launcher's executable");
     ::usleep(300000);
     CHECK_FALSE(std::filesystem::exists(report));  // and no process was started
+}
+
+// X-lock-pmd: anyone on the LAN could ask pmd to start a program.
+TEST_CASE("a node with a pool token starts nothing for a request that is not signed with it") {
+    const Daemon daemon;
+    std::ofstream{daemon.state_dir + "/playground.token"} << "the pool's token\n";
+    const std::string report = daemon.state_dir + "/report";
+    paramesh::SpawnReqPayload request = daemon.request(report);
+    REQUIRE(send(daemon.control, daemon.platform, Opcode::kSpawnReq, 33, request));
+    const Frame unsigned_reply = daemon.reply();
+    REQUIRE(unsigned_reply.header.opcode == Opcode::kSpawnDecline);
+    auto declined = paramesh::wire_decode_spawn_decline(unsigned_reply.payload);
+    REQUIRE(declined.ok());
+    CHECK(declined.value().status == Status::kDeclined);
+    CHECK(declined.value().message == "this request is not from a node of the pool");
+
+    request.pool_tag =
+        paramesh::spawn_tag(*daemon.platform.hasher, "another pool's token", 7, 34, request);
+    REQUIRE(send(daemon.control, daemon.platform, Opcode::kSpawnReq, 34, request));
+    declined = paramesh::wire_decode_spawn_decline(daemon.reply().payload);
+    REQUIRE(declined.ok());
+    CHECK(declined.value().message == "this request is not from a node of the pool");
+    ::usleep(300000);
+    CHECK_FALSE(std::filesystem::exists(report));
+}
+
+TEST_CASE("nodes that share a pool token run a job together") {
+    const ThreeNodes nodes{};
+    for (const Daemon* daemon : {&nodes.one, &nodes.two, &nodes.three}) {
+        std::ofstream{daemon->state_dir + "/playground.token"} << "the pool's token\n";
+    }
+    const pid_t pmrun = nodes.run("3", "go");
+    CHECK(exit_status(pmrun, 60) == 0);
+}
+
+TEST_CASE("the pool tag covers what is asked, and a tag is compared in full") {
+    const paramesh::Platform platform = quiet_platform();
+    paramesh::SpawnReqPayload request;
+    request.path = "/a";
+    const paramesh::Sha256 tag = paramesh::spawn_tag(*platform.hasher, "token", 1, 2, request);
+    CHECK(tag != paramesh::Sha256{});
+    CHECK(paramesh::spawn_tag(*platform.hasher, "", 1, 2, request) == paramesh::Sha256{});
+    CHECK_FALSE(
+        paramesh::same_tag(tag, paramesh::spawn_tag(*platform.hasher, "token", 1, 3, request)));
+    request.path = "/b";
+    CHECK_FALSE(
+        paramesh::same_tag(tag, paramesh::spawn_tag(*platform.hasher, "token", 1, 2, request)));
+    CHECK(paramesh::same_tag(tag, tag));
 }
 
 TEST_CASE("a request for a program that is not there, or that dies at once, is declined") {

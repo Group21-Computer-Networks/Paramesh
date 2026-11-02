@@ -231,12 +231,18 @@ Asks a peer to start one worker process for a job.
 | 20 | 32 | `binary_hash` | SHA-256 of the launcher's executable. |
 | 52 | 2 | `nodes` | The number of nodes N the job asked for, the launcher included. Added by X-node-commit, with the person's approval. |
 | 54 | 2 | reserved | |
-| 56 | var | `path` | `str16`: absolute path of the executable, the same on every node. |
+| 56 | 32 | `pool_tag` | SHA-256 of the pool token, then the frame's job and request ID as 8 bytes each, little-endian, then `binary_hash`, `path`, `cwd` and each of `argv` with a zero byte after it, then the token again. All zero from a node with no token. Added by X-lock-pmd, with the person's approval. |
+| 88 | var | `path` | `str16`: absolute path of the executable, the same on every node. |
 | var | var | `cwd` | `str16`: the launcher's working directory. |
 | var | 2 | `argc` | Number of arguments that follow, not counting the program name. |
 | var | var | `argv` | `argc` values of `str16`. |
 
-Fixed part: 56 bytes. Size: 56 bytes plus the variable part, at most 65,536 bytes.
+Fixed part: 88 bytes. Size: 88 bytes plus the variable part, at most 65,536 bytes.
+
+A node with a pool token, `playground.token` in its state directory, replies `SPAWN_DECLINE` with
+status `DECLINED` unless `pool_tag` matches. A node without one takes any request. The tag stops
+a stranger on the LAN starting a program. It does not hide the token where the invite carries it
+over plain HTTP, and a request copied off the network can be sent again.
 
 The peer hashes the file at `path`. If the hash differs it replies `SPAWN_DECLINE` with status
 `BINARY_MISMATCH`. If it accepts, it starts the process with the environment of section 10,
