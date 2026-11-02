@@ -84,7 +84,9 @@ async function poolStatus() {
     if (answer.ok) cluster = await answer.json();
   } catch { /* shown below */ }
   $("dot").classList.toggle("on", cluster.online && cluster.member === "joined");
-  $("code-field").hidden = !cluster.access_code;
+  needsSignIn = Boolean(cluster.access_code) && !session;
+  $("who").hidden = !cluster.access_code;
+  $("who").textContent = session ? `${who}, sign out` : "Sign in";
   if (!cluster.online) {
     $("pool").textContent = "pmd is not answering";
   } else if (cluster.member !== "joined") {
@@ -316,7 +318,7 @@ function renderAnalytics(run) {
 async function pastRuns() {
   const pane = $("pane-history");
   try {
-    const { runs } = await (await fetch("/api/runs")).json();
+    const { runs } = await (await fetch("/api/runs", { headers: asking() })).json();
     const finished = runs.filter((r) => r.run_ms).reverse();
     if (!finished.length) {
       pane.replaceChildren(html("div", { className: "empty" }, html("h3", { textContent: "No runs yet" }), html("p", { textContent: "Each run adds a line here, with no source code: its timing, its node count and what the runtime reported." })));
@@ -343,7 +345,7 @@ async function convert() {
   let body;
   try {
     const answer = await fetch("/api/translate", { method: "POST",
-      headers: { "Content-Type": "application/json", "X-Access-Code": $("code").value.trim() },
+      headers: asking(),
       body: JSON.stringify({ source: code() }) });
     body = await answer.json();
     if (!answer.ok) throw new Error(body.error);
@@ -358,8 +360,55 @@ async function convert() {
   return true;
 }
 
+// Who is using this page. The session lasts until the server restarts or the person signs out.
+const remembered = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
+let session = remembered("pm-session");
+let who = remembered("pm-name");
+let needsSignIn = false;
+
+function asking() {
+  return { "Content-Type": "application/json", ...(session ? { "X-Session": session } : {}) };
+}
+
+function signedIn(token, name) {
+  session = token;
+  who = name;
+  needsSignIn = !token;
+  try {
+    if (token) {
+      localStorage.setItem("pm-session", token);
+      localStorage.setItem("pm-name", name);
+    } else {
+      localStorage.removeItem("pm-session");
+      localStorage.removeItem("pm-name");
+    }
+  } catch { /* it lasts as long as the page, then */ }
+  $("who").textContent = token ? `${name}, sign out` : "Sign in";
+}
+
+async function enter(path) {
+  const problem = $("who-problem");
+  problem.hidden = true;
+  try {
+    const answer = await fetch(path, { method: "POST",
+      headers: { "Content-Type": "application/json", "X-Access-Code": $("code").value.trim() },
+      body: JSON.stringify({ name: $("who-name").value.trim(), password: $("who-password").value }) });
+    const body = await answer.json();
+    if (!answer.ok) throw new Error(body.error);
+    signedIn(body.session, body.name);
+    $("signin").close();
+  } catch (failure) {
+    problem.textContent = failure.message || "The playground server is not answering.";
+    problem.hidden = false;
+  }
+}
+
 async function runProgram() {
-  const headers = { "Content-Type": "application/json", "X-Access-Code": $("code").value.trim() };
+  if (needsSignIn) {
+    $("signin").showModal();
+    return;
+  }
+  const headers = asking();
   if (Number($("nodes").value) > 1) {  // the converted code first, then the run
     showTab("converted");
     running(true);
@@ -389,11 +438,15 @@ async function runProgram() {
     await new Promise((done) => setTimeout(done, 250));
     let state;
     try {
-      state = await (await fetch(`/api/run/${current}`)).json();
+      state = await (await fetch(`/api/run/${current}`, { headers: asking() })).json();
     } catch {
       continue;
     }
     last = state;
+    if (state.state === "queued") {
+      $("pane-output").replaceChildren(html("p", { className: "notice", textContent: `You are number ${state.place} in line. Everyone takes turns.` }));
+      continue;
+    }
     renderOutput(state);
     renderAnalytics(state);
     if (state.state === "done") {
@@ -419,12 +472,16 @@ $("reset").onclick = () => setCode(chosen().source);
 $("clear").onclick = () => setCode("");
 $("copy").onclick = () => navigator.clipboard?.writeText(code());
 $("run").onclick = runProgram;
+$("who").onclick = () => (session ? signedIn(null, null) : $("signin").showModal());
+$("who-register").onclick = () => enter("/api/register");
+$("who-login").onclick = () => enter("/api/login");
+$("who-cancel").onclick = () => $("signin").close();
 $("convert").onclick = async () => {
   showTab("converted");
   await convert();
 };
 $("tab-converted").onclick = () => showTab("converted");
-$("stop").onclick = () => current && fetch(`/api/stop/${current}`, { method: "POST", headers: { "X-Access-Code": $("code").value.trim() } });
+$("stop").onclick = () => current && fetch(`/api/stop/${current}`, { method: "POST", headers: asking() });
 $("theme").onclick = () => {
   dark = !dark;
   $("theme").textContent = dark ? "Light editor" : "Dark editor";

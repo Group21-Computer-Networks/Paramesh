@@ -37,6 +37,17 @@ other functions stay. If the translated program does not compile, the original r
   pointer changed through another pointer.
 - A loop that updates an array (`c[i][j] += x`) counts twice if a laptop leaves in the middle.
 
+## People and turns
+
+With `--public`, people register themselves with a name, a password and the access code, then sign in
+with the name and password. Each node's site has one line. A person, and an address on the LAN, each hold
+one place in it, so someone who runs again goes behind everyone waiting. Runs, past runs and Stop belong
+to their owner. Five wrong passwords or invite codes from one address wait a minute.
+
+Limits: someone with two machines, or several addresses, can hold more than one place. Two sites are two
+lines; `pmd`'s ledger then shares cores between the jobs, by node and not by person. Sessions end when
+the server restarts.
+
 ## What a run does
 
 1. The server checks the request: C only, 64 KiB at most, 1 to 8 nodes, one run at a time.
@@ -81,7 +92,7 @@ Read this before letting anyone run code.
   touches the ledger. Its own job is the only one it can end.
 - `pmd` trusts its peers: anyone on the LAN who can reach TCP 47001 can already ask it to start a
   program. That is true of ParaMesh with or without the playground. Run it on a network you trust.
-- The access code and token cross the LAN in plain HTTP.
+- Passwords, the access code and the token cross the LAN in plain HTTP.
 - On kernels below 6.7, or with Landlock off, jobs do not run: the sandbox fails closed.
 
 ## Statistics
