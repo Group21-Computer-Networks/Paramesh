@@ -397,9 +397,10 @@ public:
         // The RAM cap from pmd, split between the local cache and the home store
         // (mem.cache_share). Without pmd there is no cap.
         // A node that joined mid-run is home for nothing: all of it is the cache.
-        cache_bytes_ = (quota_flags_ & kQuotaNoHomes) != 0 ? ram_
-                       : quota_cache_ != 0                 ? quota_cache_
-                                                           : ram_ * s_.cache_share / 100;
+        cache_bytes_ = quota_cache_ != 0 ? quota_cache_ : ram_ * s_.cache_share / 100;
+        if ((quota_flags_ & kQuotaNoHomes) != 0) {
+            cache_bytes_ = ram_;
+        }
         const std::uint64_t cache_bytes = cache_bytes_;
         // The spill file (M4-3), of the spill pmd committed: no cap, no file. It is made beside
         // pmd's socket, in the daemon's state directory.
