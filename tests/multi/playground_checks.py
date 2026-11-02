@@ -238,4 +238,6 @@ check("Convert shows the program and where its loop runs", status == 200 and "PM
       and "#line" not in shown["source"] and "runs on the pool" in shown["notes"][0], shown)
 tries = [lan("127.0.0.8", "POST", "/api/run", {"source": "int main(void){}", "nodes": 1}, "wrong")[0] for _ in range(6)]
 check("wrong codes are locked out", tries[0] == 403 and tries[-1] == 429, tries)
+pool = get("/api/pool")["nodes"]
+check("the dashboard sees every node", len(pool) >= 2 and pool[0]["here"] and all(n.get("ram_total", 0) > 0 for n in pool), pool)
 sys.exit(1 if failures else 0)

@@ -60,6 +60,8 @@ PAGES = {
     "/dashboard": ("dashboard.html", "text/html; charset=utf-8"),
     "/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
     "/site.css": ("site.css", "text/css; charset=utf-8"),
+    "/playground.css": ("playground.css", "text/css; charset=utf-8"),
+    "/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
     "/arch.js": ("arch.js", "text/javascript; charset=utf-8"),
     "/home.js": ("home.js", "text/javascript; charset=utf-8"),
     "/playground.js": ("playground.js", "text/javascript; charset=utf-8"),
@@ -89,6 +91,9 @@ class Service:
         self.token = self.load_token()
         self.history = self.state / "playground.jsonl"
         self.usage_lock = threading.Lock()
+        self.pool_lock = threading.Lock()
+        self.pool_at = -1.0
+        self.pool_view = {"nodes": []}
         self.usage_at = 0
         self.usage = {}
         self.ticks = {}
@@ -218,6 +223,40 @@ class Service:
                 "ram_used": memory["MemTotal"] - memory["MemAvailable"],
                 "paramesh_rss": sum(j["rss_bytes"] for j in jobs.values()),
                 "paramesh_cpu_percent": sum(j["cpu_percent"] or 0 for j in jobs.values()), "jobs": jobs}
+
+    def pool(self):
+        """Every live node's figures, for the dashboard, read from each node's site at most once
+        a second. A node whose site does not answer is listed with no figures."""
+        with self.pool_lock:
+            if time.monotonic() - self.pool_at < 0.9:
+                return self.pool_view
+            cluster = self.cluster()
+            nodes = {cluster.get("node"): {"node": cluster.get("node"), "here": True, **self.summary(self.local_usage())}}
+            peers = self.alive_peers() if cluster["online"] else []
+
+            def ask(peer):
+                entry = {"node": peer["node"], "address": peer["address"], "here": False}
+                try:
+                    entry.update(self.summary(http_json(self.peer_url(peer, "/node/usage"), None,
+                                                        {"X-Token": self.token}, timeout=1.5)))
+                except (OSError, ValueError):
+                    pass
+                nodes[peer["node"]] = entry
+
+            threads = [threading.Thread(target=ask, args=(peer,), daemon=True) for peer in peers]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(2)
+            self.pool_view = {"nodes": sorted(nodes.values(), key=lambda n: (not n["here"], n["node"] or 0))}
+            self.pool_at = time.monotonic()
+            return self.pool_view
+
+    @staticmethod
+    def summary(usage):
+        return {"cores": usage["cores"], "cpu_percent": usage["cpu_percent"], "ram_total": usage["ram_total"],
+                "ram_used": usage["ram_used"], "paramesh_rss": usage["paramesh_rss"],
+                "paramesh_cpu_percent": usage["paramesh_cpu_percent"], "jobs": len(usage["jobs"])}
 
     def pmd(self, path):
         return http_json(f"http://127.0.0.1:{self.args.pmd_http}{path}", timeout=2)
@@ -707,7 +746,12 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 self.reply(404, {"error": "no such page"})
         elif path == "/api/cluster":
-            self.reply(200, {**service.cluster(), "access_code": service.code is not None and not self.is_local()})
+            self.reply(200, {**service.cluster(), "access_code": service.code is not None and not self.is_local(),
+                              "run_seconds": service.args.timeout})
+        elif path == "/api/pool":
+            self.reply(200, service.pool())
+        elif path == "/node/usage" and self.token_ok():
+            self.reply(200, service.local_usage())
         elif path == "/api/node":
             answer = {**service.node(), "can_manage": self.is_local()}
             if self.is_local():

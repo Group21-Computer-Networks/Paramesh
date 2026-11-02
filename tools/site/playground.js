@@ -87,6 +87,7 @@ async function poolStatus() {
   } catch { /* shown below */ }
   $("dot").classList.toggle("on", cluster.online && cluster.member === "joined");
   $("code-field").hidden = !cluster.access_code;
+  limit = cluster.run_seconds;
   if (!cluster.online) {
     $("pool").textContent = "pmd is not answering";
   } else if (cluster.member !== "joined") {
@@ -341,6 +342,7 @@ async function pastRuns() {
 
 function running(active) {
   $("run").disabled = active;
+  $("compare").disabled = active;
   $("stop").disabled = !active;
   $("run").textContent = active ? "Running" : "Run Code";
 }
@@ -374,13 +376,34 @@ function remember(key, value) {
   } catch { /* it lasts as long as the page, then */ }
 }
 
+let limit = null;  // seconds a run may take, from the server
+
 function asking() {
   return { "Content-Type": "application/json", "X-Access-Code": $("code").value.trim() };
 }
 
-async function runProgram() {
+// What each node is doing while a run goes on, from the same figures as the dashboard.
+async function drawLive() {
+  try {
+    const { nodes } = await (await fetch("/api/pool", { cache: "no-store" })).json();
+    if (!current) return;  // the run ended while this was on its way
+    $("live-strip").replaceChildren(...nodes.map((n) => {
+      const used = n.cores === undefined ? null : n.paramesh_cpu_percent / 100;
+      const bar = html("i");
+      bar.style.width = `${used === null ? 0 : Math.min(100, (used / n.cores) * 100)}%`;
+      return html("div", { className: `live-node${used ? " busy" : ""}` },
+        html("b", { textContent: n.here ? "This node" : `Node ${n.node}` }),
+        html("span", { textContent: used === null ? "no figures" : `${used.toFixed(1)} of ${n.cores} cores, ${(n.paramesh_rss / 2 ** 20).toFixed(0)} MiB` }),
+        html("div", {}, bar));
+    }));
+    $("live-strip").hidden = false;
+  } catch { /* the run goes on without it */ }
+}
+
+// Runs the program on `nodes` and waits for the end. False if the server would not run it.
+async function runProgram(nodes = Number($("nodes").value)) {
   const headers = asking();
-  if (Number($("nodes").value) > 1) {  // the converted code first, then the run
+  if (nodes > 1) {  // the converted code first, then the run
     showTab("converted");
     running(true);
     if (await convert()) await new Promise((done) => setTimeout(done, 1800));
@@ -392,20 +415,52 @@ async function runProgram() {
   renderOutput(empty);
   let answer;
   try {
-    answer = await fetch("/api/run", { method: "POST", headers, body: JSON.stringify({ language: "c", source: code(), nodes: Number($("nodes").value) }) });
+    answer = await fetch("/api/run", { method: "POST", headers, body: JSON.stringify({ language: "c", source: code(), nodes }) });
   } catch {
     $("pane-output").replaceChildren(html("p", { className: "notice bad", textContent: "The playground server is not answering." }));
     running(false);
-    return;
+    return false;
   }
   const body = await answer.json().catch(() => ({}));
   if (answer.status !== 202) {
     $("pane-output").replaceChildren(html("p", { className: "notice bad", textContent: body.error || "The server refused the run." }));
     running(false);
-    return;
+    return false;
   }
   remember("pm-run", body.id);
   await follow(body.id);
+  return true;
+}
+
+// The program as written, on one core, then split across every node, and what that proves.
+async function compare() {
+  const all = $("nodes").options.length;
+  if (all < 2) {
+    showTab("output");
+    $("pane-output").replaceChildren(html("p", { className: "notice bad", textContent: "Only one node is in the pool, so there is nothing to compare." }));
+    return;
+  }
+  $("compare").disabled = true;
+  const one = await runProgram(1) ? last : null;
+  const many = one && await runProgram(all) ? last : null;
+  $("compare").disabled = false;
+  if (!one || !many) return;
+  if (one.exit_code !== 0 || many.exit_code !== 0) {
+    $("pane-output").prepend(html("p", { className: "notice bad", textContent: "A run failed, so these cannot be compared. Its output is below." }));
+    return;
+  }
+  const ratio = one.run_ms / many.run_ms;
+  const same = one.stdout === many.stdout;
+  const nodesRan = many.metrics?.nodes_ran_tasks?.length ?? 0;
+  const verdict = ratio >= 1.05 ? `${ratio.toFixed(2)} times faster on ${all} nodes than as written`
+    : ratio > 0.95 ? "about the same speed" : `${(1 / ratio).toFixed(2)} times slower on ${all} nodes: too little work to pay for the network`;
+  $("pane-output").prepend(html("article", { className: "compare" },
+    html("h4", { textContent: verdict }),
+    html("dl", {},
+      html("dt", { textContent: "As written, one core" }), html("dd", { textContent: ms(one.run_ms) }),
+      html("dt", { textContent: `${all} nodes` }), html("dd", { textContent: ms(many.run_ms) }),
+      html("dt", { textContent: "Nodes that ran tasks" }), html("dd", { textContent: String(nodesRan) })),
+    html("p", { className: same ? "same" : "differ", textContent: same ? "The output is identical." : "The output differs: see it below. A double total can differ in its last digits." })));
 }
 
 // Shows a run until it ends. The run belongs to the server, so a page that was closed, or left
@@ -413,6 +468,9 @@ async function runProgram() {
 async function follow(id) {
   current = id;
   running(true);
+  let ranFrom = null;
+  drawLive();
+  const live = setInterval(drawLive, 1500);
   while (current) {
     let state;
     try {
@@ -432,6 +490,11 @@ async function follow(id) {
     } else {
       renderOutput(state);
       renderAnalytics(state);
+      if (state.state === "running") {
+        ranFrom ??= performance.now();
+        const seconds = Math.round((performance.now() - ranFrom) / 1000);
+        $("run").textContent = limit ? `Running, ${seconds} of ${limit} s` : `Running, ${seconds} s`;
+      }
     }
     if (state.state === "done") {
       markErrors(state.diagnostics);
@@ -440,6 +503,8 @@ async function follow(id) {
       await new Promise((done) => setTimeout(done, 250));
     }
   }
+  clearInterval(live);
+  $("live-strip").hidden = true;
   running(false);
 }
 
@@ -457,7 +522,8 @@ $("examples").onchange = () => setCode(chosen().source);
 $("reset").onclick = () => setCode(chosen().source);
 $("clear").onclick = () => setCode("");
 $("copy").onclick = () => navigator.clipboard?.writeText(code());
-$("run").onclick = runProgram;
+$("run").onclick = () => runProgram();
+$("compare").onclick = compare;
 $("convert").onclick = async () => {
   showTab("converted");
   await convert();
