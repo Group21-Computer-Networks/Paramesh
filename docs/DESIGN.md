@@ -95,7 +95,8 @@ flowchart LR
 ## 6. Fairness
 
 Inside a job, the pull queue shares work. Between jobs, each `pmd` gives its worker slots at task
-boundaries to the guest job with the lowest dominant share divided by its weight:
+boundaries in this order: a job left without a slot, this node's own jobs, then the guest job with the lowest dominant
+share divided by its weight:
 
 `w = max(0.25, 1 + balance / ledger.scale)`
 
@@ -196,19 +197,20 @@ Heartbeats go every 1 s, and 3 s of silence loses the peer. Opcodes are listed i
 ## 13. Memory limits
 
 `--cap-ram` bounds a node's home store and local cache together. The home evicts by CLOCK to a spill file.
-The local cache evicts first in, first out, and a modified page is written back first. Each node commits its share
+The local cache evicts first in, first out by default, and a modified page is written back first. Each node commits its share
 of a job's region at admission, so a job that cannot fit is refused rather than failing midway.
 
 ## 14. Performance features
 
 | Feature | What it does |
 | --- | --- |
-| Prefetch | A run of sequential faults brings the next pages too. |
-| Page encoding | Pages go compressed, or as diffs from the home's copy, when that is smaller. |
+| Prefetch | Three read faults one stride apart start a stream; up to 4 streams, up to 8 pages ahead. |
+| Page encoding | A word map leaves out zero words of a page, or of its XOR with a kept copy, when that is smaller. It is not a general compressor. |
 | Hold window | A page two nodes fight over stays put for a short time, so work gets done between moves. |
 | Hold for readers | The same for read-write fights (`thrash.hold_readers`). |
 | Re-homing | Optional: a segment used mostly by one node moves there (`rehome.period_ms`, off by default). |
-| Affinity | Chunks prefer the node that is home for their data. |
+| Locality scheduling | A node gets the chunk with most of its pages, or helps the home whose queue would take longest. |
+| Cache policy | FIFO by default, or cost-based over the 8 oldest pages. |
 
 ## 15. Translator
 
@@ -256,5 +258,5 @@ JSON API. The dashboard reads `pmd`'s status API on 127.0.0.1.
 | Free-rider over 10 rounds | Weight 0.96 to 0.60, share 0.21 to 0.14, never 0 | M5 gate |
 | Fault latency alone, 896 remote reads | p50 293.7, p90 561.1, p99 737.0 µs | M5 gate |
 
-Speedup on two real laptops has not been recorded. These figures come from simulated nodes on one machine.
+These figures come from simulated nodes on one machine. Real-laptop results are in the README.
 Rare unexplained test failures are listed in [`TODO.md`](TODO.md).
