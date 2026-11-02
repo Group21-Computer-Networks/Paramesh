@@ -19,9 +19,100 @@ a run does, and what its sandbox does not stop.
 - Deferred work: [`docs/TODO.md`](docs/TODO.md)
 - Vendored libraries, versions and licences: [`third_party/`](third_party/)
 
+## What it is for
+
+A few laptops on one network become one computer for a C program. You write ordinary C, and
+loops that are safe to split run across the laptops, while the rest of the program stays on the
+laptop that started it. It suits work made of large independent pieces, such as matrix work or
+number crunching. Small loops run slower, because a network hop costs far more than memory.
+
+## How a run works
+
+```mermaid
+flowchart LR
+    A[Write C in the playground] --> B[Sign in]
+    B --> C[Convert: safe loops become tasks]
+    C --> D[Wait your turn in line]
+    D --> E[Compile in the sandbox]
+    E --> F[Copy the program to the other laptops]
+    F --> G[pmrun: pmd admits the job]
+    G --> H[Laptops pull chunks and fetch pages on fault]
+    H --> I[Output and Analytics]
+```
+
+## Run it on two laptops
+
+Both laptops need Linux 6.7 or later for the playground, and must reach each other on the network.
+
+1. On one laptop, build the installer once:
+
+   ```bash
+   bash tools/setup/package.sh
+   ```
+
+2. Install **that same file** on every laptop. Do not build it again on the others: a job checks
+   that its program is identical everywhere.
+
+   ```bash
+   bash build/dist/paramesh-setup-*.sh
+   ```
+
+3. For the playground, install a compiler on each laptop:
+
+   ```bash
+   sudo apt install -y g++
+   ```
+
+4. On the first laptop, open `http://127.0.0.1:47080/dashboard` and join. It shows an invite code
+   and the playground's access code.
+5. On each other laptop, open the same address, enter the invite code and join.
+6. Check that every node is `alive`, then run a job:
+
+   ```bash
+   pm status
+   ```
+
+   ```bash
+   cd /opt/paramesh/apps && pmrun -n 2 /opt/paramesh/apps/matmul 512
+   ```
+
+7. Open `http://127.0.0.1:47080/playground`, or `http://ADDRESS:47080/` from another machine.
+   Register with a name, a password and the access code, set Nodes to 2, and run an example.
+
+If nodes cannot see each other, allow the pool through the firewall, for example
+`sudo ufw allow from 10.0.0.0/8`. To remove everything, run the installer with `--uninstall`.
+
+## Features
+
+| Area | What you get |
+| --- | --- |
+| Shared memory | One address space across nodes, kept coherent by page faults through userfaultfd. |
+| Tasks | `PM_TASK`, `pm_parallel_for`, `pm_wait_all`, locks, barriers and atomic add. |
+| Plain C | Convert shows your program split into tasks, and where each loop runs and why. |
+| Pool | Discovery, invite codes across subnets, caps on cores and RAM, and spill to disk. |
+| Changing pool | A planned `pm leave`, joining a running job, and optional re-homing of segments. |
+| Fairness | A ledger per node weights free slots, and what a peer claims never changes a weight. |
+| People | Self-registration, one line per laptop, turns, and private runs. |
+| Sandbox | Compiles and jobs run under Landlock, a system-call filter and limits. |
+| Seeing it | A website, a playground, a live dashboard, Analytics, `pm status` and `pm top`. |
+
+## Known limits
+
+- **Trusted network only.** Passwords, codes and the pool token cross the LAN in plain HTTP, and a
+  captured start request can be replayed. Never put this on the internet.
+- **One person can hold more places** with several accounts on several machines.
+- **Fairness between laptops is by node,** not by person, and each laptop has its own line.
+- **A laptop that crashes ends every job using it.** Only a planned leave is survived.
+- **The translator reads C with patterns,** not a parser. It handles counted `for` loops in `main()`,
+  and leaves anything it cannot show safe on one laptop. It has not been run on two real laptops.
+- **A split program gets 512 MB** of shared memory by default (`--region-mb`).
+- **`double` totals** can differ in their last digits between runs.
+- **Speedup on two real laptops has not been measured:** that gate check was waived. See `docs/logs/M3-gate.md`.
+- Rare unexplained failures are recorded in [`docs/TODO.md`](docs/TODO.md).
+
 ## Build
 
-Linux 5.19 or later, CMake 3.25+, Ninja, GCC or Clang with C++20.
+To build from source: Linux 5.19 or later, CMake 3.25+, Ninja, GCC or Clang with C++20.
 
 ```bash
 cmake --preset dev && cmake --build --preset dev && ctest --preset dev
