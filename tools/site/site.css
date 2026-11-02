@@ -304,7 +304,7 @@ th.group, th.group:last-child { font-weight: 600; padding-top: 18px; text-align:
 #signin .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 #signin .notice.bad { color: var(--bad); }
 /* the analytics board: cards of different heights, as on a pinboard */
-.board { columns: 3 190px; column-gap: 14px; }
+.pinboard { columns: 3 190px; column-gap: 14px; }
 .pin { break-inside: avoid; display: block; margin-bottom: 14px; padding: 18px; border-radius: 22px; background: var(--card); color: var(--ink); animation: pin-in 0.7s var(--ease) both; animation-delay: calc(var(--i) * 70ms); transition: transform 0.35s var(--ease); }
 .pin:hover { transform: translateY(-4px) rotate(-0.4deg); }
 @keyframes pin-in { from { opacity: 0; transform: translateY(26px) scale(0.96); } }
