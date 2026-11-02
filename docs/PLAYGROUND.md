@@ -91,8 +91,8 @@ Read this before letting anyone run code.
 - A job holds CPU and memory for up to 30 s, and the address-space limit is not a RAM cap.
 - A job shares `pmd.sock`, so a hostile program can send its own daemon false chunk counts, which
   touches the ledger. Its own job is the only one it can end.
-- `pmd` trusts its peers: anyone on the LAN who can reach TCP 47001 can already ask it to start a
-  program. That is true of ParaMesh with or without the playground. Run it on a network you trust.
+- `pmd` starts a job only for a request signed with the pool token. A request copied off the network can
+  be sent again, and a job's data ports have no lock. Run it on a network you trust.
 - The access code and the token cross the LAN in plain HTTP.
 - On kernels below 6.7, or with Landlock off, jobs do not run: the sandbox fails closed.
 
