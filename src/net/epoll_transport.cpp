@@ -614,7 +614,7 @@ private:
         }
         for (const int fd : silent) {
             if (conns_.contains(fd)) {
-                drop(conns_.at(fd), true, Errc::kClosed);
+                drop(conns_.at(fd), true, Errc::kTimeout);
             }
         }
         for (const auto& [peer, req] : timed_out) {

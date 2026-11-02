@@ -1772,7 +1772,7 @@ TEST_CASE("on a launcher pm leave is refused while its job runs, and pm leave --
 TEST_CASE(
     "a worker leaves during matrix multiply: the job finishes with the single-machine result" *
     doctest::skip(!region_can_be_mapped())) {
-    const std::string plain_out = "/tmp/pmd-test-matmul-plain";
+    const std::string plain_out = "/tmp/pmd-test-matmul-plain-" + std::to_string(::getpid());
     REQUIRE(run_tool(matmul_path(), {"--plain", "2048"}, plain_out, 120) == 0);
     const std::string plain = contents(plain_out);
     const std::string expected = plain.substr(plain.find("checksum "));

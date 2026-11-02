@@ -25,6 +25,7 @@ enum class Errc : std::uint8_t {
     kClosed,           // the peer closed the connection
     kProtocol,         // a frame failed a check of docs/PROTOCOL.md, section 3
     kUnsupported,      // not implemented in this milestone, or not available on this machine
+    kTimeout,          // a peer stayed silent past the limit
 };
 
 struct Error {

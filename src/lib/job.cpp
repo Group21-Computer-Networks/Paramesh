@@ -706,7 +706,7 @@ public:
         pump();
     }
 
-    void on_peer_lost(NodeId peer, Errc /*why*/) noexcept override {
+    void on_peer_lost(NodeId peer, Errc why) noexcept override {
         if (ending_) {
             const std::lock_guard<std::mutex> lock{mutex_};
             gone_++;
@@ -719,6 +719,15 @@ public:
             run_home_actions(actions_, {}, net_->now());
             return;
         }
+        const char* reason = "closed";
+        if (why == Errc::kTimeout) {
+            reason = "silent";
+        } else if (why == Errc::kProtocol) {
+            reason = "bad frame";
+        }
+        platform_.logger->log(LogLevel::kInfo, "peer_gone",
+                              JsonObject{{"peer", JsonValue{std::int64_t{peer.value}}},
+                                         {"why", JsonValue{std::string{reason}}}});
         const std::string message = "node " + std::to_string(peer.value) + " lost";
         if (!is_launcher() && peer == s_.members.front().node) {
             exit_with(Status::kNodeLost, message);  // nobody left to tell
