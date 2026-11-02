@@ -340,3 +340,16 @@ th.group, th.group:last-child { font-weight: 600; padding-top: 18px; text-align:
   .pin, .ribbon i, .pin .bars i, .ring .arc, .pin .histogram i { animation: none; }
   .pin { transition: none; }
 }
+
+/* every node at once */
+.nodes-live { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+.node-live { background: var(--card); border-radius: 18px; padding: 20px; border-top: 4px solid var(--paper-deep); transition: border-color 0.4s; }
+.node-live.busy { border-top-color: var(--olive); }
+.node-live h3 { font-size: 1.25rem; }
+.node-live p { margin: 2px 0 12px; font-size: 0.88rem; }
+.usage-bar { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; font-size: 0.85rem; margin-top: 10px; }
+.usage-bar span { color: var(--ink-soft); }
+.usage-bar b { font-weight: 600; font-variant-numeric: tabular-nums; }
+.usage-bar div { grid-column: 1 / -1; height: 8px; border-radius: 6px; background: var(--paper-deep); overflow: hidden; }
+.usage-bar i { display: block; height: 100%; border-radius: 6px; background: var(--blue); transition: width 0.8s var(--ease); }
+@media (prefers-reduced-motion: reduce) { .usage-bar i, .node-live { transition: none; } }
