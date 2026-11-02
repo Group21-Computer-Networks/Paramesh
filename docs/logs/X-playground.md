@@ -81,6 +81,9 @@ and the next step.
 - At the person's request, the architecture is interactive: every part can be chosen, and five stories
   walk a packet through a job's start, a task, a page fetch, a write and a lost node. `arch.js` added.
   Checked in the browser at 1280x800 and 375 wide: stories play, no sideways scroll. Without the script the list stays.
+- At the person's request, Analytics is a board of cards of different heights: figures count up, bars, a ring
+  and the histogram grow in, and it replays when the tab is opened. What the runtime does not measure is one
+  line under the full table, not rows of Not available. Checked in the browser with a real 2-node run on loopback.
 - NOT tested: the real two laptops. The new `pmd` and server need installing on both, which needs
   the person's sudo. Running on 127.0.0.1, peers skip staging; POST /node/stage is unexercised.
 - Next: the person installs on both laptops and runs a two-node job.
