@@ -652,6 +652,7 @@ Result<std::size_t> wire_encode(const SpawnReqPayload& payload, std::span<std::b
     w.bytes(payload.binary_hash);
     w.put(payload.nodes, 2);
     w.put(0, 2);  // reserved
+    w.bytes(payload.pool_tag);
     put_str16(w, payload.path);
     put_str16(w, payload.cwd);
     w.put(payload.argv.size(), 2);
@@ -677,6 +678,8 @@ Result<SpawnReqPayload> wire_decode_spawn_req(std::span<const std::byte> in) {
     std::copy(hash.begin(), hash.end(), payload.binary_hash.begin());
     payload.nodes = static_cast<std::uint16_t>(r.get(2));
     r.take(2);
+    const std::span<const std::byte> tag = r.take(payload.pool_tag.size());
+    std::copy(tag.begin(), tag.end(), payload.pool_tag.begin());
     payload.path = get_str16(r);
     payload.cwd = get_str16(r);
     const std::size_t argc = r.get(2);

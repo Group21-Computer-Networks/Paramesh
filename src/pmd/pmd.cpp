@@ -2,6 +2,7 @@
 
 #include "net/frame_io.h"
 #include "platform/sandbox.h"
+#include "pmd/pool_key.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -617,6 +618,13 @@ void Pmd::on_spawn_req(Connection& connection, const FrameHeader& header,
         return;
     }
     const SpawnReqPayload& request = decoded.value();
+    const std::string token = read_pool_token(config_.state_dir);
+    if (!token.empty() &&
+        !same_tag(request.pool_tag, spawn_tag(*platform_.hasher, token, header.job.value,
+                                              header.req.value, request))) {
+        decline(spawn, Status::kDeclined, "this request is not from a node of the pool");
+        return;
+    }
     spawn.hash = request.binary_hash;
     spawn.want = request.threads_per_node;
     const std::string here = " on node " + std::to_string(config_.node.value);
@@ -1412,6 +1420,8 @@ void Pmd::ask_peer(Run& run, Endpoint peer, std::uint16_t flags) {
     request.cwd = run.request.cwd;
     request.argv = run.request.argv;
     const ReqId req{next_req_++};
+    request.pool_tag = spawn_tag(*platform_.hasher, read_pool_token(config_.state_dir),
+                                 run.job.value, req.value, request);
     asks_[req.value] = Ask{run.job, connection, peer, flags != 0};
     run.asked++;
     reply(connection, Opcode::kSpawnReq, run.job, kNoNode, req, request);
