@@ -655,10 +655,11 @@ void Pmd::on_spawn_req(Connection& connection, const FrameHeader& header,
         spawn.commit = *commit;
     }
 
-    std::ifstream file{request.path, std::ios::binary};
-    const std::vector<char> image{std::istreambuf_iterator<char>{file},
-                                  std::istreambuf_iterator<char>{}};
-    if (!file.is_open() || image.empty()) {
+    // One read: byte by byte, a debug build of a 20 MB program held up this loop for seconds.
+    std::ifstream file{request.path, std::ios::binary | std::ios::ate};
+    std::vector<char> image(static_cast<std::size_t>(std::max<std::streamoff>(0, file.tellg())));
+    if (image.empty() || !file.seekg(0) ||
+        !file.read(image.data(), static_cast<std::streamsize>(image.size()))) {
         decline(spawn, Status::kNotFound, "no executable at " + request.path + here);
         return;
     }
