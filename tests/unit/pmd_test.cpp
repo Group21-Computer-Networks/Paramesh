@@ -1706,8 +1706,10 @@ TEST_CASE("Ctrl+C on pmd is a graceful leave: it logs why and goes; a second one
         std::string state = "/tmp/pmd-test-int-XXXXXX";
         REQUIRE(::mkdtemp(state.data()) != nullptr);
         const std::string log = state + "/log";
-        std::vector<std::string> all{pmd, "--node-id",      "9", "--no-multicast", "--http-port",
-                                     "0", "--control-port", "0", "--state-dir",    state};
+        // Its own discovery port: on 47000 it hears other daemons, and they offer it work.
+        std::vector<std::string> all{
+            pmd, "--node-id",        "9", "--no-multicast", "--http-port", "0", "--control-port",
+            "0", "--discovery-port", "0", "--state-dir",    state};
         std::vector<char*> argv;
         argv.reserve(all.size() + 1);
         for (std::string& argument : all) {
