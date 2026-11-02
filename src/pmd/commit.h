@@ -4,6 +4,8 @@
 // store, which gets the RAM less mem.cache_share, holds the whole share. A node that joins a
 // running job commits only a local cache. A commitment grows when the node is made home for
 // more than it holds, after a leave or when the job runs on fewer nodes than it asked for.
+// Beyond that, the cache grows to mem.cache_share of the node's cap, or the region if that is less,
+// out of the RAM still free.
 #ifndef PARAMESH_PMD_COMMIT_H
 #define PARAMESH_PMD_COMMIT_H
 
@@ -26,11 +28,12 @@ std::uint64_t job_need(std::uint64_t region, std::uint16_t nodes) noexcept;
 // The commitment out of what is free, or nothing when it does not fit.
 std::optional<JobCommit> job_commit(std::uint64_t region, std::uint16_t nodes,
                                     std::uint64_t free_ram, std::uint64_t free_spill,
-                                    std::uint64_t cache_share) noexcept;
+                                    std::uint64_t cache_share, std::uint64_t cap_ram = 0) noexcept;
 // A node joining a running job: a cache the size of the others' and no spill, or nothing when
 // it does not fit the free RAM.
 std::optional<JobCommit> joiner_commit(std::uint64_t region, std::uint16_t nodes,
-                                       std::uint64_t free_ram, std::uint64_t cache_share) noexcept;
+                                       std::uint64_t free_ram, std::uint64_t cache_share,
+                                       std::uint64_t cap_ram = 0) noexcept;
 // Grows `commit` until its home store, the RAM less the cache plus the spill, holds `home`
 // bytes: RAM first, then spill. False, and `commit` as it was, when what is free falls short.
 bool grow_commit(JobCommit& commit, std::uint64_t home, std::uint64_t free_ram,

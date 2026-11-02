@@ -48,8 +48,7 @@ COMPILE_SECONDS = 20
 RUN_SECONDS = 30
 KEPT_RUNS = 32
 MAX_WAITING = 32
-NAME = re.compile(r"[A-Za-z0-9_-]{2,24}")
-TRIES = 5  # wrong passwords or invite codes from one address before it must wait
+TRIES = 5  # wrong access or invite codes from one address before it must wait
 TRIES_WAIT = 60
 LOCAL = "this machine"
 TRANSLATE_SECONDS = 5
@@ -61,6 +60,8 @@ PAGES = {
     "/dashboard": ("dashboard.html", "text/html; charset=utf-8"),
     "/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
     "/site.css": ("site.css", "text/css; charset=utf-8"),
+    "/playground.css": ("playground.css", "text/css; charset=utf-8"),
+    "/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
     "/arch.js": ("arch.js", "text/javascript; charset=utf-8"),
     "/home.js": ("home.js", "text/javascript; charset=utf-8"),
     "/playground.js": ("playground.js", "text/javascript; charset=utf-8"),
@@ -86,14 +87,13 @@ class Service:
         self.busy = False
         self.waiting = []
         self.failed = {}
-        self.sessions = {}
-        self.registered = {}
         self.code = self.load_code() if args.public else None
         self.token = self.load_token()
         self.history = self.state / "playground.jsonl"
-        self.accounts_file = self.state / "playground.accounts"
-        self.accounts = json.loads(self.accounts_file.read_text()) if self.accounts_file.exists() else {}
         self.usage_lock = threading.Lock()
+        self.pool_lock = threading.Lock()
+        self.pool_at = -1.0
+        self.pool_view = {"nodes": []}
         self.usage_at = 0
         self.usage = {}
         self.ticks = {}
@@ -224,6 +224,40 @@ class Service:
                 "paramesh_rss": sum(j["rss_bytes"] for j in jobs.values()),
                 "paramesh_cpu_percent": sum(j["cpu_percent"] or 0 for j in jobs.values()), "jobs": jobs}
 
+    def pool(self):
+        """Every live node's figures, for the dashboard, read from each node's site at most once
+        a second. A node whose site does not answer is listed with no figures."""
+        with self.pool_lock:
+            if time.monotonic() - self.pool_at < 0.9:
+                return self.pool_view
+            cluster = self.cluster()
+            nodes = {cluster.get("node"): {"node": cluster.get("node"), "here": True, **self.summary(self.local_usage())}}
+            peers = self.alive_peers() if cluster["online"] else []
+
+            def ask(peer):
+                entry = {"node": peer["node"], "address": peer["address"], "here": False}
+                try:
+                    entry.update(self.summary(http_json(self.peer_url(peer, "/node/usage"), None,
+                                                        {"X-Token": self.token}, timeout=1.5)))
+                except (OSError, ValueError):
+                    pass
+                nodes[peer["node"]] = entry
+
+            threads = [threading.Thread(target=ask, args=(peer,), daemon=True) for peer in peers]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(2)
+            self.pool_view = {"nodes": sorted(nodes.values(), key=lambda n: (not n["here"], n["node"] or 0))}
+            self.pool_at = time.monotonic()
+            return self.pool_view
+
+    @staticmethod
+    def summary(usage):
+        return {"cores": usage["cores"], "cpu_percent": usage["cpu_percent"], "ram_total": usage["ram_total"],
+                "ram_used": usage["ram_used"], "paramesh_rss": usage["paramesh_rss"],
+                "paramesh_cpu_percent": usage["paramesh_cpu_percent"], "jobs": len(usage["jobs"])}
+
     def pmd(self, path):
         return http_json(f"http://127.0.0.1:{self.args.pmd_http}{path}", timeout=2)
 
@@ -281,7 +315,7 @@ class Service:
         except (OSError, ValueError):
             return 502, {"error": "no answer from pmd: is it running?"}
 
-    # ---- people: they register themselves, and a name is theirs ---------------------------------
+    # ---- guesses ---------------------------------------------------------------------------------
 
     def locked_out(self, address):
         """Too many wrong guesses from this address. Counted, not slept on: guesses can be parallel."""
@@ -298,57 +332,14 @@ class Service:
             tries = self.failed.get(address, (0, 0))[0] + 1
             self.failed[address] = (tries, time.monotonic() + TRIES_WAIT)
 
-    @staticmethod
-    def hashed(password, salt):
-        return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000).hex()
-
-    def session(self, name):
-        token = secrets.token_hex(16)
-        with self.lock:
-            self.sessions[token] = name
-        return token
-
-    def register(self, name, password, address):
-        """The name's session, or an error. One new name a minute from an address on the LAN."""
-        if not isinstance(name, str) or not NAME.fullmatch(name):
-            return None, "a name is 2 to 24 letters, digits, - or _"
-        if not isinstance(password, str) or len(password) < 6:
-            return None, "a password is at least 6 characters"
-        salt = secrets.token_bytes(16)
-        hashed = self.hashed(password, salt)
-        with self.lock:
-            if name in self.accounts:
-                return None, "that name is taken"
-            loopback = ipaddress.ip_address(address).is_loopback
-            if not loopback and time.monotonic() - self.registered.get(address, -TRIES_WAIT) < TRIES_WAIT:
-                return None, "this address registered a name a moment ago: wait a minute"
-            self.registered[address] = time.monotonic()
-            self.accounts[name] = {"salt": salt.hex(), "hash": hashed}
-            self.state.mkdir(parents=True, exist_ok=True)
-            fresh = self.accounts_file.with_suffix(".new")
-            fresh.touch(0o600)
-            fresh.write_text(json.dumps(self.accounts))
-            fresh.replace(self.accounts_file)
-        return self.session(name), None
-
-    def login(self, name, password, address):
-        account = self.accounts.get(name) if isinstance(name, str) else None
-        salt = bytes.fromhex(account["salt"]) if account else b"\0" * 16  # as slow for a name that is not there
-        hashed = self.hashed(password if isinstance(password, str) else "", salt)
-        if account and hmac.compare_digest(hashed, account["hash"]):
-            return self.session(name)
-        self.wrong_guess(address)
-        return None
-
     # ---- a run ------------------------------------------------------------------------------
 
-    def start(self, source, nodes, person, address):
-        """Puts a run in the line, or says why not. Each person, and each address on the LAN, has
-        one place in it, so someone who runs again goes behind everyone waiting: people take turns."""
-        loopback = ipaddress.ip_address(address).is_loopback
+    def start(self, source, nodes, person):
+        """Puts a run in the line, or says why not. Each machine has one place in it, so one that
+        runs again goes behind everyone waiting: machines take turns."""
         with self.lock:
-            if any(w["person"] == person or (w["address"] == address and not loopback) for w in self.waiting):
-                return None, "you already have a run waiting"
+            if any(w["person"] == person for w in self.waiting):
+                return None, "this machine already has a run waiting"
             if len(self.waiting) >= MAX_WAITING:
                 return None, "the line is full; try again in a moment"
             run = {"id": uuid.uuid4().hex, "state": "queued", "stop": False, "started": time.time(), "person": person}
@@ -356,7 +347,7 @@ class Service:
             self.order.append(run["id"])
             while len(self.order) > KEPT_RUNS:
                 self.runs.pop(self.order.pop(0), None)
-            self.waiting.append({"person": person, "address": address, "run": run, "source": source, "nodes": nodes})
+            self.waiting.append({"person": person, "run": run, "source": source, "nodes": nodes})
             self.next_run()
         return run, None
 
@@ -708,11 +699,23 @@ class Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(given.encode(), self.server.service.token.encode())
 
     def person(self):
-        """Who is asking: None if no one signed in. Without --public this machine is one person."""
-        service = self.server.service
-        if service.code is None:
+        """Who is asking: None without the access code. A person here is a machine, by its
+        address, and the machine that runs the site needs no code."""
+        if self.server.service.code is None or self.is_local():
             return LOCAL
-        return service.sessions.get(self.headers.get("X-Session", ""))
+        return self.client_address[0] if self.code_ok() else None
+
+    def asker(self):
+        """As person(), for a request that does something: a wrong code counts as a guess."""
+        address = self.client_address[0]
+        if self.server.service.locked_out(address):
+            self.reply(429, {"error": "too many wrong codes: wait a minute"})
+            return None
+        person = self.person()
+        if person is None:
+            self.server.service.wrong_guess(address)
+            self.reply(403, {"error": "the access code is not right"})
+        return person
 
     def own_run(self, path):
         run = self.server.service.runs.get(path.rsplit("/", 1)[1])
@@ -743,7 +746,12 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 self.reply(404, {"error": "no such page"})
         elif path == "/api/cluster":
-            self.reply(200, service.cluster())
+            self.reply(200, {**service.cluster(), "access_code": service.code is not None and not self.is_local(),
+                              "run_seconds": service.args.timeout})
+        elif path == "/api/pool":
+            self.reply(200, service.pool())
+        elif path == "/node/usage" and self.token_ok():
+            self.reply(200, service.local_usage())
         elif path == "/api/node":
             answer = {**service.node(), "can_manage": self.is_local()}
             if self.is_local():
@@ -774,34 +782,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         service = self.server.service
         path, query = self.path_and_query()
-        if path in ("/api/register", "/api/login"):
-            try:
-                request = json.loads(self.body(4096))
-                name, password = request["name"], request["password"]
-            except (TypeError, ValueError, KeyError):
-                self.reply(400, {"error": "send JSON with name and password"})
-                return
-            address = self.client_address[0]
-            if service.locked_out(address):
-                self.reply(429, {"error": "too many wrong tries: wait a minute"})
-            elif path == "/api/login":
-                token = service.login(name, password, address)
-                self.reply(200, {"session": token, "name": name}) if token else self.reply(403, {"error": "that name and password do not match"})
-            elif not self.code_ok():
-                service.wrong_guess(address)
-                self.reply(403, {"error": "the access code is not right"})
-            else:
-                token, problem = service.register(name, password, address)
-                self.reply(200, {"session": token, "name": name}) if token else self.reply(409, {"error": problem})
-        elif path == "/api/translate":
+        if path == "/api/translate":
             try:
                 source = json.loads(self.body(MAX_SOURCE * 2))["source"]
             except (TypeError, ValueError, KeyError):
                 self.reply(400, {"error": "send JSON with source"})
                 return
-            if self.person() is None:
-                self.reply(403, {"error": "sign in first"})
-            elif not isinstance(source, str) or len(source.encode()) > MAX_SOURCE:
+            if not self.asker():
+                return
+            if not isinstance(source, str) or len(source.encode()) > MAX_SOURCE:
                 self.reply(400, {"error": f"the program must be text, at most {MAX_SOURCE} bytes"})
             else:
                 directory = JOBS / f"convert-{uuid.uuid4().hex}"
@@ -813,8 +802,8 @@ class Handler(BaseHTTPRequestHandler):
                     shutil.rmtree(directory, ignore_errors=True)
                 self.reply(200, {"source": readable(translated), "changed": translated != source, "notes": notes})
         elif path == "/api/run":
-            if self.person() is None:
-                self.reply(403, {"error": "sign in first"})
+            person = self.asker()
+            if person is None:
                 return
             raw = self.body(MAX_SOURCE * 2)
             try:
@@ -830,7 +819,7 @@ class Handler(BaseHTTPRequestHandler):
             elif not 1 <= nodes <= 8:
                 self.reply(400, {"error": "nodes must be 1 to 8"})
             else:
-                run, problem = service.start(source, nodes, self.person(), self.client_address[0])
+                run, problem = service.start(source, nodes, person)
                 if run is None:
                     self.reply(409, {"error": problem})
                 else:

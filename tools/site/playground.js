@@ -33,7 +33,8 @@ function fallbackEditor() {
     area.setRangeText("    ", area.selectionStart, area.selectionEnd, "end");
   });
   $("editor").replaceChildren(area);
-  area.value = examples[3].source;
+  area.value = remembered("pm-code") ?? examples[3].source;
+  area.addEventListener("input", () => remember("pm-code", area.value));
 }
 
 function startEditor() {
@@ -52,9 +53,10 @@ function startEditor() {
         { token: "comment", foreground: "8795a8" }, { token: "keyword", foreground: "9dc2de" },
         { token: "string", foreground: "dcc497" }],
         colors: { "editor.background": "#1e3550", "editor.lineHighlightBackground": "#28425f" } });
-      editor = api.editor.create($("editor"), { value: examples[3].source, language: "c", theme: "paramesh-paper",
+      editor = api.editor.create($("editor"), { value: remembered("pm-code") ?? examples[3].source, language: "c", theme: "paramesh-paper",
         automaticLayout: true, minimap: { enabled: false }, fontFamily: "IBM Plex Mono, monospace", fontSize: 14,
         tabSize: 4, insertSpaces: true, autoIndent: "full", matchBrackets: "always", scrollBeyondLastLine: false });
+      editor.onDidChangeModelContent(() => remember("pm-code", editor.getValue()));
       api.languages.registerCompletionItemProvider("c", { provideCompletionItems: (model, position) => {
         const word = model.getWordUntilPosition(position);
         const range = { startLineNumber: position.lineNumber, endLineNumber: position.lineNumber,
@@ -84,9 +86,8 @@ async function poolStatus() {
     if (answer.ok) cluster = await answer.json();
   } catch { /* shown below */ }
   $("dot").classList.toggle("on", cluster.online && cluster.member === "joined");
-  needsSignIn = Boolean(cluster.access_code) && !session;
-  $("who").hidden = !cluster.access_code;
-  $("who").textContent = session ? `${who}, sign out` : "Sign in";
+  $("code-field").hidden = !cluster.access_code;
+  limit = cluster.run_seconds;
   if (!cluster.online) {
     $("pool").textContent = "pmd is not answering";
   } else if (cluster.member !== "joined") {
@@ -97,7 +98,7 @@ async function poolStatus() {
   const select = $("nodes");
   const count = Math.max(1, cluster.online ? cluster.nodes : 1);
   if (select.options.length !== count) {
-    const kept = select.value;
+    const kept = remembered("pm-nodes") ?? select.value;
     select.replaceChildren(...Array.from({ length: count }, (_, i) => html("option", { textContent: i + 1 })));
     select.value = Math.min(kept, count);
   }
@@ -107,6 +108,7 @@ async function poolStatus() {
 // ---- running ---------------------------------------------------------------------------------
 
 function showTab(name) {
+  remember("pm-tab", name);
   for (const tab of ["output", "converted", "analytics", "history"]) {
     $(`tab-${tab}`).setAttribute("aria-selected", tab === name);
     $(`pane-${tab}`).hidden = tab !== name;
@@ -245,7 +247,7 @@ function renderAnalytics(run) {
   const nodes = m.nodes_ran_tasks && m.nodes_ran_tasks.length ? m.nodes_ran_tasks : null;
   const chunks = Object.entries(m.chunks_by_peer || {});
   const by = Object.entries(m.by_node || {});
-  const board = html("div", { className: "board" });
+  const board = html("div", { className: "pinboard" });
   const cleanly = run.exit_code === 0;
   const verdict = cleanly ? "Finished cleanly" : run.exit_code === undefined ? "Did not run" : `Exit status ${run.exit_code}`;
   board.append(pin(`hero ${cleanly ? "" : "failed"}`, html("span", { textContent: "Program ran for" }), count(run.run_ms || 0, ms), html("p", { textContent: verdict })));
@@ -340,6 +342,7 @@ async function pastRuns() {
 
 function running(active) {
   $("run").disabled = active;
+  $("compare").disabled = active;
   $("stop").disabled = !active;
   $("run").textContent = active ? "Running" : "Run Code";
 }
@@ -365,56 +368,42 @@ async function convert() {
   return true;
 }
 
-// Who is using this page. The session lasts until the server restarts or the person signs out.
 const remembered = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
-let session = remembered("pm-session");
-let who = remembered("pm-name");
-let needsSignIn = false;
+function remember(key, value) {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  } catch { /* it lasts as long as the page, then */ }
+}
+
+let limit = null;  // seconds a run may take, from the server
 
 function asking() {
-  return { "Content-Type": "application/json", ...(session ? { "X-Session": session } : {}) };
+  return { "Content-Type": "application/json", "X-Access-Code": $("code").value.trim() };
 }
 
-function signedIn(token, name) {
-  session = token;
-  who = name;
-  needsSignIn = !token;
+// What each node is doing while a run goes on, from the same figures as the dashboard.
+async function drawLive() {
   try {
-    if (token) {
-      localStorage.setItem("pm-session", token);
-      localStorage.setItem("pm-name", name);
-    } else {
-      localStorage.removeItem("pm-session");
-      localStorage.removeItem("pm-name");
-    }
-  } catch { /* it lasts as long as the page, then */ }
-  $("who").textContent = token ? `${name}, sign out` : "Sign in";
+    const { nodes } = await (await fetch("/api/pool", { cache: "no-store" })).json();
+    if (!current) return;  // the run ended while this was on its way
+    $("live-strip").replaceChildren(...nodes.map((n) => {
+      const used = n.cores === undefined ? null : n.paramesh_cpu_percent / 100;
+      const bar = html("i");
+      bar.style.width = `${used === null ? 0 : Math.min(100, (used / n.cores) * 100)}%`;
+      return html("div", { className: `live-node${used ? " busy" : ""}` },
+        html("b", { textContent: n.here ? "This node" : `Node ${n.node}` }),
+        html("span", { textContent: used === null ? "no figures" : `${used.toFixed(1)} of ${n.cores} cores, ${(n.paramesh_rss / 2 ** 20).toFixed(0)} MiB` }),
+        html("div", {}, bar));
+    }));
+    $("live-strip").hidden = false;
+  } catch { /* the run goes on without it */ }
 }
 
-async function enter(path) {
-  const problem = $("who-problem");
-  problem.hidden = true;
-  try {
-    const answer = await fetch(path, { method: "POST",
-      headers: { "Content-Type": "application/json", "X-Access-Code": $("code").value.trim() },
-      body: JSON.stringify({ name: $("who-name").value.trim(), password: $("who-password").value }) });
-    const body = await answer.json();
-    if (!answer.ok) throw new Error(body.error);
-    signedIn(body.session, body.name);
-    $("signin").close();
-  } catch (failure) {
-    problem.textContent = failure.message || "The playground server is not answering.";
-    problem.hidden = false;
-  }
-}
-
-async function runProgram() {
-  if (needsSignIn) {
-    $("signin").showModal();
-    return;
-  }
+// Runs the program on `nodes` and waits for the end. False if the server would not run it.
+async function runProgram(nodes = Number($("nodes").value)) {
   const headers = asking();
-  if (Number($("nodes").value) > 1) {  // the converted code first, then the run
+  if (nodes > 1) {  // the converted code first, then the run
     showTab("converted");
     running(true);
     if (await convert()) await new Promise((done) => setTimeout(done, 1800));
@@ -426,39 +415,96 @@ async function runProgram() {
   renderOutput(empty);
   let answer;
   try {
-    answer = await fetch("/api/run", { method: "POST", headers, body: JSON.stringify({ language: "c", source: code(), nodes: Number($("nodes").value) }) });
+    answer = await fetch("/api/run", { method: "POST", headers, body: JSON.stringify({ language: "c", source: code(), nodes }) });
   } catch {
     $("pane-output").replaceChildren(html("p", { className: "notice bad", textContent: "The playground server is not answering." }));
     running(false);
-    return;
+    return false;
   }
   const body = await answer.json().catch(() => ({}));
   if (answer.status !== 202) {
     $("pane-output").replaceChildren(html("p", { className: "notice bad", textContent: body.error || "The server refused the run." }));
     running(false);
+    return false;
+  }
+  remember("pm-run", body.id);
+  await follow(body.id);
+  return true;
+}
+
+// The program as written, on one core, then split across every node, and what that proves.
+async function compare() {
+  const all = $("nodes").options.length;
+  if (all < 2) {
+    showTab("output");
+    $("pane-output").replaceChildren(html("p", { className: "notice bad", textContent: "Only one node is in the pool, so there is nothing to compare." }));
     return;
   }
-  current = body.id;
+  $("compare").disabled = true;
+  const one = await runProgram(1) ? last : null;
+  const many = one && await runProgram(all) ? last : null;
+  $("compare").disabled = false;
+  if (!one || !many) return;
+  if (one.exit_code !== 0 || many.exit_code !== 0) {
+    $("pane-output").prepend(html("p", { className: "notice bad", textContent: "A run failed, so these cannot be compared. Its output is below." }));
+    return;
+  }
+  const ratio = one.run_ms / many.run_ms;
+  const same = one.stdout === many.stdout;
+  const nodesRan = many.metrics?.nodes_ran_tasks?.length ?? 0;
+  const verdict = ratio >= 1.05 ? `${ratio.toFixed(2)} times faster on ${all} nodes than as written`
+    : ratio > 0.95 ? "about the same speed" : `${(1 / ratio).toFixed(2)} times slower on ${all} nodes: too little work to pay for the network`;
+  $("pane-output").prepend(html("article", { className: "compare" },
+    html("h4", { textContent: verdict }),
+    html("dl", {},
+      html("dt", { textContent: "As written, one core" }), html("dd", { textContent: ms(one.run_ms) }),
+      html("dt", { textContent: `${all} nodes` }), html("dd", { textContent: ms(many.run_ms) }),
+      html("dt", { textContent: "Nodes that ran tasks" }), html("dd", { textContent: String(nodesRan) })),
+    html("p", { className: same ? "same" : "differ", textContent: same ? "The output is identical." : "The output differs: see it below. A double total can differ in its last digits." })));
+}
+
+// Shows a run until it ends. The run belongs to the server, so a page that was closed, or left
+// for the dashboard, comes back to it here.
+async function follow(id) {
+  current = id;
+  running(true);
+  let ranFrom = null;
+  drawLive();
+  const live = setInterval(drawLive, 1500);
   while (current) {
-    await new Promise((done) => setTimeout(done, 250));
     let state;
     try {
       state = await (await fetch(`/api/run/${current}`, { headers: asking() })).json();
     } catch {
+      await new Promise((done) => setTimeout(done, 250));
       continue;
+    }
+    if (!state.state) {  // gone: the server restarted, or someone else signed in
+      remember("pm-run", null);
+      current = null;
+      break;
     }
     last = state;
     if (state.state === "queued") {
       $("pane-output").replaceChildren(html("p", { className: "notice", textContent: `You are number ${state.place} in line. Everyone takes turns.` }));
-      continue;
+    } else {
+      renderOutput(state);
+      renderAnalytics(state);
+      if (state.state === "running") {
+        ranFrom ??= performance.now();
+        const seconds = Math.round((performance.now() - ranFrom) / 1000);
+        $("run").textContent = limit ? `Running, ${seconds} of ${limit} s` : `Running, ${seconds} s`;
+      }
     }
-    renderOutput(state);
-    renderAnalytics(state);
     if (state.state === "done") {
       markErrors(state.diagnostics);
       current = null;
+    } else {
+      await new Promise((done) => setTimeout(done, 250));
     }
   }
+  clearInterval(live);
+  $("live-strip").hidden = true;
   running(false);
 }
 
@@ -476,11 +522,8 @@ $("examples").onchange = () => setCode(chosen().source);
 $("reset").onclick = () => setCode(chosen().source);
 $("clear").onclick = () => setCode("");
 $("copy").onclick = () => navigator.clipboard?.writeText(code());
-$("run").onclick = runProgram;
-$("who").onclick = () => (session ? signedIn(null, null) : $("signin").showModal());
-$("who-register").onclick = () => enter("/api/register");
-$("who-login").onclick = () => enter("/api/login");
-$("who-cancel").onclick = () => $("signin").close();
+$("run").onclick = () => runProgram();
+$("compare").onclick = compare;
 $("convert").onclick = async () => {
   showTab("converted");
   await convert();
@@ -498,7 +541,7 @@ $("tab-analytics").onclick = () => {
   if (last?.state === "done") renderAnalytics(last);  // the board fills in as it comes into view
 };
 $("tab-history").onclick = () => showTab("history");
-$("clear-output").onclick = () => { last = null; emptyPanes(); };
+$("clear-output").onclick = () => { last = null; remember("pm-run", null); emptyPanes(); };
 $("copy-output").onclick = () => last && navigator.clipboard?.writeText(outputText(last));
 $("download-output").onclick = () => {
   if (!last) return;
@@ -507,7 +550,13 @@ $("download-output").onclick = () => {
   URL.revokeObjectURL(link.href);
 };
 
+$("nodes").onchange = () => remember("pm-nodes", $("nodes").value);
+$("code").value = remembered("pm-access") ?? "";
+$("code").oninput = () => remember("pm-access", $("code").value.trim());
+
 emptyPanes();
 startEditor();
 poolStatus();
+if (remembered("pm-run")) follow(remembered("pm-run"));
+showTab(remembered("pm-tab") ?? "output");
 setInterval(poolStatus, 4000);

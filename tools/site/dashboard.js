@@ -232,3 +232,56 @@ $("join").addEventListener("submit", (event) => {
 $("leave").addEventListener("click", () => ask("/api/leave", null, $("leave"), "Leaving"));
 refresh();
 setInterval(refresh, 1000);
+
+// Every node at once: what each one's site says about its own machine.
+function meter(label, percent, text) {
+  const row = document.createElement("div");
+  row.className = "usage-bar";
+  const name = document.createElement("span");
+  name.textContent = label;
+  const value = document.createElement("b");
+  value.textContent = text;
+  const track = document.createElement("div");
+  const fill = document.createElement("i");
+  fill.style.width = `${Math.min(100, Math.max(0, percent))}%`;
+  track.append(fill);
+  row.append(name, value, track);
+  return row;
+}
+
+function nodeCard(n) {
+  const card = document.createElement("article");
+  card.className = `node-live${n.jobs ? " busy" : ""}`;
+  const title = document.createElement("h3");
+  title.textContent = n.here ? `This node, ${n.node}` : `Node ${n.node}`;
+  const where = document.createElement("p");
+  where.className = "soft";
+  card.append(title, where);
+  if (n.cores === undefined) {
+    where.textContent = `${n.address}: its site does not answer. It needs the same release and the invite code.`;
+    return card;
+  }
+  where.textContent = `${n.here ? "" : `${n.address}, `}${n.jobs ? `working on ${n.jobs} job${n.jobs === 1 ? "" : "s"}` : "idle"}`;
+  const gib = (bytes) => (bytes / 2 ** 30).toFixed(1);
+  card.append(
+    meter("Machine CPU", n.cpu_percent ?? 0, n.cpu_percent === null ? "–" : `${Math.round(n.cpu_percent)}%`),
+    meter("ParaMesh CPU", n.paramesh_cpu_percent / n.cores, `${(n.paramesh_cpu_percent / 100).toFixed(1)} of ${n.cores} cores`),
+    meter("Machine RAM", (n.ram_used / n.ram_total) * 100, `${gib(n.ram_used)} of ${gib(n.ram_total)} GiB`),
+    meter("ParaMesh RAM", (n.paramesh_rss / n.ram_total) * 100, `${(n.paramesh_rss / 2 ** 20).toFixed(0)} MiB`));
+  return card;
+}
+
+async function drawPool() {
+  try {
+    const { nodes } = await (await fetch("/api/pool", { cache: "no-store" })).json();
+    const working = nodes.filter((n) => n.jobs).length;
+    const cores = nodes.reduce((sum, n) => sum + (n.paramesh_cpu_percent || 0) / 100, 0);
+    $("pool-sum").textContent = `${nodes.length} node${nodes.length === 1 ? "" : "s"}, ${working} working, ${cores.toFixed(1)} cores busy on ParaMesh`;
+    $("pool-nodes").replaceChildren(...nodes.map(nodeCard));
+  } catch {
+    $("pool-sum").textContent = "This node's site is not answering.";
+  }
+}
+
+drawPool();
+setInterval(drawPool, 2000);

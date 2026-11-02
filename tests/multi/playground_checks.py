@@ -1,4 +1,5 @@
 """What tests/multi/run_playground.sh checks, through the same requests the page sends."""
+import http.client
 import json
 import os
 import shutil
@@ -12,7 +13,6 @@ from pathlib import Path
 
 BASE = "http://127.0.0.1:47081"
 CODE = {"X-Access-Code": "letmein", "Content-Type": "application/json"}
-SIGNED_IN = {}
 failures = 0
 
 
@@ -23,7 +23,7 @@ def check(name, good, detail=""):
 
 
 def post(path, body, headers=None):
-    headers = headers or (SIGNED_IN if path not in ("/api/register", "/api/login") else CODE)
+    headers = CODE if headers is None else headers
     request = urllib.request.Request(BASE + path, json.dumps(body).encode(), headers)
     try:
         with urllib.request.urlopen(request) as answer:
@@ -33,18 +33,18 @@ def post(path, body, headers=None):
 
 
 def get(path, headers=None):
-    request = urllib.request.Request(BASE + path, headers=headers or SIGNED_IN)
+    request = urllib.request.Request(BASE + path, headers=headers or {})
     with urllib.request.urlopen(request) as answer:
         return json.load(answer)
 
 
-def join(name, password="secret6"):
-    status, body = post("/api/register", {"name": name, "password": password})
-    assert status == 200, body
-    return {"X-Session": body["session"], "Content-Type": "application/json"}
-
-
-SIGNED_IN.update(join("tester"))
+def lan(source, method, path, body=None, code="letmein"):
+    """A request from another machine: another loopback address, not this machine's name."""
+    connection = http.client.HTTPConnection("127.0.0.2", 47081, source_address=(source, 0))
+    connection.request(method, path, json.dumps(body) if body is not None else None,
+                       {"X-Access-Code": code, "Content-Type": "application/json"})
+    answer = connection.getresponse()
+    return answer.status, json.loads(answer.read())
 
 
 def run(source, nodes=1):
@@ -124,8 +124,7 @@ done = subprocess.run([str(directory / "pmrun"), "--state-dir", os.environ["STAT
 shutil.rmtree(directory)
 check("pmd refuses a job asked for from the sandbox", "may not do that" in done.stderr, done.stderr)
 
-status, _ = post("/api/run", {"source": "int main(void){}", "nodes": 1}, {"Content-Type": "application/json"})
-check("Run needs someone signed in", status == 403, status)
+check("Run needs the access code on the LAN", lan("127.0.0.9", "POST", "/api/run", {"source": "int main(void){}", "nodes": 1}, "wrong")[0] == 403)
 for body, why in [({"language": "python", "source": "print(1)"}, "another language"), ({"source": "", "nodes": 1}, "no source"),
                   ({"source": "int main(void){}", "nodes": 99}, "too many nodes"), ({"source": "x" * 70000}, "too long"),
                   ({"source": "a\0b"}, "a NUL")]:
@@ -139,26 +138,18 @@ twice, _ = post("/api/run", QUICK)
 check("a run waits in line while another runs", status == 202 and own_status == 202
       and get("/api/run/" + own["id"]).get("place") == 1, own)
 check("one place in line for each person", twice == 409, twice)
-bob = join("bob")
-bob_status, theirs = post("/api/run", QUICK, bob)
-check("the next person is behind them", bob_status == 202 and get("/api/run/" + theirs["id"], bob).get("place") == 2, theirs)
-try:
-    get("/api/run/" + first["id"], bob)
-    peeked = 200
-except urllib.error.HTTPError as answer:
-    peeked = answer.code
-check("no one reads another person's run", peeked == 404, peeked)
-check("no one stops another person's run", post("/api/stop/" + first["id"], {}, bob)[0] == 403)
-check("the same name cannot be taken twice", post("/api/register", {"name": "bob", "password": "secret6"})[0] == 409)
-check("registering needs the access code", post("/api/register", {"name": "eve", "password": "secret6"},
-                                                 {"Content-Type": "application/json"})[0] == 403)
+BOB = "127.0.0.3"
+bob_status, theirs = lan(BOB, "POST", "/api/run", QUICK)
+check("the next machine is behind them", bob_status == 202 and lan(BOB, "GET", "/api/run/" + theirs["id"])[1].get("place") == 2, theirs)
+check("no machine reads another's run", lan(BOB, "GET", "/api/run/" + first["id"])[0] == 404)
+check("no machine stops another's run", lan(BOB, "POST", "/api/stop/" + first["id"], {})[0] == 403)
 post("/api/stop/" + first["id"], {})
 begin = time.monotonic()
-while get("/api/run/" + theirs["id"], bob)["state"] != "done" and time.monotonic() - begin < 20:
+while lan(BOB, "GET", "/api/run/" + theirs["id"])[1]["state"] != "done" and time.monotonic() - begin < 20:
     time.sleep(0.1)
-check("they run in turn", get("/api/run/" + own["id"])["started"] < get("/api/run/" + theirs["id"], bob)["started"]
-      and get("/api/run/" + theirs["id"], bob).get("exit_code") == 0)
-check("past runs are your own", {r["person"] for r in get("/api/runs", bob)["runs"]} == {"bob"}, get("/api/runs", bob))
+bobs = lan(BOB, "GET", "/api/run/" + theirs["id"])[1]
+check("they run in turn", get("/api/run/" + own["id"])["started"] < bobs["started"] and bobs.get("exit_code") == 0)
+check("past runs are your own", {r["person"] for r in lan(BOB, "GET", "/api/runs")[1]["runs"]} == {BOB})
 begin = time.monotonic()
 while get("/api/run/" + first["id"])["state"] != "done" and time.monotonic() - begin < 20:
     time.sleep(0.1)
@@ -245,7 +236,8 @@ check("a job's RAM and CPU are measured", measured, seen)
 status, shown = post("/api/translate", {"source": "#include <stdio.h>\nint main(void){long s=0;\nfor(int i=0;i<9;i++){s+=i;}\nprintf(\"%ld\\n\",s);return 0;}\n"})
 check("Convert shows the program and where its loop runs", status == 200 and "PM_TASK" in shown["source"]
       and "#line" not in shown["source"] and "runs on the pool" in shown["notes"][0], shown)
-check("the right password signs in", post("/api/login", {"name": "bob", "password": "secret6"})[0] == 200)
-tries = [post("/api/login", {"name": "bob", "password": "wrong"})[0] for _ in range(6)]
-check("wrong passwords are locked out", tries[0] == 403 and tries[-1] == 429, tries)
+tries = [lan("127.0.0.8", "POST", "/api/run", {"source": "int main(void){}", "nodes": 1}, "wrong")[0] for _ in range(6)]
+check("wrong codes are locked out", tries[0] == 403 and tries[-1] == 429, tries)
+pool = get("/api/pool")["nodes"]
+check("the dashboard sees every node", len(pool) >= 2 and pool[0]["here"] and all(n.get("ram_total", 0) > 0 for n in pool), pool)
 sys.exit(1 if failures else 0)
