@@ -431,9 +431,9 @@ void take_next(HomeDirectory& directory, Entry& e, const HomeEvent& event, const
 
 // Section 3, "new map drops a member". An entry the member owns cannot exist: a leaver
 // writes its pages back first.
-// A member has left. Its INV_ACK will never come: the connection is closed, and what it held for
-// reading is gone. An operation that needs bytes only it had cannot go on, and is never answered
-// with zeros: the job ends.
+// A member has left. Its INV_ACK will never come: what it held for reading is gone. Page data it
+// sent before it left may still be on the way, over another connection than the map's, so a
+// FETCH it owes stays open: home_member_closed() ends that wait.
 void home_drop_member(HomeDirectory& directory, Slot slot, Nanos now,
                       std::vector<HomeAction>& out) {
     const NodeId gone = directory.nodes.at(slot.value);
@@ -445,8 +445,9 @@ void home_drop_member(HomeDirectory& directory, Slot slot, Nanos now,
         const bool waited = e.wait == HomeWait::kInv && (e.pending & bit(slot)) != 0;
         e.pending &= ~bit(slot);
         if ((e.wait == HomeWait::kFetch || e.wait == HomeWait::kFetchInv) && e.owner == gone) {
-            out.push_back(action(HomeActionKind::kAbort, PageId{page}));
-        } else if (waited && e.pending == 0) {
+            continue;
+        }
+        if (waited && e.pending == 0) {
             finish(e, false, step);
             HomeEvent event;
             event.page = PageId{page};
@@ -454,6 +455,16 @@ void home_drop_member(HomeDirectory& directory, Slot slot, Nanos now,
             take_next(directory, e, event, step);
         } else if (e.state == HomeState::kShared && e.copyset == 0) {
             e.state = HomeState::kUncached;
+        }
+    }
+}
+
+// The stream from a member that left has ended, so all it sent has been read. Bytes it still owes
+// are lost, and a page is never answered with zeros: the job ends.
+void home_member_closed(const HomeDirectory& directory, NodeId node, std::vector<HomeAction>& out) {
+    for (const auto& [page, e] : directory.entries) {
+        if ((e.wait == HomeWait::kFetch || e.wait == HomeWait::kFetchInv) && e.owner == node) {
+            out.push_back(action(HomeActionKind::kAbort, PageId{page}));
         }
     }
 }

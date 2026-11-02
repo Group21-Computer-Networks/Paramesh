@@ -710,8 +710,11 @@ public:
             changed_.notify_all();
             return;
         }
-        if (left_.contains(peer.value)) {
-            return;  // it said LEAVE_DONE and every process has the map without it
+        if (left_.contains(peer.value)) {  // it said LEAVE_DONE and every process has the map
+            actions_.clear();              // without it: only what it still owed can matter
+            home_member_closed(*dir_, peer, actions_);
+            run_home_actions(actions_, {}, net_->now());
+            return;
         }
         const std::string message = "node " + std::to_string(peer.value) + " lost";
         if (!is_launcher() && peer == s_.members.front().node) {
