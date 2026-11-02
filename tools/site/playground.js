@@ -172,8 +172,41 @@ const bytes = (value) => {
   return value >= 1048576 ? `${(value / 1048576).toFixed(1)} MiB` : `${(value / 1024).toFixed(1)} KiB`;
 };
 
-function kpi(label, value) {
-  return html("div", { className: "kpi" }, html("span", { textContent: label }), html("b", { textContent: value }));
+const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+// A figure that runs up to its value. The value is the measured one; only the arrival moves.
+function count(value, format, delay = 0) {
+  const figure = html("b", { textContent: format(value) });
+  if (still || !value) return figure;
+  figure.textContent = format(0);
+  const begin = performance.now() + delay;
+  const step = (now) => {
+    const done = Math.max(0, Math.min(1, (now - begin) / 900));
+    const eased = value * (1 - (1 - done) ** 3);
+    figure.textContent = format(done === 1 ? value : Number.isInteger(value) ? Math.round(eased) : eased);
+    if (done < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+  return figure;
+}
+
+// One card of the board. The order sets when it rises, so the board fills in from the top.
+let pins = 0;
+function pin(kind, ...children) {
+  const card = html("article", { className: `pin ${kind}` }, ...children);
+  card.style.setProperty("--i", pins++);
+  return card;
+}
+
+function ring(fraction) {
+  const holder = html("div", { className: "ring" });
+  const length = 2 * Math.PI * 50;
+  holder.innerHTML = `<svg viewBox="0 0 120 120" aria-hidden="true"><circle cx="60" cy="60" r="50"/><circle class="arc" cx="60" cy="60" r="50" stroke-dasharray="${length}" style="--from:${length};--to:${length * (1 - fraction)}"/></svg>`;
+  return holder;
+}
+
+function stat(label, value, format, kind = "") {
+  return pin(`small ${kind}`, count(value, format, 200), html("span", { textContent: label }));
 }
 
 function bars(rows) {
@@ -204,57 +237,80 @@ function renderAnalytics(run) {
     pane.replaceChildren(html("div", { className: "empty" }, html("h3", { textContent: "Running" }), html("p", { textContent: "The figures arrive when the job ends, because each process reports its own as it exits." })));
     return;
   }
+  pins = 0;
   const m = run.metrics || {};
-  const nodes = m.nodes_ran_tasks && m.nodes_ran_tasks.length ? m.nodes_ran_tasks.length : null;
-  const cpu = m.cpu_ms ?? run.launcher_cpu_ms;
-  const parts = [["Compile", run.compile_ms, "#a88a5e"], ["Stage", run.stage_ms, "#5f6b38"], ["Program", run.run_ms, "#3f6386"]].filter((p) => p[1]);
-  const total = parts.reduce((sum, p) => sum + p[1], 0);
-  const timeline = html("div", { className: "timeline" });
-  const legend = html("div", { className: "legend" });
-  for (const [label, value, color] of parts) {
+  const whole = (value) => number(value);
+  const nodes = m.nodes_ran_tasks && m.nodes_ran_tasks.length ? m.nodes_ran_tasks : null;
+  const chunks = Object.entries(m.chunks_by_peer || {});
+  const by = Object.entries(m.by_node || {});
+  const board = html("div", { className: "board" });
+  const cleanly = run.exit_code === 0;
+  const verdict = cleanly ? "Finished cleanly" : run.exit_code === undefined ? "Did not run" : `Exit status ${run.exit_code}`;
+  board.append(pin(`hero ${cleanly ? "" : "failed"}`, html("span", { textContent: "Program ran for" }), count(run.run_ms || 0, ms), html("p", { textContent: verdict })));
+
+  const steps = [["Compile", run.compile_ms, "#a88a5e"], ["Stage", run.stage_ms, "#5f6b38"], ["Program", run.run_ms, "#3f6386"]].filter((p) => p[1]);
+  const total = steps.reduce((sum, p) => sum + p[1], 0);
+  const ribbon = html("div", { className: "ribbon" });
+  const legend = html("ul", { className: "ribbon-key" });
+  for (const [label, value, color] of steps) {
     const piece = html("i");
-    piece.style.width = `${(value / total) * 100}%`;
+    piece.style.flexGrow = value / total;
     piece.style.background = color;
-    timeline.append(piece);
+    ribbon.append(piece);
     const swatch = html("i");
     swatch.style.background = color;
-    legend.append(html("span", {}, swatch, `${label} ${ms(value)}`));
+    legend.append(html("li", {}, swatch, label, html("b", { textContent: ms(value) })));
   }
-  const by = Object.entries(m.by_node || {});
-  const content = [
-    html("div", { className: "kpis" }, kpi("Compile", ms(run.compile_ms)), kpi("Program wall clock", ms(run.run_ms)),
-      kpi("CPU, all processes", ms(cpu)), kpi("Nodes that ran tasks", nodes ?? NA), kpi("Exit status", run.exit_code ?? NA)),
-    html("p", { className: "chart-title", textContent: "Execution timeline" }), timeline, legend,
-  ];
-  if (by.length) {
-    content.push(html("p", { className: "chart-title", textContent: "Page faults by node" }), bars(by.map(([node, p]) => ({ label: `Node ${node}`, value: p.faults }))));
-    content.push(html("p", { className: "chart-title", textContent: "Pages received by node" }), bars(by.map(([node, p]) => ({ label: `Node ${node}`, value: p.received }))));
+  board.append(pin("paper", html("h4", { textContent: "Where the time went" }), ribbon, legend));
+
+  const who = [html("h4", { textContent: "Who did the work" })];
+  if (nodes) {
+    who.push(html("div", { className: "nodes" }, ...nodes.map((node) => html("span", { textContent: `Node ${node}` }))));
+    if (chunks.length) who.push(bars(chunks.map(([peer, value]) => ({ label: `Node ${peer}`, value }))));
+  } else {
+    who.push(html("p", { textContent: "No tasks ran, so all of this stayed on the laptop that started it." }));
+  }
+  board.append(pin("sky", ...who));
+
+  if (m.page_faults) board.append(stat("page faults", m.page_faults, whole, "olive"));
+  if (run.launcher_peak_kib) board.append(stat("peak memory, launcher", run.launcher_peak_kib * 1024, bytes, "tan"));
+  if (m.pages_received) board.append(stat("pages received", m.pages_received, whole));
+
+  if (m.page_bytes_plain) {
+    const saved = Math.max(0, 1 - m.page_bytes / m.page_bytes_plain);
+    board.append(pin("paper center", html("h4", { textContent: "Saved on the network" }), ring(saved),
+      count(Math.round(saved * 100), (value) => `${value}%`, 300), html("p", { textContent: `${bytes(m.page_bytes)} sent, not ${bytes(m.page_bytes_plain)}` })));
+  }
+  if (by.length > 1) {
+    board.append(pin("paper", html("h4", { textContent: "Page faults by node" }), bars(by.map(([node, p]) => ({ label: `Node ${node}`, value: p.faults })))));
   }
   if (m.fault_latency && m.fault_latency.some(Boolean)) {
     const most = Math.max(...m.fault_latency);
     const chart = html("div", { className: "histogram" });
-    m.fault_latency.forEach((count, bucket) => {
-      const column = html("i", { title: `${count} faults, below ${bucket === 15 ? "over 16,384" : 2 ** bucket} µs` });
-      column.style.height = `${(count / most) * 100}%`;
+    m.fault_latency.forEach((value, bucket) => {
+      const column = html("i", { title: `${value} faults, below ${bucket === 15 ? "over 16,384" : 2 ** bucket} µs` });
+      column.style.height = `${(value / most) * 100}%`;
+      column.style.setProperty("--n", bucket);
       chart.append(column);
     });
-    content.push(html("p", { className: "chart-title", textContent: "Fault latency, power-of-two buckets from 1 µs to over 16 ms" }), chart);
+    board.append(pin("paper", html("h4", { textContent: "How long a page took" }), chart, html("p", { className: "axis", textContent: "1 µs to over 16 ms; each bar twice the last" })));
   }
-  const chunks = Object.entries(m.chunks_by_peer || {});
-  content.push(html("p", { className: "chart-title", textContent: "Every measurement" }), table([
+  if (m.pages_prefetched) board.append(stat("pages prefetched", m.pages_prefetched, whole, "sky"));
+  if (m.pages_as_diffs) board.append(stat("pages sent as diffs", m.pages_as_diffs, whole, "tan"));
+
+  const details = html("details", { className: "measured" }, html("summary", { textContent: "Every measurement" }), table([
     ["Execution", [["Compile time", ms(run.compile_ms)], ["Staging to peers", ms(run.stage_ms)], ["Program wall clock", ms(run.run_ms)],
       ["CPU time, summed over processes", ms(m.cpu_ms)], ["CPU time, launcher and pmrun", ms(run.launcher_cpu_ms)], ["Exit status", run.exit_code ?? NA]]],
-    ["Distribution", [["Processes that reported", number(m.processes_reported)], ["Nodes that ran tasks", nodes ? m.nodes_ran_tasks.join(", ") : NA],
+    ["Distribution", [["Processes that reported", number(m.processes_reported)], ["Nodes that ran tasks", nodes ? nodes.join(", ") : NA],
       ["Worker threads on this node", number(m.worker_threads)],
-      ...(chunks.length ? chunks.map(([peer, count]) => [`Chunks run by peer ${peer}`, number(count)]) : [["Chunks run by peers", NA]]),
-      ["Tasks scheduled", NA], ["Tasks completed", NA]]],
-    ["Resources", [["CPU utilisation", NA], ["Peak memory, launcher", run.launcher_peak_kib ? bytes(run.launcher_peak_kib * 1024) : NA], ["Peak memory, workers", NA],
-      ["Shared memory allocated", NA], ["Page data sent", bytes(m.page_bytes)], ["Page data if sent plain", bytes(m.page_bytes_plain)]]],
+      ...chunks.map(([peer, value]) => [`Chunks run by peer ${peer}`, number(value)])]],
+    ["Memory and network", [["Peak memory, launcher", run.launcher_peak_kib ? bytes(run.launcher_peak_kib * 1024) : NA],
+      ["Page data sent", bytes(m.page_bytes)], ["Page data if sent plain", bytes(m.page_bytes_plain)]]],
     ["Runtime", [["Page faults", number(m.page_faults)], ["Pages received", number(m.pages_received)], ["Pages sent", number(m.pages_sent)],
       ["Pages prefetched", number(m.pages_prefetched)], ["Requests sent again", number(m.requests_sent_again)], ["Pages sent encoded", number(m.pages_encoded)],
-      ["Pages sent as diffs", number(m.pages_as_diffs)], ["Invalidations", NA]]],
-  ]));
-  pane.replaceChildren(...content);
+      ["Pages sent as diffs", number(m.pages_as_diffs)]]],
+  ]), html("p", { className: "unmeasured", textContent: "Not measured by the runtime: tasks scheduled and completed, invalidations, CPU utilisation, workers' peak memory, shared memory allocated." }));
+  pane.replaceChildren(board, details);
 }
 
 async function pastRuns() {
@@ -375,7 +431,10 @@ $("theme").onclick = () => {
   monacoApi?.editor.setTheme(dark ? "paramesh-night" : "paramesh-paper");
 };
 $("tab-output").onclick = () => showTab("output");
-$("tab-analytics").onclick = () => showTab("analytics");
+$("tab-analytics").onclick = () => {
+  showTab("analytics");
+  if (last?.state === "done") renderAnalytics(last);  // the board fills in as it comes into view
+};
 $("tab-history").onclick = () => showTab("history");
 $("clear-output").onclick = () => { last = null; emptyPanes(); };
 $("copy-output").onclick = () => last && navigator.clipboard?.writeText(outputText(last));
