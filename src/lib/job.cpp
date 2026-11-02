@@ -713,12 +713,15 @@ public:
         if (left_.contains(peer.value)) {
             return;  // it said LEAVE_DONE and every process has the map without it
         }
-        platform_.logger->log(
-            LogLevel::kWarn, "peer_lost",
-            JsonObject{{"peer", JsonValue{std::int64_t{peer.value}}},
-                       {"why", JsonValue{std::string{why == Errc::kTimeout    ? "silent"
-                                                     : why == Errc::kProtocol ? "bad frame"
-                                                                              : "closed"}}}});
+        const char* reason = "closed";
+        if (why == Errc::kTimeout) {
+            reason = "silent";
+        } else if (why == Errc::kProtocol) {
+            reason = "bad frame";
+        }
+        platform_.logger->log(LogLevel::kInfo, "peer_lost",
+                              JsonObject{{"peer", JsonValue{std::int64_t{peer.value}}},
+                                         {"why", JsonValue{std::string{reason}}}});
         const std::string message = "node " + std::to_string(peer.value) + " lost";
         if (!is_launcher() && peer == s_.members.front().node) {
             exit_with(Status::kNodeLost, message);  // nobody left to tell
