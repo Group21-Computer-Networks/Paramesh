@@ -245,7 +245,7 @@ function renderAnalytics(run) {
   const nodes = m.nodes_ran_tasks && m.nodes_ran_tasks.length ? m.nodes_ran_tasks : null;
   const chunks = Object.entries(m.chunks_by_peer || {});
   const by = Object.entries(m.by_node || {});
-  const board = html("div", { className: "board" });
+  const board = html("div", { className: "pinboard" });
   const cleanly = run.exit_code === 0;
   const verdict = cleanly ? "Finished cleanly" : run.exit_code === undefined ? "Did not run" : `Exit status ${run.exit_code}`;
   board.append(pin(`hero ${cleanly ? "" : "failed"}`, html("span", { textContent: "Program ran for" }), count(run.run_ms || 0, ms), html("p", { textContent: verdict })));
