@@ -31,6 +31,10 @@ Approved by Amirishetty Sai Vignesh in chat, 2026-11-06: "make this as package",
 
 - Second run (42098968121): the join answered 403, because the status API's POSTs need the header `X-ParaMesh: 1` (the dashboard's guard against other pages posting). Added the header to the test.
 
+### 2026-11-06 — session 4
+
+- Third run (42099401460): join accepted, the job was admitted, and `quickstart` printed "this machine cannot run ParaMesh": Docker's default seccomp profile allows `userfaultfd` only to a container with `CAP_SYS_PTRACE`. The test, the Dockerfile's comment and the README now run the container with `--cap-add SYS_PTRACE`, which is narrower than turning seccomp off.
+
 ## Files touched
 
 - `Dockerfile` — the image
@@ -44,6 +48,7 @@ Approved by Amirishetty Sai Vignesh in chat, 2026-11-06: "make this as package",
 
 - A container image, because GitHub Packages has no format for a native Linux runtime; the image reuses `package.sh` so it cannot drift from the installer.
 - Host networking documented as required: multicast discovery and the job mesh's own ports do not pass through Docker's port mapping.
+- `--cap-add SYS_PTRACE` rather than `--security-opt seccomp=unconfined`: it keeps Docker's seccomp profile and only lifts what userfaultfd needs.
 
 ## Questions and blockers
 

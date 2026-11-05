@@ -1,9 +1,11 @@
 # The ParaMesh container image (X-package): the same files the installer puts in /opt/paramesh,
 # with pmd and the website started by tools/setup/docker-entrypoint.sh.
 #
-#   docker run -d --name paramesh --network host --init ghcr.io/group21-computer-networks/paramesh
+#   docker run -d --name paramesh --network host --cap-add SYS_PTRACE --init \
+#       ghcr.io/group21-computer-networks/paramesh
 #
 # Host networking is needed: discovery uses UDP multicast and jobs open TCP ports of their own.
+# SYS_PTRACE is needed because Docker's default seccomp profile allows userfaultfd only with it.
 
 FROM ubuntu:24.04 AS build
 RUN apt-get update \

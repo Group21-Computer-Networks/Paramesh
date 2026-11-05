@@ -31,7 +31,7 @@ jobs:
           docker run --rm paramesh:test bash -c 'printf "#include <paramesh.h>\nint main(void){return pm_strerror(PM_OK)==0;}\n" >/tmp/a.c && cc -O2 /tmp/a.c $(pkg-config --cflags --libs paramesh) -o /tmp/a && /tmp/a'
       - name: Test the services and a one-node job
         run: |
-          docker run -d --name pm --network host --init paramesh:test
+          docker run -d --name pm --network host --init --cap-add SYS_PTRACE paramesh:test
           for port in 47002 47080; do
             for _ in $(seq 1 50); do (: </dev/tcp/127.0.0.1/$port) 2>/dev/null && break; sleep 0.2; done
             (: </dev/tcp/127.0.0.1/$port) || { docker logs pm; exit 1; }
