@@ -3,10 +3,10 @@
 - Task: X-package
 - Milestone: none
 - Stream: -
-- Status: in-progress
+- Status: done
 - Branch: x-package
 - Started: 2026-11-06
-- Finished:
+- Finished: 2026-11-06
 
 ## Card
 
@@ -39,6 +39,11 @@ Approved by Amirishetty Sai Vignesh in chat, 2026-11-06: "make this as package",
 
 - Fourth run (42099844304) failed the same way with `SYS_PTRACE`. A probe step built a small C program in the image calling `userfaultfd(UFFD_USER_MODE_ONLY)` on the runner (kernel 7.0.0-1017-azure): default Docker, "Operation not permitted"; with `--cap-add SYS_PTRACE`, "Operation not permitted"; with `--security-opt seccomp=unconfined`, "ok". So the container runs with `seccomp=unconfined`; the test, the Dockerfile's comment and the README say so and why. The probe step was removed after it answered.
 
+### 2026-11-06 — session 6
+
+- Fifth run (42100744625) on the pull request passed every step: build; `pmd --help`, `pm` and `pmrun` present, a program built with `pkg-config` ran; services answered on 47002 and 47080; joined with `POST /v1/join`; `pm status`; `pmrun -n 1 quickstart 100000` printed "sum of squares below 100000: 333328333350000 (right)". Push was skipped, as on every pull request.
+- Next: merge, then run `package` on `main` by hand to push `latest`.
+
 ## Files touched
 
 - `Dockerfile` — the image
@@ -69,7 +74,7 @@ None
 
 ## Verification
 
-Pending: the `package` workflow's test steps, run in Actions after merge.
+`package` workflow on the pull request, run 42100744625: every step passed (session 6). Log check against `origin/main` passed. The push to ghcr.io happens on `main` and is reported in the pull request.
 
 ## Deferred
 
