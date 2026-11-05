@@ -36,6 +36,8 @@ jobs:
             for _ in $(seq 1 50); do (: </dev/tcp/127.0.0.1/$port) 2>/dev/null && break; sleep 0.2; done
             (: </dev/tcp/127.0.0.1/$port) || { docker logs pm; exit 1; }
           done
+          curl -sf -X POST -d '{"cap_cores": 2, "cap_ram": 1073741824}' http://127.0.0.1:47002/v1/join
+          sleep 2
           docker exec pm pm status
           docker exec pm pmrun -n 1 /opt/paramesh/apps/quickstart 100000 || { docker logs pm; exit 1; }
           docker rm -f pm

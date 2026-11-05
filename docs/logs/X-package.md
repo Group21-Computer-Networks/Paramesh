@@ -23,6 +23,10 @@ Approved by Amirishetty Sai Vignesh in chat, 2026-11-06: "make this as package",
 - README: a "Container image" section.
 - No Docker on this machine, so the image is built and tested only in Actions. Next: pull request, then a manual run of `package` on `main` once merged.
 
+### 2026-11-06 — session 2
+
+- First `package` run on the pull request (run 42098556890): build passed, tools and library test passed; the one-node job was refused, "this node has not joined the pool: join on the dashboard", because the image starts `pmd --standby` as the installer does. The test now joins first with `POST /v1/join` (2 cores, 1 GB), as the dashboard's button does.
+
 ## Files touched
 
 - `Dockerfile` — the image
