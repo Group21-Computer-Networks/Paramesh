@@ -27,6 +27,10 @@ Approved by Amirishetty Sai Vignesh in chat, 2026-11-06: "make this as package",
 
 - First `package` run on the pull request (run 42098556890): build passed, tools and library test passed; the one-node job was refused, "this node has not joined the pool: join on the dashboard", because the image starts `pmd --standby` as the installer does. The test now joins first with `POST /v1/join` (2 cores, 1 GB), as the dashboard's button does.
 
+### 2026-11-06 — session 3
+
+- Second run (42098968121): the join answered 403, because the status API's POSTs need the header `X-ParaMesh: 1` (the dashboard's guard against other pages posting). Added the header to the test.
+
 ## Files touched
 
 - `Dockerfile` — the image
