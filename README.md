@@ -136,6 +136,23 @@ bash ~/.local/share/paramesh/paramesh-setup.sh --uninstall
 
 </details>
 
+### Container image
+
+ParaMesh is also published on GitHub Packages as a container image with the same files as the installer:
+
+```bash
+docker pull ghcr.io/group21-computer-networks/paramesh:latest
+```
+
+```bash
+docker run -d --name paramesh --network host --init ghcr.io/group21-computer-networks/paramesh
+```
+
+It starts `pmd` in standby and the website on port 47080. Host networking is needed, because discovery
+uses UDP multicast and jobs open TCP ports of their own. Run commands inside it with
+`docker exec paramesh pm status` or `docker exec paramesh pmrun -n 2 /opt/paramesh/apps/matmul 512`.
+Every laptop must run the same image tag.
+
 ## How it works
 
 ### The parts
