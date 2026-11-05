@@ -35,6 +35,10 @@ Approved by Amirishetty Sai Vignesh in chat, 2026-11-06: "make this as package",
 
 - Third run (42099401460): join accepted, the job was admitted, and `quickstart` printed "this machine cannot run ParaMesh": Docker's default seccomp profile allows `userfaultfd` only to a container with `CAP_SYS_PTRACE`. The test, the Dockerfile's comment and the README now run the container with `--cap-add SYS_PTRACE`, which is narrower than turning seccomp off.
 
+### 2026-11-06 — session 5
+
+- Fourth run (42099844304) failed the same way with `SYS_PTRACE`. A probe step built a small C program in the image calling `userfaultfd(UFFD_USER_MODE_ONLY)` on the runner (kernel 7.0.0-1017-azure): default Docker, "Operation not permitted"; with `--cap-add SYS_PTRACE`, "Operation not permitted"; with `--security-opt seccomp=unconfined`, "ok". So the container runs with `seccomp=unconfined`; the test, the Dockerfile's comment and the README say so and why. The probe step was removed after it answered.
+
 ## Files touched
 
 - `Dockerfile` — the image
@@ -42,13 +46,14 @@ Approved by Amirishetty Sai Vignesh in chat, 2026-11-06: "make this as package",
 - `tools/setup/docker-entrypoint.sh` — the container's start
 - `.github/workflows/package.yml` — build, test and push to ghcr.io
 - `README.md` — Container image section
+- `docs/TODO.md` — a narrower seccomp profile for the image
 - `docs/logs/X-package.md` — this log
 
 ## Decisions
 
 - A container image, because GitHub Packages has no format for a native Linux runtime; the image reuses `package.sh` so it cannot drift from the installer.
 - Host networking documented as required: multicast discovery and the job mesh's own ports do not pass through Docker's port mapping.
-- `--cap-add SYS_PTRACE` rather than `--security-opt seccomp=unconfined`: it keeps Docker's seccomp profile and only lifts what userfaultfd needs.
+- `--security-opt seccomp=unconfined`, measured as the only Docker option tried that allows userfaultfd (session 5). A custom profile, Docker's default plus `userfaultfd`, would be narrower; deferred.
 
 ## Questions and blockers
 
@@ -68,4 +73,4 @@ Pending: the `package` workflow's test steps, run in Actions after merge.
 
 ## Deferred
 
-None
+- A seccomp profile for the container that is Docker's default plus `userfaultfd`, so `seccomp=unconfined` is not needed. Added to `docs/TODO.md`.
