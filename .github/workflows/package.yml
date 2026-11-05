@@ -29,6 +29,27 @@ jobs:
           docker run --rm paramesh:test pmd --help
           docker run --rm paramesh:test bash -c 'command -v pm pmrun'
           docker run --rm paramesh:test bash -c 'printf "#include <paramesh.h>\nint main(void){return pm_strerror(PM_OK)==0;}\n" >/tmp/a.c && cc -O2 /tmp/a.c $(pkg-config --cflags --libs paramesh) -o /tmp/a && /tmp/a'
+      - name: Probe userfaultfd in a container
+        run: |
+          cat >/tmp/probe.c <<'C'
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <linux/userfaultfd.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <sys/syscall.h>
+          #include <unistd.h>
+          int main(void) {
+              long fd = syscall(SYS_userfaultfd, O_CLOEXEC | UFFD_USER_MODE_ONLY);
+              printf("userfaultfd: %s\n", fd < 0 ? strerror(errno) : "ok");
+              return fd < 0;
+          }
+          C
+          uname -r
+          for opts in "" "--cap-add SYS_PTRACE" "--security-opt seccomp=unconfined"; do
+            echo "== docker run $opts"
+            docker run --rm $opts -v /tmp/probe.c:/probe.c paramesh:test bash -c 'cc /probe.c -o /p && /p' || true
+          done
       - name: Test the services and a one-node job
         run: |
           docker run -d --name pm --network host --init --cap-add SYS_PTRACE paramesh:test
